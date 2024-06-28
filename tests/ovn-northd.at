@@ -59,7 +59,7 @@ $recompute : compute - $compute"
 
   node_stat=$(as northd ovn-appctl -t ovn-northd inc-engine/show-stats $node)
   # node_stat will be of this format :
-  #     - Node: lflow - recompute: 3 - compute: 0 - abort: 0
+  #     - Node: lflow - recompute: 3 - compute: 0 - cancel: 0
   node_recompute_ct=$(echo $node_stat | cut -d '-' -f2 | cut -d ':' -f2)
   node_compute_ct=$(echo $node_stat | cut -d '-' -f3 | cut -d ':' -f2)
 
@@ -1025,8 +1025,20 @@ check_flow_match_sets 2 2 2 0 0 0 0
 ovn-nbctl lr-nat-del R1 dnat_and_snat  172.16.1.1
 
 echo
+echo "IPv4: stateful with match"
+ovn-nbctl --wait=sb --match="udp" lr-nat-add R1 dnat_and_snat  172.16.1.1 50.0.0.11
+check_flow_match_sets 2 2 2 0 0 0 0
+ovn-nbctl lr-nat-del R1 dnat_and_snat  172.16.1.1
+
+echo
 echo "IPv4: stateless"
 ovn-nbctl --wait=sb --stateless lr-nat-add R1 dnat_and_snat  172.16.1.1 50.0.0.11
+check_flow_match_sets 2 0 0 1 1 0 0
+ovn-nbctl lr-nat-del R1 dnat_and_snat  172.16.1.1
+
+echo
+echo "IPv4: stateless with match"
+ovn-nbctl --wait=sb --match="udp" --stateless lr-nat-add R1 dnat_and_snat  172.16.1.1 50.0.0.11
 check_flow_match_sets 2 0 0 1 1 0 0
 ovn-nbctl lr-nat-del R1 dnat_and_snat  172.16.1.1
 
@@ -1037,8 +1049,20 @@ check_flow_match_sets 2 2 2 0 0 0 0
 ovn-nbctl lr-nat-del R1 dnat_and_snat  fd01::1
 
 echo
+echo "IPv6: stateful with match"
+ovn-nbctl --wait=sb --match="udp" lr-nat-add R1 dnat_and_snat fd01::1 fd11::2
+check_flow_match_sets 2 2 2 0 0 0 0
+ovn-nbctl lr-nat-del R1 dnat_and_snat  fd01::1
+
+echo
 echo "IPv6: stateless"
 ovn-nbctl --wait=sb --stateless lr-nat-add R1 dnat_and_snat fd01::1 fd11::2
+check_flow_match_sets 2 0 0 0 0 1 1
+ovn-nbctl lr-nat-del R1 dnat_and_snat fd01::1
+
+echo
+echo "IPv6: stateless with match"
+ovn-nbctl --wait=sb --match="udp" --stateless lr-nat-add R1 dnat_and_snat fd01::1 fd11::2
 check_flow_match_sets 2 0 0 0 0 1 1
 
 AT_CLEANUP
@@ -2846,6 +2870,35 @@ AT_CHECK(
   [ovn-nbctl --wait=sb set logical-switch-port lsp01 options:requested-tnl-key=2])
 get_tunnel_keys
 AT_CHECK([test $lsp02 = 3 && test $ls1 = 123])
+
+AT_CLEANUP
+])
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([check VXLAN mode disabling])
+ovn_start
+
+# Create a fake chassis with vxlan encap to implicitly enable VXLAN mode.
+ovn-sbctl \
+    --id=@e create encap chassis_name=hv1 ip="192.168.0.1" type="vxlan" \
+    -- --id=@c create chassis name=hv1 encaps=@e
+
+cmd="ovn-nbctl --wait=sb"
+for i in {1..4097..1}; do
+    cmd="${cmd} -- ls-add lsw-${i}"
+done
+
+check $cmd
+
+check_row_count nb:Logical_Switch 4097
+wait_row_count sb:Datapath_Binding 4095
+
+OVS_WAIT_UNTIL([grep "all datapath tunnel ids exhausted" northd/ovn-northd.log])
+
+# Explicitly disable VXLAN mode and check that two remaining datapaths were created.
+check ovn-nbctl set NB_Global . options:vxlan_mode=false
+
+check_row_count nb:Logical_Switch 4097
+wait_row_count sb:Datapath_Binding 4097
 
 AT_CLEANUP
 ])
@@ -7378,7 +7431,7 @@ AT_CHECK([cat log_flows], [0], [dnl
 
 rm log_flows
 
-# And just for sanity's sake, let's remove the allow-related ACL and make sure
+# And just to verify, let's remove the allow-related ACL and make sure
 # all the special log messages are gone.
 check ovn-nbctl acl-del pg2
 check ovn-nbctl --wait=sb sync
@@ -7483,7 +7536,7 @@ AT_CHECK([cat log_flows], [0], [dnl
 
 rm log_flows
 
-# And just for sanity's sake, let's remove the allow-related ACL and make sure
+# And just to verify, let's remove the allow-related ACL and make sure
 # all the special log messages are gone.
 check ovn-nbctl acl-del pg2
 check ovn-nbctl --wait=sb sync
@@ -8674,7 +8727,7 @@ delete_switch_ports() {
     RUN_OVN_NBCTL()
 }
 
-m4_define([DUMP_FLOWS_SORTED], [sed -e 's/arp.tpa == 10.1.0.[[0-9]]\{1,3\}/arp.tpa == 10.1.0.??/;s/eth.dst == ..:..:..:..:..:../??:??:??:??:??:??/' | sort])
+m4_define([DUMP_FLOWS_SORTED], [sed -e 's/arp.tpa == 10.1.0.[[0-9]]\{1,3\}/arp.tpa == 10.1.0.??/;s/eth.dst == ..:..:..:..:..:../??:??:??:??:??:??/;s/eth.src == ..:..:..:..:..:../??:??:??:??:??:??/' | sort])
 
 # Build some rather heavy config and modify number of threads in the middle
 check ovn-nbctl ls-add ls1
@@ -8739,7 +8792,7 @@ ovn_strip_lflows ], [0], [dnl
   table=??(ls_in_apply_port_sec), priority=50   , match=(reg0[[15]] == 1), action=(drop;)
   table=??(ls_in_check_port_sec), priority=100  , match=(eth.src[[40]]), action=(drop;)
   table=??(ls_in_check_port_sec), priority=100  , match=(vlan.present), action=(drop;)
-  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && flags.tunnel_rx == 1), action=(drop;)
+  table=??(ls_in_check_port_sec), priority=105  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && flags.tunnel_rx == 1), action=(drop;)
   table=??(ls_in_check_port_sec), priority=50   , match=(1), action=(reg0[[15]] = check_in_port_sec(); next;)
   table=??(ls_in_l2_lkup      ), priority=0    , match=(1), action=(outport = get_fdb(eth.dst); next;)
   table=??(ls_in_l2_lkup      ), priority=110  , match=(eth.dst == $svc_monitor_mac && (tcp || icmp || icmp6)), action=(handle_svc_check(inport);)
@@ -8752,8 +8805,8 @@ ovn_strip_lflows ], [0], [dnl
   table=??(ls_out_check_port_sec), priority=100  , match=(eth.mcast), action=(reg0[[15]] = 0; next;)
 ])
 
-check ovn-nbctl lsp-add sw0 sw0p1 -- lsp-set-addresses sw0p1 "00:00:00:00:00:01"
-check ovn-nbctl lsp-add sw0 sw0p2 -- lsp-set-addresses sw0p2 "00:00:00:00:00:02"
+check ovn-nbctl lsp-add sw0 sw0p1 -- lsp-set-addresses sw0p1 "00:00:00:00:00:01" "00:00:00:00:01:01"
+check ovn-nbctl lsp-add sw0 sw0p2 -- lsp-set-addresses sw0p2 "00:00:00:00:00:02" "00:00:00:00:02:02"
 check ovn-nbctl --wait=sb lsp-add sw0 localnetport -- lsp-set-type localnetport localnet
 
 ovn-sbctl dump-flows sw0 > sw0flows
@@ -8765,12 +8818,18 @@ ovn_strip_lflows ], [0], [dnl
   table=??(ls_in_apply_port_sec), priority=50   , match=(reg0[[15]] == 1), action=(drop;)
   table=??(ls_in_check_port_sec), priority=100  , match=(eth.src[[40]]), action=(drop;)
   table=??(ls_in_check_port_sec), priority=100  , match=(vlan.present), action=(drop;)
-  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && flags.tunnel_rx == 1), action=(drop;)
+  table=??(ls_in_check_port_sec), priority=105  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && flags.tunnel_rx == 1), action=(drop;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:00:01 && outport == "sw0p1" && !is_chassis_resident("sw0p1") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:00:02 && outport == "sw0p2" && !is_chassis_resident("sw0p2") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:01:01 && outport == "sw0p1" && !is_chassis_resident("sw0p1") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:02:02 && outport == "sw0p2" && !is_chassis_resident("sw0p2") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
   table=??(ls_in_check_port_sec), priority=50   , match=(1), action=(reg0[[15]] = check_in_port_sec(); next;)
   table=??(ls_in_l2_lkup      ), priority=0    , match=(1), action=(outport = get_fdb(eth.dst); next;)
   table=??(ls_in_l2_lkup      ), priority=110  , match=(eth.dst == $svc_monitor_mac && (tcp || icmp || icmp6)), action=(handle_svc_check(inport);)
   table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:00:01), action=(outport = "sw0p1"; output;)
   table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:00:02), action=(outport = "sw0p2"; output;)
+  table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:01:01), action=(outport = "sw0p1"; output;)
+  table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:02:02), action=(outport = "sw0p2"; output;)
   table=??(ls_in_l2_lkup      ), priority=70   , match=(eth.mcast), action=(outport = "_MC_flood"; output;)
   table=??(ls_in_l2_unknown   ), priority=0    , match=(1), action=(output;)
   table=??(ls_in_l2_unknown   ), priority=50   , match=(outport == "none"), action=(drop;)
@@ -8792,12 +8851,18 @@ ovn_strip_lflows ], [0], [dnl
   table=??(ls_in_apply_port_sec), priority=50   , match=(reg0[[15]] == 1), action=(drop;)
   table=??(ls_in_check_port_sec), priority=100  , match=(eth.src[[40]]), action=(drop;)
   table=??(ls_in_check_port_sec), priority=100  , match=(vlan.present), action=(drop;)
-  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && flags.tunnel_rx == 1), action=(drop;)
+  table=??(ls_in_check_port_sec), priority=105  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && flags.tunnel_rx == 1), action=(drop;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:00:01 && outport == "sw0p1" && !is_chassis_resident("sw0p1") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:00:02 && outport == "sw0p2" && !is_chassis_resident("sw0p2") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:01:01 && outport == "sw0p1" && !is_chassis_resident("sw0p1") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:02:02 && outport == "sw0p2" && !is_chassis_resident("sw0p2") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
   table=??(ls_in_check_port_sec), priority=50   , match=(1), action=(reg0[[15]] = check_in_port_sec(); next;)
   table=??(ls_in_l2_lkup      ), priority=0    , match=(1), action=(outport = get_fdb(eth.dst); next;)
   table=??(ls_in_l2_lkup      ), priority=110  , match=(eth.dst == $svc_monitor_mac && (tcp || icmp || icmp6)), action=(handle_svc_check(inport);)
   table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:00:01), action=(outport = "sw0p1"; output;)
   table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:00:02), action=(outport = "sw0p2"; output;)
+  table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:01:01), action=(outport = "sw0p1"; output;)
+  table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:02:02), action=(outport = "sw0p2"; output;)
   table=??(ls_in_l2_lkup      ), priority=70   , match=(eth.mcast), action=(outport = "_MC_flood"; output;)
   table=??(ls_in_l2_unknown   ), priority=0    , match=(1), action=(output;)
   table=??(ls_in_l2_unknown   ), priority=50   , match=(outport == "none"), action=(drop;)
@@ -8820,12 +8885,18 @@ ovn_strip_lflows ], [0], [dnl
   table=??(ls_in_check_port_sec), priority=100  , match=(eth.src[[40]]), action=(drop;)
   table=??(ls_in_check_port_sec), priority=100  , match=(inport == "sw0p1"), action=(reg0[[15]] = 1; next;)
   table=??(ls_in_check_port_sec), priority=100  , match=(vlan.present), action=(drop;)
-  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && flags.tunnel_rx == 1), action=(drop;)
+  table=??(ls_in_check_port_sec), priority=105  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && flags.tunnel_rx == 1), action=(drop;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:00:01 && outport == "sw0p1" && !is_chassis_resident("sw0p1") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:00:02 && outport == "sw0p2" && !is_chassis_resident("sw0p2") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:01:01 && outport == "sw0p1" && !is_chassis_resident("sw0p1") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:02:02 && outport == "sw0p2" && !is_chassis_resident("sw0p2") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
   table=??(ls_in_check_port_sec), priority=50   , match=(1), action=(reg0[[15]] = check_in_port_sec(); next;)
   table=??(ls_in_l2_lkup      ), priority=0    , match=(1), action=(outport = get_fdb(eth.dst); next;)
   table=??(ls_in_l2_lkup      ), priority=110  , match=(eth.dst == $svc_monitor_mac && (tcp || icmp || icmp6)), action=(handle_svc_check(inport);)
   table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:00:01), action=(drop;)
   table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:00:02), action=(outport = "sw0p2"; output;)
+  table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:01:01), action=(drop;)
+  table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:02:02), action=(outport = "sw0p2"; output;)
   table=??(ls_in_l2_lkup      ), priority=70   , match=(eth.mcast), action=(outport = "_MC_flood"; output;)
   table=??(ls_in_l2_unknown   ), priority=0    , match=(1), action=(output;)
   table=??(ls_in_l2_unknown   ), priority=50   , match=(outport == "none"), action=(drop;)
@@ -8847,13 +8918,19 @@ ovn_strip_lflows ], [0], [dnl
   table=??(ls_in_check_port_sec), priority=100  , match=(eth.src[[40]]), action=(drop;)
   table=??(ls_in_check_port_sec), priority=100  , match=(inport == "sw0p1"), action=(reg0[[15]] = 1; next;)
   table=??(ls_in_check_port_sec), priority=100  , match=(vlan.present), action=(drop;)
-  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && flags.tunnel_rx == 1), action=(drop;)
+  table=??(ls_in_check_port_sec), priority=105  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && flags.tunnel_rx == 1), action=(drop;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:00:01 && outport == "sw0p1" && !is_chassis_resident("sw0p1") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:00:02 && outport == "sw0p2" && !is_chassis_resident("sw0p2") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:01:01 && outport == "sw0p1" && !is_chassis_resident("sw0p1") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:02:02 && outport == "sw0p2" && !is_chassis_resident("sw0p2") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
   table=??(ls_in_check_port_sec), priority=50   , match=(1), action=(reg0[[15]] = check_in_port_sec(); next;)
   table=??(ls_in_check_port_sec), priority=70   , match=(inport == "sw0p2"), action=(set_queue(10); reg0[[15]] = check_in_port_sec(); next;)
   table=??(ls_in_l2_lkup      ), priority=0    , match=(1), action=(outport = get_fdb(eth.dst); next;)
   table=??(ls_in_l2_lkup      ), priority=110  , match=(eth.dst == $svc_monitor_mac && (tcp || icmp || icmp6)), action=(handle_svc_check(inport);)
   table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:00:01), action=(drop;)
   table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:00:02), action=(outport = "sw0p2"; output;)
+  table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:01:01), action=(drop;)
+  table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:02:02), action=(outport = "sw0p2"; output;)
   table=??(ls_in_l2_lkup      ), priority=70   , match=(eth.mcast), action=(outport = "_MC_flood"; output;)
   table=??(ls_in_l2_unknown   ), priority=0    , match=(1), action=(output;)
   table=??(ls_in_l2_unknown   ), priority=50   , match=(outport == "none"), action=(drop;)
@@ -8877,7 +8954,11 @@ ovn_strip_lflows ], [0], [dnl
   table=??(ls_in_apply_port_sec), priority=50   , match=(reg0[[15]] == 1), action=(drop;)
   table=??(ls_in_check_port_sec), priority=100  , match=(eth.src[[40]]), action=(drop;)
   table=??(ls_in_check_port_sec), priority=100  , match=(vlan.present), action=(drop;)
-  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && flags.tunnel_rx == 1), action=(drop;)
+  table=??(ls_in_check_port_sec), priority=105  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && flags.tunnel_rx == 1), action=(drop;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:00:01 && outport == "sw0p1" && !is_chassis_resident("sw0p1") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:00:02 && outport == "sw0p2" && !is_chassis_resident("sw0p2") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:01:01 && outport == "sw0p1" && !is_chassis_resident("sw0p1") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
+  table=??(ls_in_check_port_sec), priority=110  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && eth.src == 00:00:00:00:02:02 && outport == "sw0p2" && !is_chassis_resident("sw0p2") && flags.tunnel_rx == 1), action=(outport <-> inport; next;)
   table=??(ls_in_check_port_sec), priority=50   , match=(1), action=(reg0[[15]] = check_in_port_sec(); next;)
   table=??(ls_in_check_port_sec), priority=70   , match=(inport == "localnetport"), action=(set_queue(10); reg0[[15]] = check_in_port_sec(); next;)
   table=??(ls_in_check_port_sec), priority=70   , match=(inport == "sw0p1"), action=(reg0[[14]] = 1; next(pipeline=ingress, table=??);)
@@ -8886,6 +8967,8 @@ ovn_strip_lflows ], [0], [dnl
   table=??(ls_in_l2_lkup      ), priority=110  , match=(eth.dst == $svc_monitor_mac && (tcp || icmp || icmp6)), action=(handle_svc_check(inport);)
   table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:00:01), action=(outport = "sw0p1"; output;)
   table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:00:02), action=(outport = "sw0p2"; output;)
+  table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:01:01), action=(outport = "sw0p1"; output;)
+  table=??(ls_in_l2_lkup      ), priority=50   , match=(eth.dst == 00:00:00:00:02:02), action=(outport = "sw0p2"; output;)
   table=??(ls_in_l2_lkup      ), priority=70   , match=(eth.mcast), action=(outport = "_MC_flood"; output;)
   table=??(ls_in_l2_unknown   ), priority=0    , match=(1), action=(output;)
   table=??(ls_in_l2_unknown   ), priority=50   , match=(outport == "none"), action=(drop;)
@@ -9425,9 +9508,9 @@ AT_CAPTURE_FILE([S1flows])
 
 AT_CHECK([grep -e "ls_in_arp_rsp" S1flows | ovn_strip_lflows], [0], [dnl
   table=??(ls_in_arp_rsp      ), priority=0    , match=(1), action=(next;)
-  table=??(ls_in_arp_rsp      ), priority=100  , match=(arp.tpa == 192.168.0.10 && arp.op == 1 && inport == "S1-vm1"), action=(next;)
+  table=??(ls_in_arp_rsp      ), priority=100  , match=(arp.tpa == 192.168.0.10 && arp.op == 1 && eth.dst == ff:ff:ff:ff:ff:ff && inport == "S1-vm1"), action=(next;)
   table=??(ls_in_arp_rsp      ), priority=100  , match=(nd_ns && ip6.dst == {fd00::10, ff02::1:ff00:10} && nd.target == fd00::10 && inport == "S1-vm1"), action=(next;)
-  table=??(ls_in_arp_rsp      ), priority=50   , match=(arp.tpa == 192.168.0.10 && arp.op == 1), action=(eth.dst = eth.src; eth.src = 50:54:00:00:00:10; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = 50:54:00:00:00:10; arp.tpa = arp.spa; arp.spa = 192.168.0.10; outport = inport; flags.loopback = 1; output;)
+  table=??(ls_in_arp_rsp      ), priority=50   , match=(arp.tpa == 192.168.0.10 && arp.op == 1 && eth.dst == ff:ff:ff:ff:ff:ff), action=(eth.dst = eth.src; eth.src = 50:54:00:00:00:10; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = 50:54:00:00:00:10; arp.tpa = arp.spa; arp.spa = 192.168.0.10; outport = inport; flags.loopback = 1; output;)
   table=??(ls_in_arp_rsp      ), priority=50   , match=(nd_ns && ip6.dst == {fd00::10, ff02::1:ff00:10} && nd.target == fd00::10), action=(nd_na { eth.src = 50:54:00:00:00:10; ip6.src = fd00::10; nd.target = fd00::10; nd.tll = 50:54:00:00:00:10; outport = inport; flags.loopback = 1; output; };)
 ])
 
@@ -9588,14 +9671,14 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats northd], [0],
 Node: northd
 - recompute:            0
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl The port_group node recomputes every time a NB port group is added/deleted.
 AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats port_group], [0], [dnl
 Node: port_group
 - recompute:            1
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl The port_group node is an input for the lflow node.  Port_group
 dnl recompute/compute triggers lflow recompute.
@@ -9603,7 +9686,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats lflow], [0], 
 Node: lflow
 - recompute:            1
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
@@ -9625,7 +9708,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats northd], [0],
 Node: northd
 - recompute:            0
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl The port_group node recomputes also every time a port from a new switch
 dnl is added to the group.
@@ -9633,7 +9716,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats port_group], 
 Node: port_group
 - recompute:            1
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl The port_group node is an input for the lflow node.  Port_group
 dnl recompute/compute triggers lflow recompute.
@@ -9641,7 +9724,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats lflow], [0], 
 Node: lflow
 - recompute:            1
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl Expect ACL1 on sw1 and sw2
 check_acl_lflows 1 0 1 0
@@ -9661,7 +9744,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats northd], [0],
 Node: northd
 - recompute:            0
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl The port_group node recomputes also every time a port from a new switch
 dnl is added to the group.
@@ -9669,7 +9752,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats port_group], 
 Node: port_group
 - recompute:            1
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl The port_group node is an input for the lflow node.  Port_group
 dnl recompute/compute triggers lflow recompute (for ACLs).
@@ -9677,7 +9760,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats lflow], [0], 
 Node: lflow
 - recompute:            1
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl Expect both ACLs on sw1 and sw2
 check_acl_lflows 1 1 1 1
@@ -9698,7 +9781,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats northd], [0],
 Node: northd
 - recompute:            0
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl We did not change the set of switches a pg is applied to, there should be
 dnl no recompute.
@@ -9706,7 +9789,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats port_group], 
 Node: port_group
 - recompute:            0
 - compute:              1
-- abort:                0
+- cancel:               0
 ])
 dnl We did not change the set of switches a pg is applied to, there should be
 dnl no recompute.
@@ -9714,7 +9797,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats lflow], [0], 
 Node: lflow
 - recompute:            0
 - compute:              1
-- abort:                0
+- cancel:               0
 ])
 dnl Expect both ACLs on sw1 and sw2
 check_acl_lflows 1 1 1 1
@@ -9736,7 +9819,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats northd], [0],
 Node: northd
 - recompute:            0
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl We did not change the set of switches a pg is applied to, there should be
 dnl no recompute.
@@ -9744,7 +9827,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats port_group], 
 Node: port_group
 - recompute:            0
 - compute:              1
-- abort:                0
+- cancel:               0
 ])
 dnl We did not change the set of switches a pg is applied to, there should be
 dnl no recompute.
@@ -9752,7 +9835,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats lflow], [0], 
 Node: lflow
 - recompute:            0
 - compute:              1
-- abort:                0
+- cancel:               0
 ])
 dnl Expect both ACLs on sw1 and sw2
 check_acl_lflows 1 1 1 1
@@ -9772,7 +9855,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats northd], [0],
 Node: northd
 - recompute:            0
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl We changed the set of switches a pg is applied to, there should be
 dnl a recompute.
@@ -9780,7 +9863,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats port_group], 
 Node: port_group
 - recompute:            1
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl We changed the set of switches a pg is applied to, there should be
 dnl a recompute (for ACLs).
@@ -9788,7 +9871,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats lflow], [0], 
 Node: lflow
 - recompute:            1
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl Expect both ACLs on sw1 and only the first one on sw2.
 check_acl_lflows 1 1 1 0
@@ -9809,7 +9892,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats northd], [0],
 Node: northd
 - recompute:            0
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl We changed the set of switches a pg is applied to, there should be
 dnl a recompute.
@@ -9817,7 +9900,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats port_group], 
 Node: port_group
 - recompute:            1
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl We changed the set of switches a pg is applied to, there should be
 dnl a recompute (for ACLs).
@@ -9825,7 +9908,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats lflow], [0], 
 Node: lflow
 - recompute:            1
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl Expect both ACLs on sw1 and not on sw2.
 check_acl_lflows 1 1 0 0
@@ -9846,7 +9929,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats northd], [0],
 Node: northd
 - recompute:            0
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl We changed the set of switches a pg is applied to, there should be a
 dnl recompute.
@@ -9854,7 +9937,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats port_group], 
 Node: port_group
 - recompute:            1
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl We changed the set of switches a pg is applied to, there should be a
 dnl recompute.
@@ -9862,7 +9945,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats lflow], [0], 
 Node: lflow
 - recompute:            1
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl Expect both ACLs on sw1 and sw2
 check_acl_lflows 1 1 1 1
@@ -9885,7 +9968,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats northd], [0],
 Node: northd
 - recompute:            0
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl We changed the set of switches a pg is applied to, there should be a
 dnl recompute.
@@ -9893,7 +9976,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats port_group], 
 Node: port_group
 - recompute:            1
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl We changed the set of switches a pg is applied to, there should be a
 dnl recompute.
@@ -9901,7 +9984,7 @@ AT_CHECK([as northd ovn-appctl -t ovn-northd inc-engine/show-stats lflow], [0], 
 Node: lflow
 - recompute:            1
 - compute:              0
-- abort:                0
+- cancel:               0
 ])
 dnl Expect both ACLs on sw1 and no ACLs on sw2
 check_acl_lflows 1 1 0 0
@@ -12071,7 +12154,7 @@ CHECK_NO_CHANGE_AFTER_RECOMPUTE
 
 # Adding a logical router port should result in recompute
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
-check ovn-nbctl lrp-add lr0 lr0-sw0 00:00:00:00:ff:01 10.0.0.1/24
+check ovn-nbctl --wait=sb lrp-add lr0 lr0-sw0 00:00:00:00:ff:01 10.0.0.1/24
 # for northd engine there will be both recompute and compute
 # first it will be recompute to handle lr0-sw0 and then a compute
 # for the SB port binding change.
@@ -12101,7 +12184,7 @@ check ovn-nbctl lrp-add lr0 lr0-public 00:00:20:20:12:13 172.168.0.100/24
 check ovn-nbctl lsp-add public public-lr0
 check ovn-nbctl lsp-set-type public-lr0 router
 check ovn-nbctl lsp-set-addresses public-lr0 router
-check ovn-nbctl lsp-set-options public-lr0 router-port=lr0-public
+check ovn-nbctl --wait=sb lsp-set-options public-lr0 router-port=lr0-public
 
 # localnet port
 check ovn-nbctl lsp-add public ln-public
@@ -12433,6 +12516,7 @@ CHECK_NO_CHANGE_AFTER_RECOMPUTE
 check as northd ovn-appctl -t ovn-northd inc-engine/clear-stats
 # This should result in recomputes.
 check ovn-sbctl set SB_Global . options:bar=foo
+check ovn-nbctl --wait=sb sync
 check_engine_stats global_config recompute compute
 check_engine_stats northd recompute nocompute
 check_engine_stats lflow recompute nocompute
@@ -12582,3 +12666,58 @@ check_engine_stats northd recompute nocompute
 check_engine_stats lflow recompute nocompute
 
 AT_CLEANUP
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([NAT with match])
+ovn_start
+
+check ovn-sbctl chassis-add hv1 geneve 127.0.0.1
+
+check ovn-nbctl lr-add lr -- \
+    lrp-add lr lr-ls 02:ac:10:01:00:01 172.16.1.1/24
+
+check ovn-nbctl ls-add ls -- \
+    lsp-add ls ls-lr -- \
+    lsp-set-type ls-lr router -- \
+    lsp-set-addresses ls-lr router -- \
+    lsp-set-options ls-lr router-port=lr-ls
+
+check ovn-nbctl lr-nat-add lr snat 172.16.1.1 10.0.0.0/24
+check ovn-nbctl --match="udp" --priority=10 lr-nat-add lr snat 172.16.1.2 10.0.0.0/24
+
+check ovn-nbctl lr-nat-add lr dnat 10.0.0.100 10.0.0.10
+check ovn-nbctl --match="udp" --priority=20 lr-nat-add lr dnat 10.0.0.100 10.0.0.20
+
+check ovn-nbctl --wait=sb lrp-set-gateway-chassis lr-ls hv1
+
+AT_CHECK([ovn-sbctl dump-flows lr | grep lr_out_snat | ovn_strip_lflows], [0], [dnl
+  table=??(lr_out_snat        ), priority=0    , match=(1), action=(next;)
+  table=??(lr_out_snat        ), priority=120  , match=(nd_ns), action=(next;)
+  table=??(lr_out_snat        ), priority=153  , match=(ip && ip4.src == 10.0.0.0/24 && outport == "lr-ls" && is_chassis_resident("cr-lr-ls") && (!ct.trk || !ct.rpl)), action=(ct_snat(172.16.1.1);)
+  table=??(lr_out_snat        ), priority=310  , match=(ip && ip4.src == 10.0.0.0/24 && outport == "lr-ls" && is_chassis_resident("cr-lr-ls") && (udp) && (!ct.trk || !ct.rpl)), action=(ct_snat(172.16.1.2);)
+])
+
+AT_CHECK([ovn-sbctl dump-flows lr | grep lr_in_dnat | ovn_strip_lflows], [0], [dnl
+  table=??(lr_in_dnat         ), priority=0    , match=(1), action=(next;)
+  table=??(lr_in_dnat         ), priority=100  , match=(ip && ip4.dst == 10.0.0.100 && inport == "lr-ls" && is_chassis_resident("cr-lr-ls")), action=(ct_dnat(10.0.0.10);)
+  table=??(lr_in_dnat         ), priority=320  , match=(ip && ip4.dst == 10.0.0.100 && inport == "lr-ls" && is_chassis_resident("cr-lr-ls") && (udp)), action=(ct_dnat(10.0.0.20);)
+])
+
+check ovn-nbctl lrp-del-gateway-chassis lr-ls hv1
+check ovn-nbctl --wait=sb set logical_router lr options:chassis=hv1
+
+AT_CHECK([ovn-sbctl dump-flows lr | grep lr_out_snat | ovn_strip_lflows], [0], [dnl
+  table=??(lr_out_snat        ), priority=0    , match=(1), action=(next;)
+  table=??(lr_out_snat        ), priority=120  , match=(nd_ns), action=(next;)
+  table=??(lr_out_snat        ), priority=25   , match=(ip && ip4.src == 10.0.0.0/24 && (!ct.trk || !ct.rpl)), action=(ct_snat(172.16.1.1);)
+  table=??(lr_out_snat        ), priority=310  , match=(ip && ip4.src == 10.0.0.0/24 && (udp) && (!ct.trk || !ct.rpl)), action=(ct_snat(172.16.1.2);)
+])
+
+AT_CHECK([ovn-sbctl dump-flows lr | grep lr_in_dnat | ovn_strip_lflows], [0], [dnl
+  table=??(lr_in_dnat         ), priority=0    , match=(1), action=(next;)
+  table=??(lr_in_dnat         ), priority=100  , match=(ip && ip4.dst == 10.0.0.100), action=(flags.loopback = 1; ct_dnat(10.0.0.10);)
+  table=??(lr_in_dnat         ), priority=320  , match=(ip && ip4.dst == 10.0.0.100 && (udp)), action=(flags.loopback = 1; ct_dnat(10.0.0.20);)
+])
+
+AT_CLEANUP
+])

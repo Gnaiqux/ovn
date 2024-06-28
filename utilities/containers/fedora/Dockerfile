@@ -1,4 +1,4 @@
-FROM quay.io/fedora/fedora:39
+FROM quay.io/fedora/fedora:40
 
 ARG CONTAINERS_PATH
 
@@ -27,7 +27,9 @@ RUN dnf -y update \
         libcap-ng-devel \
         libtool \
         net-tools \
+        ninja-build \
         nmap-ncat \
+        numactl-devel \
         openssl \
         openssl-devel \
         procps-ng \
@@ -44,41 +46,14 @@ RUN dnf -y update \
     && \
     dnf clean all
 
-# Compile sparse from source
-WORKDIR /workspace/sparse
-
-RUN git clone git://git.kernel.org/pub/scm/devel/sparse/sparse.git \
-    /workspace/sparse \
-    && \
-    make -j4 PREFIX=/usr HAVE_LLVM= HAVE_SQLITE= install
-
-# Compile OpenBFDD from source
-WORKDIR /workspace/OpenBFDD
+WORKDIR /workspace
 
 COPY $CONTAINERS_PATH/openbfdd.patch /tmp/openbfdd.patch
 
-RUN git clone https://github.com/dyninc/OpenBFDD.git \
-    /workspace/OpenBFDD \
-    && \
-    git apply /tmp/openbfdd.patch \
-    && \
-    ./autogen.sh \
-    && \
-    ./configure --enable-silent-rules \
-    && \
-    make \
-    && \
-    make install
-
-WORKDIR /workspace
-
 COPY $CONTAINERS_PATH/py-requirements.txt /tmp/py-requirements.txt
 
-# Update and install pip dependencies
-RUN python3 -m pip install --upgrade pip \
-    && \
-    python3 -m pip install wheel \
-    && \
-    python3 -m pip install -r /tmp/py-requirements.txt
+COPY $CONTAINERS_PATH/prepare.sh /tmp/prepare.sh
+
+RUN /tmp/prepare.sh
 
 CMD ["/usr/sbin/init"]

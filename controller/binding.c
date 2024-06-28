@@ -757,6 +757,8 @@ update_active_pb_ras_pd(const struct sbrec_port_binding *pb,
     }
 }
 
+static bool is_ext_id_changed(const struct smap *a, const struct smap *b,
+                              const char *key);
 static struct local_binding *local_binding_create(
     const char *name, const struct ovsrec_interface *);
 static void local_binding_add(struct shash *local_bindings,
@@ -1268,6 +1270,18 @@ update_port_additional_encap_if_needed(
     return true;
 }
 
+static bool
+is_requested_additional_chassis(const struct sbrec_port_binding *pb,
+                      const struct sbrec_chassis *chassis_rec)
+{
+    for (size_t i = 0; i < pb->n_requested_additional_chassis; i++) {
+        if (pb->requested_additional_chassis[i] == chassis_rec) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool
 is_additional_chassis(const struct sbrec_port_binding *pb,
                       const struct sbrec_chassis *chassis_rec)
@@ -1301,6 +1315,12 @@ lport_maybe_postpone(const char *port_name, long long int now,
     VLOG_DBG("Postponed claim on logical port %s.", port_name);
 
     return true;
+}
+
+static bool
+is_postponed_port(const char *port_name)
+{
+    return sset_contains(&_postponed_ports, port_name);
 }
 
 /* Returns false if lport is not claimed due to 'sb_readonly'.
@@ -1477,7 +1497,8 @@ is_binding_lport_this_chassis(struct binding_lport *b_lport,
 {
     return (b_lport && b_lport->pb && chassis &&
             (b_lport->pb->chassis == chassis
-             || is_additional_chassis(b_lport->pb, chassis)));
+             || is_additional_chassis(b_lport->pb, chassis)
+             || is_postponed_port(b_lport->pb->logical_port)));
 }
 
 /* Returns 'true' if the 'lbinding' has binding lports of type LP_CONTAINER,
@@ -1579,11 +1600,21 @@ consider_vif_lport_(const struct sbrec_port_binding *pb,
         }
 
         if (!lbinding_set || !can_bind) {
+            remove_related_lport(pb, b_ctx_out);
             return release_lport(pb, b_ctx_in->chassis_rec,
                                  !b_ctx_in->ovnsb_idl_txn,
                                  b_ctx_out->tracked_dp_bindings,
                                  b_ctx_out->if_mgr);
         }
+    }
+    if (pb->chassis != b_ctx_in->chassis_rec
+            && !is_requested_additional_chassis(pb, b_ctx_in->chassis_rec)
+            && if_status_is_port_claimed(b_ctx_out->if_mgr,
+                                         pb->logical_port)) {
+        update_lport_tracking(pb, b_ctx_out->tracked_dp_bindings, false);
+        if_status_mgr_remove_ovn_installed(b_ctx_out->if_mgr,
+                           b_lport->lbinding->iface->name,
+                           &b_lport->lbinding->iface->header_.uuid);
     }
 
     return true;
@@ -1785,7 +1816,8 @@ consider_localport(const struct sbrec_port_binding *pb,
     struct shash *local_bindings = &b_ctx_out->lbinding_data->bindings;
     struct local_binding *lbinding = local_binding_find(local_bindings,
                                                         pb->logical_port);
-
+    /* Make sure there is no previous postponed port claim */
+    sset_find_and_delete(b_ctx_out->postponed_ports, pb->logical_port);
     if (!lbinding) {
         return true;
     }
@@ -1822,7 +1854,7 @@ consider_localport(const struct sbrec_port_binding *pb,
  */
 static bool
 consider_nonvif_lport_(const struct sbrec_port_binding *pb,
-                       bool our_chassis,
+                       bool our_chassis, bool is_ha_chassis,
                        struct binding_ctx_in *b_ctx_in,
                        struct binding_ctx_out *b_ctx_out)
 {
@@ -1841,6 +1873,9 @@ consider_nonvif_lport_(const struct sbrec_port_binding *pb,
                            b_ctx_out->tracked_dp_bindings,
                            b_ctx_out->if_mgr,
                            b_ctx_out->postponed_ports);
+    }
+    if (!is_ha_chassis) {
+        remove_related_lport(pb, b_ctx_out);
     }
 
     if (pb->chassis == b_ctx_in->chassis_rec
@@ -1865,7 +1900,7 @@ consider_l2gw_lport(const struct sbrec_port_binding *pb,
     bool our_chassis = chassis_id && !strcmp(chassis_id,
                                              b_ctx_in->chassis_rec->name);
 
-    return consider_nonvif_lport_(pb, our_chassis, b_ctx_in, b_ctx_out);
+    return consider_nonvif_lport_(pb, our_chassis, false, b_ctx_in, b_ctx_out);
 }
 
 static bool
@@ -1877,7 +1912,7 @@ consider_l3gw_lport(const struct sbrec_port_binding *pb,
     bool our_chassis = chassis_id && !strcmp(chassis_id,
                                              b_ctx_in->chassis_rec->name);
 
-    return consider_nonvif_lport_(pb, our_chassis, b_ctx_in, b_ctx_out);
+    return consider_nonvif_lport_(pb, our_chassis, false, b_ctx_in, b_ctx_out);
 }
 
 static void
@@ -1940,7 +1975,8 @@ consider_ha_lport(const struct sbrec_port_binding *pb,
         update_related_lport(pb, b_ctx_out);
     }
 
-    return consider_nonvif_lport_(pb, our_chassis, b_ctx_in, b_ctx_out);
+    return consider_nonvif_lport_(pb, our_chassis, is_ha_chassis, b_ctx_in,
+                                  b_ctx_out);
 }
 
 static bool
@@ -2309,6 +2345,18 @@ consider_iface_claim(const struct ovsrec_interface *iface_rec,
     if (!pb) {
         /* There is no port_binding row for this local binding. */
         return true;
+    }
+
+    /* Check if iface-id-ver just becomes correct */
+    struct smap *external_ids_old =
+        shash_find_data(b_ctx_in->iface_table_external_ids_old,
+                        iface_rec->name);
+
+    if (external_ids_old &&
+        is_ext_id_changed(&iface_rec->external_ids,
+                          external_ids_old,
+                          "iface-id-ver")) {
+            b_ctx_out->local_lports_changed = true;
     }
 
     /* If multiple bindings to the same port, remove the "old" binding.
@@ -2736,11 +2784,15 @@ handle_deleted_vif_lport(const struct sbrec_port_binding *pb,
          binding_lport_delete(binding_lports, b_lport);
     }
 
-    if (bound && lbinding && lport_type == LP_VIF) {
+    if ((lbinding && lport_type == LP_VIF) &&
+        (bound || sset_find_and_delete(b_ctx_out->postponed_ports,
+                                       pb->logical_port))) {
         /* We need to release the container/virtual binding lports (if any) if
          * deleted 'pb' type is LP_VIF. */
         struct binding_lport *c_lport;
         LIST_FOR_EACH (c_lport, list_node, &lbinding->binding_lports) {
+            sset_find_and_delete(b_ctx_out->postponed_ports, c_lport->name);
+            remove_local_lports(c_lport->pb->logical_port, b_ctx_out);
             if (!release_binding_lport(b_ctx_in->chassis_rec, c_lport,
                                        !b_ctx_in->ovnsb_idl_txn,
                                        b_ctx_out)) {

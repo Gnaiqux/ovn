@@ -173,7 +173,8 @@ static bool garp_rarp_continuous;
 static void *pinctrl_handler(void *arg);
 
 struct pinctrl {
-    char *br_int_name;
+    /* OpenFlow connection to the switch. */
+    struct rconn *swconn;
     pthread_t pinctrl_thread;
     /* Latch to destroy the 'pinctrl_thread' */
     struct latch pinctrl_thread_exit;
@@ -563,7 +564,7 @@ pinctrl_init(void)
     init_svc_monitors();
     bfd_monitor_init();
     init_fdb_entries();
-    pinctrl.br_int_name = NULL;
+    pinctrl.swconn = rconn_create(0, 0, DSCP_DEFAULT, 1 << OFP15_VERSION);
     pinctrl.mac_binding_can_timestamp = false;
     pinctrl_handler_seq = seq_create();
     pinctrl_main_seq = seq_create();
@@ -718,8 +719,6 @@ pinctrl_forward_pkt(struct rconn *swconn, int64_t dp_key,
     put_load(dp_key, MFF_LOG_DATAPATH, 0, 64, &ofpacts);
     put_load(in_port_key, MFF_LOG_INPORT, 0, 32, &ofpacts);
     put_load(out_port_key, MFF_LOG_OUTPORT, 0, 32, &ofpacts);
-    /* Avoid re-injecting packet already consumed. */
-    put_load(1, MFF_LOG_FLAGS, MLF_IGMP_IGMP_SNOOP_INJECT_BIT, 1, &ofpacts);
 
     struct ofpact_resubmit *resubmit = ofpact_put_RESUBMIT(&ofpacts);
     resubmit->in_port = OFPP_CONTROLLER;
@@ -3983,30 +3982,13 @@ notify_pinctrl_main(void)
     seq_change(pinctrl_main_seq);
 }
 
-static void
-pinctrl_rconn_setup(struct rconn *swconn, const char *br_int_name)
-    OVS_REQUIRES(pinctrl_mutex)
-{
-    if (br_int_name) {
-        char *target = xasprintf("unix:%s/%s.mgmt", ovs_rundir(), br_int_name);
-
-        if (strcmp(target, rconn_get_target(swconn))) {
-            VLOG_INFO("%s: connecting to switch", target);
-            rconn_connect(swconn, target, target);
-        }
-        free(target);
-    } else {
-        rconn_disconnect(swconn);
-    }
-}
-
 /* pinctrl_handler pthread function. */
 static void *
 pinctrl_handler(void *arg_)
 {
     struct pinctrl *pctrl = arg_;
     /* OpenFlow connection to the switch. */
-    struct rconn *swconn;
+    struct rconn *swconn = pctrl->swconn;
     /* Last seen sequence number for 'swconn'.  When this differs from
      * rconn_get_connection_seqno(rconn), 'swconn' has reconnected. */
     unsigned int conn_seq_no = 0;
@@ -4022,13 +4004,10 @@ pinctrl_handler(void *arg_)
     static long long int svc_monitors_next_run_time = LLONG_MAX;
     static long long int send_prefixd_time = LLONG_MAX;
 
-    swconn = rconn_create(0, 0, DSCP_DEFAULT, 1 << OFP15_VERSION);
-
     while (!latch_is_set(&pctrl->pinctrl_thread_exit)) {
         long long int bfd_time = LLONG_MAX;
 
         ovs_mutex_lock(&pinctrl_mutex);
-        pinctrl_rconn_setup(swconn, pctrl->br_int_name);
         ip_mcast_snoop_run();
         ovs_mutex_unlock(&pinctrl_mutex);
 
@@ -4087,37 +4066,24 @@ pinctrl_handler(void *arg_)
         poll_block();
     }
 
-    rconn_destroy(swconn);
     return NULL;
 }
 
-static void
-pinctrl_set_br_int_name_(const char *br_int_name)
-    OVS_REQUIRES(pinctrl_mutex)
+void
+pinctrl_update_swconn(const char *target, int probe_interval)
 {
-    if (br_int_name && (!pinctrl.br_int_name || strcmp(pinctrl.br_int_name,
-                                                       br_int_name))) {
-        free(pinctrl.br_int_name);
-        pinctrl.br_int_name = xstrdup(br_int_name);
-        /* Notify pinctrl_handler that integration bridge is
-         * set/changed. */
+    if (ovn_update_swconn_at(pinctrl.swconn, target,
+                             probe_interval, "pinctrl")) {
+        /* Notify pinctrl_handler that integration bridge
+         * target is set/changed. */
         notify_pinctrl_handler();
     }
 }
 
 void
-pinctrl_set_br_int_name(const char *br_int_name)
+pinctrl_update(const struct ovsdb_idl *idl)
 {
     ovs_mutex_lock(&pinctrl_mutex);
-    pinctrl_set_br_int_name_(br_int_name);
-    ovs_mutex_unlock(&pinctrl_mutex);
-}
-
-void
-pinctrl_update(const struct ovsdb_idl *idl, const char *br_int_name)
-{
-    ovs_mutex_lock(&pinctrl_mutex);
-    pinctrl_set_br_int_name_(br_int_name);
 
     bool can_mb_timestamp =
             sbrec_server_has_mac_binding_table_col_timestamp(idl);
@@ -4739,7 +4705,7 @@ pinctrl_destroy(void)
     latch_set(&pinctrl.pinctrl_thread_exit);
     pthread_join(pinctrl.pinctrl_thread, NULL);
     latch_destroy(&pinctrl.pinctrl_thread_exit);
-    free(pinctrl.br_int_name);
+    rconn_destroy(pinctrl.swconn);
     destroy_send_garps_rarps();
     destroy_ipv6_ras();
     destroy_ipv6_prefixd();
@@ -4771,6 +4737,7 @@ pinctrl_destroy(void)
 /* Buffered "put_mac_binding" operation. */
 
 #define MAX_MAC_BINDING_DELAY_MSEC 50
+#define MAX_FDB_DELAY_MSEC         50
 #define MAX_MAC_BINDINGS           1000
 
 /* Contains "struct mac_binding"s. */
@@ -6375,6 +6342,10 @@ get_localnet_vifs_l3gwports(
             if (!pb || pb->chassis != chassis) {
                 continue;
             }
+            if (!iface_rec->link_state ||
+                    strcmp(iface_rec->link_state, "up")) {
+                continue;
+            }
             struct local_datapath *ld
                 = get_local_datapath(local_datapaths,
                                      pb->datapath->tunnel_key);
@@ -7307,6 +7278,9 @@ struct svc_monitor {
     long long int timestamp;
     bool is_ip6;
 
+    struct eth_addr src_mac;
+    struct in6_addr src_ip;
+
     long long int wait_time;
     long long int next_send_time;
 
@@ -7500,6 +7474,9 @@ sync_svc_monitors(struct ovsdb_idl_txn *ovnsb_idl_txn,
                 smap_get_int(&svc_mon->options, "failure_count", 1);
             svc_mon->n_success = 0;
             svc_mon->n_failures = 0;
+
+            eth_addr_from_string(sb_svc_mon->src_mac, &svc_mon->src_mac);
+            ip46_parse(sb_svc_mon->src_ip, &svc_mon->src_ip);
 
             hmap_insert(&svc_monitors_map, &svc_mon->hmap_node, hash);
             ovs_list_push_back(&svc_monitors, &svc_mon->list_node);
@@ -8259,19 +8236,14 @@ svc_monitor_send_tcp_health_check__(struct rconn *swconn,
     struct dp_packet packet;
     dp_packet_use_stub(&packet, packet_stub, sizeof packet_stub);
 
-    struct eth_addr eth_src;
-    eth_addr_from_string(svc_mon->sb_svc_mon->src_mac, &eth_src);
     if (svc_mon->is_ip6) {
-        struct in6_addr ip6_src;
-        ipv6_parse(svc_mon->sb_svc_mon->src_ip, &ip6_src);
-        pinctrl_compose_ipv6(&packet, eth_src, svc_mon->ea,
-                             &ip6_src, &svc_mon->ip, IPPROTO_TCP,
+        pinctrl_compose_ipv6(&packet, svc_mon->src_mac, svc_mon->ea,
+                             &svc_mon->src_ip, &svc_mon->ip, IPPROTO_TCP,
                              63, TCP_HEADER_LEN);
     } else {
-        ovs_be32 ip4_src;
-        ip_parse(svc_mon->sb_svc_mon->src_ip, &ip4_src);
-        pinctrl_compose_ipv4(&packet, eth_src, svc_mon->ea,
-                             ip4_src, in6_addr_get_mapped_ipv4(&svc_mon->ip),
+        pinctrl_compose_ipv4(&packet, svc_mon->src_mac, svc_mon->ea,
+                             in6_addr_get_mapped_ipv4(&svc_mon->src_ip),
+                             in6_addr_get_mapped_ipv4(&svc_mon->ip),
                              IPPROTO_TCP, 63, TCP_HEADER_LEN);
     }
 
@@ -8327,24 +8299,18 @@ svc_monitor_send_udp_health_check(struct rconn *swconn,
                                   struct svc_monitor *svc_mon,
                                   ovs_be16 udp_src)
 {
-    struct eth_addr eth_src;
-    eth_addr_from_string(svc_mon->sb_svc_mon->src_mac, &eth_src);
-
     uint64_t packet_stub[128 / 8];
     struct dp_packet packet;
     dp_packet_use_stub(&packet, packet_stub, sizeof packet_stub);
 
     if (svc_mon->is_ip6) {
-        struct in6_addr ip6_src;
-        ipv6_parse(svc_mon->sb_svc_mon->src_ip, &ip6_src);
-        pinctrl_compose_ipv6(&packet, eth_src, svc_mon->ea,
-                             &ip6_src, &svc_mon->ip, IPPROTO_UDP,
+        pinctrl_compose_ipv6(&packet, svc_mon->src_mac, svc_mon->ea,
+                             &svc_mon->src_ip, &svc_mon->ip, IPPROTO_UDP,
                              63, UDP_HEADER_LEN + 8);
     } else {
-        ovs_be32 ip4_src;
-        ip_parse(svc_mon->sb_svc_mon->src_ip, &ip4_src);
-        pinctrl_compose_ipv4(&packet, eth_src, svc_mon->ea,
-                             ip4_src, in6_addr_get_mapped_ipv4(&svc_mon->ip),
+        pinctrl_compose_ipv4(&packet, svc_mon->src_mac, svc_mon->ea,
+                             in6_addr_get_mapped_ipv4(&svc_mon->src_ip),
+                             in6_addr_get_mapped_ipv4(&svc_mon->ip),
                              IPPROTO_UDP, 63, UDP_HEADER_LEN + 8);
     }
 
@@ -8993,21 +8959,30 @@ run_put_fdbs(struct ovsdb_idl_txn *ovnsb_idl_txn,
         return;
     }
 
-    const struct fdb *fdb;
-    HMAP_FOR_EACH (fdb, hmap_node, &put_fdbs) {
-        run_put_fdb(ovnsb_idl_txn, sbrec_fdb_by_dp_key_mac,
-                    sbrec_port_binding_by_key,
-                    sbrec_datapath_binding_by_key, fdb);
+    long long now = time_msec();
+    struct fdb *fdb;
+    HMAP_FOR_EACH_SAFE (fdb, hmap_node, &put_fdbs) {
+        if (now >= fdb->timestamp) {
+            run_put_fdb(ovnsb_idl_txn, sbrec_fdb_by_dp_key_mac,
+                        sbrec_port_binding_by_key,
+                        sbrec_datapath_binding_by_key, fdb);
+            fdb_remove(&put_fdbs, fdb);
+        }
     }
-    fdbs_clear(&put_fdbs);
 }
 
 
 static void
 wait_put_fdbs(struct ovsdb_idl_txn *ovnsb_idl_txn)
+    OVS_REQUIRES(pinctrl_mutex)
 {
-    if (ovnsb_idl_txn && !hmap_is_empty(&put_fdbs)) {
-        poll_immediate_wake();
+    if (!ovnsb_idl_txn) {
+        return;
+    }
+
+    struct fdb *fdb;
+    HMAP_FOR_EACH (fdb, hmap_node, &put_fdbs) {
+        poll_timer_wait_until(fdb->timestamp);
     }
 }
 
@@ -9027,6 +9002,8 @@ pinctrl_handle_put_fdb(const struct flow *md, const struct flow *headers)
             .mac = headers->dl_src,
     };
 
-    fdb_add(&put_fdbs, fdb_data);
+    uint32_t delay = random_range(MAX_FDB_DELAY_MSEC) + 1;
+    long long timestamp = time_msec() + delay;
+    fdb_add(&put_fdbs, fdb_data, timestamp);
     notify_pinctrl_main();
 }

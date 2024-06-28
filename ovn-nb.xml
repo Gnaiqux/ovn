@@ -381,6 +381,16 @@
         of SB changes would be very noticeable.
       </column>
 
+      <column name="options" key="vxlan_mode">
+        By default if at least one chassis in OVN cluster has VXLAN encap,
+        northd will run in a <code>VXLAN mode</code>. See man
+        ovn-architecture(7) <code>Tunnel Encapsulations</code> paragraph for
+        more details.  In case VXLAN encaps are needed on chassis only to
+        support HW VTEP functionality and main encap type is GENEVE or STT, set
+        this option to <code>false</code> to use default
+        non-<code>VXLAN mode</code> tunnel IDs allocation logic.
+      </column>
+
       <group title="Options for configuring interconnection route advertisement">
         <p>
           These options control how routes are advertised between OVN
@@ -442,7 +452,7 @@
           <code>ic-route-learn</code> is <code>true</code>.
         </column>
 
-        <column name="options" key="ic-route-blacklist">
+        <column name="options" key="ic-route-denylist">
           A string value contains a list of CIDRs delimited by ",".  A route
           will not be advertised or learned if the route's prefix belongs to
           any of the CIDRs listed.
@@ -943,7 +953,7 @@
               send any traffic to this port. <code>OVN</code> can support
               native services like DHCPv4/DHCPv6/DNS for this port.
               If <ref column="ha_chassis_group"/> is defined,
-              <code>ovn-controller</code> running in the master chassis of
+              <code>ovn-controller</code> running in the active chassis of
               the HA chassis group will bind this port to provide these native
               services. It is expected that this port belong to a bridged
               logical switch (with a <code>localnet</code> port).
@@ -3935,6 +3945,21 @@ or
       </p>
     </column>
 
+    <column name="match">
+      The packets that the NAT rules should match, in addition to the match
+      that is created based on the NAT type, in the same expression
+      language used for the <ref column="match" table="Logical_Flow"
+                                 db="OVN_Southbound"/> column in the OVN
+      Southbound database's <ref table="Logical_Flow" db="OVN_Southbound"/>
+      table.  This allows for more fine-grained control over the NAT rule.
+    </column>
+
+    <column name="priority">
+      The NAT rule's priority.  Rules with numerically higher priority
+      take precedence over those with lower.  The priority is taken into
+      account only if the <code>match</code> is defined.
+    </column>
+
     <column name="options" key="stateless">
       Indicates if a dnat_and_snat rule should lead to connection
       tracking state or not.
@@ -4805,10 +4830,10 @@ or
       Table representing a group of chassis which can provide high availability
       services. Each chassis in the group is represented by the table
       <ref table="HA_Chassis"/>. The HA chassis with highest priority will
-      be the master of this group. If the master chassis failover is detected,
-      the HA chassis with the next higher priority takes over the
+      be the active chassis of this group. If the active chassis failover is
+      detected, the HA chassis with the next higher priority takes over the
       responsibility of providing the HA. If a distributed gateway router port
-      references a row in this table, then the master HA chassis in this group
+      references a row in this table, then the active HA chassis in this group
       provides the gateway functionality.
     </p>
 
@@ -4841,7 +4866,7 @@ or
     <column name="priority">
       <p>
         Priority of the chassis. Chassis with highest priority will be
-        the master.
+        the active chassis.
       </p>
     </column>
 

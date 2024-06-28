@@ -40,13 +40,19 @@ Release Notes
 You should always check the OVS and OVN release notes (NEWS file) for any
 release specific notes on upgrades.
 
-OVS
----
+Open vSwitch
+------------
 
-OVN depends on and is included with OVS.  It's expected that OVS and OVN are
-upgraded together, partly for convenience.  OVN is included in OVS releases
-so it's easiest to upgrade them together.  OVN may also make use of new
-features of OVS only available in that release.
+OVN compiles with a particular version of Open vSwitch.  This is a build-time
+dependency.
+
+In runtime, OVN should be able to work with any reasonably fresh version of
+Open vSwitch (not necessarily the version that it was compiled against.)
+
+OVN may make use of new runtime features of Open vSwitch that are only
+available in a particular release. OVN is expected to test for an Open vSwitch
+feature presence before using it, and gracefully handle scenarios where Open
+vSwitch doesn't support a particular optional feature, yet.
 
 Upgrade procedures
 ------------------
@@ -67,6 +73,11 @@ upgrading from and to simultaneously.
 To avoid buildup of complexity and technical debt we limit the span of versions
 supported for a rolling upgrade on :ref:`long-term-support` (LTS), and it
 should always be possible to upgrade from the previous LTS version to the next.
+
+The following rolling upgrade paths are supported:
+
+1. LTS to the very next LTS release, or to any non-LTS in between the two.
+2. Any non-LTS to the very next LTS release.
 
 The first LTS version of OVN was 22.03.  If you want to upgrade between other
 versions, you can use the `Fail-safe upgrade`_ procedure.

@@ -1032,11 +1032,11 @@ reprocess_count_old=$(read_counter consider_logical_flow)
 check ovn-nbctl add address_set as1 addresses 10.0.0.21,10.0.0.22 -- \
                 remove address_set as1 addresses 10.0.0.10
 check ovn-nbctl --wait=hv sync
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c 10\.0\.0\.21], [0], [1
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c "10\.0\.0\.21"], [0], [1
 ])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c 10\.0\.0\.22], [0], [1
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c "10\.0\.0\.22"], [0], [1
 ])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep 10\.0\.0\.10], [1], [ignore])
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep "10\.0\.0\.10"], [1], [ignore])
 
 reprocess_count_new=$(read_counter consider_logical_flow)
 AT_CHECK([echo $(($reprocess_count_new - $reprocess_count_old))], [0], [0
@@ -1048,9 +1048,9 @@ reprocess_count_old=$(read_counter consider_logical_flow)
 check ovn-nbctl remove address_set as1 addresses 10.0.0.21,10.0.0.22 -- \
                 add address_set as1 addresses 10.0.0.10
 check ovn-nbctl --wait=hv sync
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep 10\.0\.0\.21], [1], [ignore])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep 10\.0\.0\.22], [1], [ignore])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c 10\.0\.0\.10], [0], [1
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep "10\.0\.0\.21"], [1], [ignore])
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep "10\.0\.0\.22"], [1], [ignore])
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c "10\.0\.0\.10"], [0], [1
 ])
 
 reprocess_count_new=$(read_counter consider_logical_flow)
@@ -1063,9 +1063,9 @@ reprocess_count_old=$(read_counter consider_logical_flow)
 check ovn-nbctl add address_set as1 addresses 10.0.0.21 -- \
                 remove address_set as1 addresses 10.0.0.10
 check ovn-nbctl --wait=hv sync
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c 10\.0\.0\.21], [0], [1
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c "10\.0\.0\.21"], [0], [1
 ])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep 10\.0\.0\.10], [1], [ignore])
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep "10\.0\.0\.10"], [1], [ignore])
 
 reprocess_count_new=$(read_counter consider_logical_flow)
 AT_CHECK([echo $(($reprocess_count_new - $reprocess_count_old))], [0], [0
@@ -1077,12 +1077,12 @@ reprocess_count_old=$(read_counter consider_logical_flow)
 check ovn-nbctl add address_set as1 addresses 10.0.0.22,10.0.0.23 -- \
                 remove address_set as1 addresses 10.0.0.9,10.0.0.8
 check ovn-nbctl --wait=hv sync
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c 10\.0\.0\.22], [0], [1
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c "10\.0\.0\.22"], [0], [1
 ])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c 10\.0\.0\.23], [0], [1
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c "10\.0\.0\.23"], [0], [1
 ])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep 10\.0\.0\.8], [1], [ignore])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep 10\.0\.0\.9], [1], [ignore])
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep "10\.0\.0\.8"], [1], [ignore])
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep "10\.0\.0\.9"], [1], [ignore])
 
 reprocess_count_new=$(read_counter consider_logical_flow)
 AT_CHECK([echo $(($reprocess_count_new - $reprocess_count_old))], [0], [0
@@ -1231,11 +1231,11 @@ reprocess_count_old=$(read_counter consider_logical_flow)
 check ovn-nbctl add address_set as1 addresses 10.0.0.21,10.0.0.22 -- \
                 remove address_set as1 addresses 10.0.0.10
 check ovn-nbctl --wait=hv sync
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c 10\.0\.0\.21], [0], [1
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c "10\.0\.0\.21"], [0], [1
 ])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c 10\.0\.0\.22], [0], [1
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c "10\.0\.0\.22"], [0], [1
 ])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep 10\.0\.0\.10], [1], [ignore])
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep "10\.0\.0\.10"], [1], [ignore])
 
 reprocess_count_new=$(read_counter consider_logical_flow)
 AT_CHECK([echo $(($reprocess_count_new - $reprocess_count_old))], [0], [0
@@ -1247,9 +1247,9 @@ reprocess_count_old=$(read_counter consider_logical_flow)
 check ovn-nbctl remove address_set as1 addresses 10.0.0.21,10.0.0.22 -- \
                 add address_set as1 addresses 10.0.0.10
 check ovn-nbctl --wait=hv sync
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep 10\.0\.0\.21], [1], [ignore])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep 10\.0\.0\.22], [1], [ignore])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c 10\.0\.0\.10], [0], [1
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep "10\.0\.0\.21"], [1], [ignore])
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep "10\.0\.0\.22"], [1], [ignore])
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c "10\.0\.0\.10"], [0], [1
 ])
 
 reprocess_count_new=$(read_counter consider_logical_flow)
@@ -1262,9 +1262,9 @@ reprocess_count_old=$(read_counter consider_logical_flow)
 check ovn-nbctl add address_set as1 addresses 10.0.0.21 -- \
                 remove address_set as1 addresses 10.0.0.10
 check ovn-nbctl --wait=hv sync
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c 10\.0\.0\.21], [0], [1
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c "10\.0\.0\.21"], [0], [1
 ])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep 10\.0\.0\.10], [1], [ignore])
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep "10\.0\.0\.10"], [1], [ignore])
 
 reprocess_count_new=$(read_counter consider_logical_flow)
 AT_CHECK([echo $(($reprocess_count_new - $reprocess_count_old))], [0], [0
@@ -1276,12 +1276,12 @@ reprocess_count_old=$(read_counter consider_logical_flow)
 check ovn-nbctl add address_set as1 addresses 10.0.0.22,10.0.0.23 -- \
                 remove address_set as1 addresses 10.0.0.9,10.0.0.8
 check ovn-nbctl --wait=hv sync
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c 10\.0\.0\.22], [0], [1
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c "10\.0\.0\.22"], [0], [1
 ])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c 10\.0\.0\.23], [0], [1
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep -c "10\.0\.0\.23"], [0], [1
 ])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep 10\.0\.0\.8], [1], [ignore])
-AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep 10\.0\.0\.9], [1], [ignore])
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep "10\.0\.0\.8"], [1], [ignore])
+AT_CHECK([ovs-ofctl dump-flows br-int table=$acl_eval | grep "10\.0\.0\.9"], [1], [ignore])
 
 reprocess_count_new=$(read_counter consider_logical_flow)
 AT_CHECK([echo $(($reprocess_count_new - $reprocess_count_old))], [0], [0
@@ -2487,7 +2487,8 @@ check ovn-nbctl lsp-add ls-ext lsp-ext \
     -- lsp-set-addresses lsp-ext unknown
 check ovn-nbctl --wait=hv sync
 
-AT_CHECK([ovs-vsctl list-ports br-int | grep patch-br-int-to-lsp-ext], [0], [ignore])
+# Patch port might be created by ovn-controller after handling nb_cfg sync, if ovs db is busy handling command.
+OVS_WAIT_UNTIL([test 1 = $(ovs-vsctl list-ports br-int | grep patch-br-int-to-lsp-ext | wc -l)])
 
 # Stop ovn-controller
 OVS_APP_EXIT_AND_WAIT([ovn-controller])
@@ -2970,6 +2971,159 @@ priority=1100,ip,reg15=0x1,metadata=0x1,nw_src=10.0.0.2 actions=load:0x1->OXM_OF
 priority=1100,ip,reg15=0x1,metadata=0x1,nw_src=10.0.0.3 actions=load:0x1->OXM_OF_PKT_REG4[[49]],resubmit(,$acl_action)
 priority=1100,ip,reg15=0x1,metadata=0x1,nw_src=10.0.0.4 actions=load:0x1->OXM_OF_PKT_REG4[[49]],resubmit(,$acl_action)
 ])
+
+OVN_CLEANUP([hv1])
+AT_CLEANUP
+
+AT_SETUP([ovn-controller - LB remove after disconnect])
+ovn_start
+
+net_add n1
+sim_add hv1
+as hv1
+check ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.1
+check ovs-vsctl -- add-port br-int vif1 -- \
+    set interface vif1 external-ids:iface-id=lsp
+
+check ovs-vsctl set Open_vSwitch . external-ids:ovn-remote-probe-interval="5000"
+
+check ovn-nbctl ls-add ls
+check ovn-nbctl lsp-add ls lsp \
+-- lsp-set-addresses lsp "f0:00:00:00:00:01 172.16.0.10"
+
+check ovn-nbctl lb-add lb 192.168.100.100 172.16.0.10
+check ovn-nbctl ls-lb-add ls lb
+
+wait_for_ports_up
+check ovn-nbctl --wait=hv sync
+
+sleep_sb
+OVS_WAIT_UNTIL([grep -q 'OVNSB commit failed' hv1/ovn-controller.log])
+
+sleep_controller hv1
+wake_up_sb
+
+ovn-nbctl lb-del lb
+
+wake_up_controller hv1
+check ovn-nbctl --wait=hv sync
+
+OVN_CLEANUP([hv1
+/no response to inactivity probe after .* seconds, disconnecting/d])
+AT_CLEANUP
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn-controller - pmtud flows])
+AT_KEYWORDS([pmtud])
+
+ovn_start
+
+net_add n1
+sim_add hv1
+ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.1
+
+check ovn-nbctl ls-add ls1 \
+    -- set logical_switch ls1 other-config:requested-tnl-key=1 \
+    -- lsp-add ls1 lsp1 \
+    -- lsp-set-addresses lsp1 "00:00:00:00:00:01 192.168.1.1" \
+    -- set logical_switch_port lsp1 options:requested-tnl-key=1 \
+    -- lsp-add ls1 lsp2 \
+    -- lsp-set-addresses lsp2 "00:00:00:00:00:02 192.168.1.2" \
+    -- set logical_switch_port lsp2 options:requested-tnl-key=2
+
+as hv1
+check ovs-vsctl \
+    -- add-port br-int vif1 \
+    -- set Interface vif1 external_ids:iface-id=lsp1 \
+    -- add-port br-int vif2 \
+    -- set Interface vif2 external_ids:iface-id=lsp2
+
+wait_for_ports_up
+check ovn-nbctl --wait=hv sync
+
+AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=OFTABLE_CT_ZONE_LOOKUP | \
+          sed -e 's/load:0x[[0-9]]\+/load:0x?/g' | grep -v NXST_FLOW | \
+          awk '{print $7, $8}' | sort], [0], [dnl
+priority=0 actions=resubmit(,OFTABLE_LOG_INGRESS_PIPELINE)
+priority=100,reg14=0x1,metadata=0x1 actions=load:0x?->NXM_NX_REG13[[0..15]],load:0x?->NXM_NX_REG11[[]],load:0x?->NXM_NX_REG12[[]],resubmit(,OFTABLE_LOG_INGRESS_PIPELINE)
+priority=100,reg14=0x2,metadata=0x1 actions=load:0x?->NXM_NX_REG13[[0..15]],load:0x?->NXM_NX_REG11[[]],load:0x?->NXM_NX_REG12[[]],resubmit(,OFTABLE_LOG_INGRESS_PIPELINE)
+])
+
+check ovn-nbctl lsp-add ls1 lsp3 \
+    -- lsp-set-addresses lsp3 "00:00:00:00:00:03 192.168.1.3" \
+    -- set logical_switch_port lsp3 options:requested-tnl-key=3
+check ovs-vsctl \
+    -- add-port br-int vif3 \
+    -- set Interface vif3 external_ids:iface-id=lsp3
+
+wait_for_ports_up
+check ovn-nbctl --wait=hv sync
+
+AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=OFTABLE_CT_ZONE_LOOKUP | \
+          sed -e 's/load:0x[[0-9]]\+/load:0x?/g' | grep -v NXST_FLOW | \
+          awk '{print $7, $8}' | sort], [0], [dnl
+priority=0 actions=resubmit(,OFTABLE_LOG_INGRESS_PIPELINE)
+priority=100,reg14=0x1,metadata=0x1 actions=load:0x?->NXM_NX_REG13[[0..15]],load:0x?->NXM_NX_REG11[[]],load:0x?->NXM_NX_REG12[[]],resubmit(,OFTABLE_LOG_INGRESS_PIPELINE)
+priority=100,reg14=0x2,metadata=0x1 actions=load:0x?->NXM_NX_REG13[[0..15]],load:0x?->NXM_NX_REG11[[]],load:0x?->NXM_NX_REG12[[]],resubmit(,OFTABLE_LOG_INGRESS_PIPELINE)
+priority=100,reg14=0x3,metadata=0x1 actions=load:0x?->NXM_NX_REG13[[0..15]],load:0x?->NXM_NX_REG11[[]],load:0x?->NXM_NX_REG12[[]],resubmit(,OFTABLE_LOG_INGRESS_PIPELINE)
+])
+
+check ovn-nbctl --wait=hv lsp-del lsp3
+AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=OFTABLE_CT_ZONE_LOOKUP | \
+          sed -e 's/load:0x[[0-9]]\+/load:0x?/g' | grep -v NXST_FLOW | \
+          awk '{print $7, $8}' | sort], [0], [dnl
+priority=0 actions=resubmit(,OFTABLE_LOG_INGRESS_PIPELINE)
+priority=100,reg14=0x1,metadata=0x1 actions=load:0x?->NXM_NX_REG13[[0..15]],load:0x?->NXM_NX_REG11[[]],load:0x?->NXM_NX_REG12[[]],resubmit(,OFTABLE_LOG_INGRESS_PIPELINE)
+priority=100,reg14=0x2,metadata=0x1 actions=load:0x?->NXM_NX_REG13[[0..15]],load:0x?->NXM_NX_REG11[[]],load:0x?->NXM_NX_REG12[[]],resubmit(,OFTABLE_LOG_INGRESS_PIPELINE)
+])
+
+OVN_CLEANUP([hv1])
+AT_CLEANUP
+])
+
+AT_SETUP([ovn-controller - br-int remote])
+AT_KEYWORDS([ovn])
+ovn_start
+
+net_add n1
+sim_add hv1
+ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.20
+ovs-vsctl -- add-port br-int vif1 -- \
+    set interface vif1 external-ids:iface-id=vif1
+
+# Set the br-int remote and wait for the connection
+check ovs-vsctl set-controller br-int ptcp:1234
+check ovs-vsctl -- \
+    set open . external-ids:ovn-bridge-remote="tcp:127.0.0.1:1234" -- \
+    set open . external-ids:ovn-bridge-remote-probe-interval=5000
+
+OVS_WAIT_UNTIL([test $(grep -c 'connecting to switch: "tcp:127.0.0.1:1234"' hv1/ovn-controller.log) = 4])
+OVS_WAIT_UNTIL([grep -q 'tcp:127.0.0.1:1234: connected' hv1/ovn-controller.log])
+
+check ovn-nbctl ls-add sw0
+
+check ovn-nbctl lsp-add sw0 vif1
+check ovn-nbctl lsp-set-addresses vif1 "00:00:00:00:00:01 192.168.0.10 1000::10"
+
+wait_for_ports_up
+check ovn-nbctl --wait=hv sync
+
+check ovs-vsctl -- \
+    remove open . external-ids ovn-bridge-remote -- \
+    remove open . external-ids ovn-bridge-remote-probe-interval
+
+check ovs-vsctl del-controller br-int
+
+# Set different br-int remote and wait for the connection
+check ovs-vsctl set-controller br-int ptcp:1235
+check ovs-vsctl -- \
+    set open . external-ids:ovn-bridge-remote="tcp:127.0.0.1:1235"
+
+OVS_WAIT_UNTIL([test $(grep -c 'connecting to switch: "tcp:127.0.0.1:1235"' hv1/ovn-controller.log) = 4])
+OVS_WAIT_UNTIL([grep -q 'tcp:127.0.0.1:1235: connected' hv1/ovn-controller.log])
 
 OVN_CLEANUP([hv1])
 AT_CLEANUP

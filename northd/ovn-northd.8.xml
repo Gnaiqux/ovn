@@ -324,8 +324,7 @@
       'packet too big' and <code>eth.src == <var>D</var> &amp;&amp;
       outport == <var>P</var> &amp;&amp; flags.tunnel_rx == 1</code> where
       <var>D</var> is the peer logical router port <var>RP</var> mac address,
-      swaps inport and outport and applies the action <code>
-      next(pipeline=S_SWITCH_IN_L2_LKUP)</code>.
+      swaps inport and outport and applies the action <code>next</code>.
     </p>
 
     <p>
@@ -338,7 +337,16 @@
     </p>
 
     <p>
-      This table adds a priority-110 flow that matches 'recirculated' icmp{4,6}
+      For each logical switch port <var>P</var> a priority-110 flow that
+      matches 'recirculated' icmp{4,6} error 'packet too big' and <code>
+      eth.src == <var>D</var> &amp;&amp; outport == <var>P</var> &amp;&amp;
+      !is_chassis_resident("<var>P</var>") &amp;&amp; flags.tunnel_rx == 1
+      </code> where <var>D</var> is the logical switch port mac address,
+      swaps inport and outport and applies the action <code>next</code>.
+    </p>
+
+    <p>
+      This table adds a priority-105 flow that matches 'recirculated' icmp{4,6}
       error 'packet too big' to drop the packet.
     </p>
 
@@ -1435,9 +1443,10 @@
 
       <li>
         <p>
-          Priority-50 flows that match ARP requests to each known IP address
-          <var>A</var> of every logical switch port, and respond with ARP
-          replies directly with corresponding Ethernet address <var>E</var>:
+          Priority-50 flows that match only broadcast ARP requests to each
+          known IPv4 address <var>A</var> of every logical switch port, and
+          respond with ARP replies directly with corresponding Ethernet
+          address <var>E</var>:
         </p>
 
         <pre>
@@ -1948,13 +1957,13 @@ output;
       </li>
 
       <li>
-        Priority-90 flows for non-transit switches that forward registered
-        IP multicast traffic to their corresponding multicast group, which
-        <code>ovn-northd</code> creates based on learnt
-        <ref table="IGMP_Group" db="OVN_Southbound"/> entries.  The flows
-        also forward packets to the <code>MC_MROUTER_FLOOD</code> multicast
-        group, which <code>ovn-nortdh</code> populates with all the logical
-        ports that are connected to logical routers with
+        Priority-90 flows that forward registered IP multicast traffic to
+        their corresponding multicast group, which <code>ovn-northd</code>
+        creates based on learnt <ref table="IGMP_Group" db="OVN_Southbound"/>
+        entries.  The flows also forward packets to the
+        <code>MC_MROUTER_FLOOD</code> multicast group, which
+        <code>ovn-nortdh</code> populates with all the logical ports that
+        are connected to logical routers with
         <ref column="options" table="Logical_Router"/>:mcast_relay='true'.
       </li>
 
@@ -2479,7 +2488,7 @@ output;
         </p>
 
         <p>
-          This table adds a priority-110 flow that matches 'recirculated'
+          This table adds a priority-105 flow that matches 'recirculated'
           icmp{4,6} error 'packet too big' to drop the packet.
         </p>
 
@@ -3786,6 +3795,23 @@ next;
           <code>exempted_ext_ips</code>.
         </p>
 
+        <p>
+          For each configuration in the OVN Northbound database, that asks
+          to change the destination IP address of a packet from <var>A</var>
+          to <var>B</var>, match <var>M</var> and priority <var>P</var>,
+          a logical flow that matches <code>ip &amp;&amp; ip4.dst ==
+          <var>A</var></code> or <code>ip &amp;&amp; ip6.dst == <var>A</var>
+          &amp;&amp; (<var>M</var>)</code> with an action
+          <code>flags.loopback = 1; ct_dnat(<var>B</var>);</code>.
+          The priority of the flow is calculated based as
+          <code>300 + <var>P</var></code>.  If the Gateway router is
+          configured to force SNAT any DNATed packet, the above action will
+          be replaced by <code>flags.force_snat_for_dnat = 1;
+          flags.loopback = 1; ct_dnat(<var>B</var>);</code>. If the NAT rule
+          is of type dnat_and_snat and has <code>stateless=true</code> in the
+          options, then the action would be <code>ip4/6.dst=
+          (<var>B</var>)</code>.
+        </p>
       </li>
 
       <li>
@@ -5153,6 +5179,20 @@ nd_ns {
           of type dnat_and_snat and has <code>stateless=true</code> in the
           options, then the action would be <code>ip4/6.src=
           (<var>B</var>)</code>.
+        </p>
+
+        <p>
+          For each configuration in the OVN Northbound database, that asks
+          to change the source IP address of a packet from an IP address of
+          <var>A</var> or to change the source IP address of a packet that
+          belongs to network <var>A</var> to <var>B</var>, match <var>M</var>
+          and priority <var>P</var>, a flow matches <code>ip &amp;&amp;
+          ip4.src == <var>A</var> &amp;&amp; (!ct.trk || !ct.rpl) &amp;&amp;
+          (<var>M</var>)</code> with an action <code>ct_snat(<var>B</var>);
+          </code>.  The priority of the flow is calculated based as
+          <code>300 + <var>P</var></code>.  If the NAT rule is of type
+          dnat_and_snat and has <code>stateless=true</code> in the options,
+          then the action would be <code>ip4/6.src=(<var>B</var>)</code>.
         </p>
       </li>
 

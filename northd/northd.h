@@ -362,12 +362,6 @@ ovn_datapath_is_stale(const struct ovn_datapath *od)
     return !od->nbr && !od->nbs;
 };
 
-static inline bool
-ovn_datapath_is_transit_switch(const struct ovn_datapath *od)
-{
-    return od->tunnel_key >= OVN_MIN_DP_KEY_GLOBAL;
-}
-
 /* Pipeline stages. */
 
 /* The two purposes for which ovn-northd uses OVN logical datapaths. */
@@ -586,13 +580,11 @@ struct ovn_port {
     /* Logical port multicast data. */
     struct mcast_port_info mcast_info;
 
-    /* At most one of l3dgw_port and cr_port can be not NULL. */
+    /* At most one of primary_port and cr_port can be not NULL. */
 
-    /* This is set to a distributed gateway port if and only if this ovn_port
-     * is "derived" from it. Otherwise this is set to NULL. The derived
-     * ovn_port represents the instance of distributed gateway port on the
-     * gateway chassis.*/
-    struct ovn_port *l3dgw_port;
+    /* If this ovn_port is a derived port, then 'primary_port' points to the
+     * port from which this ovn_port is derived. */
+    struct ovn_port *primary_port;
 
     /* This is set to the "derived" chassis-redirect port of this port if and
      * only if this port is a distributed gateway port. Otherwise this is set
@@ -791,6 +783,10 @@ lr_has_multiple_gw_ports(const struct ovn_datapath *od)
     return od->n_l3dgw_ports > 1 && !od->is_gw_router;
 }
 
-uint32_t get_ovn_max_dp_key_local(const struct sbrec_chassis_table *);
+bool
+is_vxlan_mode(const struct smap *nb_options,
+              const struct sbrec_chassis_table *sbrec_chassis_table);
+
+uint32_t get_ovn_max_dp_key_local(bool _vxlan_mode);
 
 #endif /* NORTHD_H */

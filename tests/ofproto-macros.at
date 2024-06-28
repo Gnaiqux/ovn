@@ -196,7 +196,7 @@ m4_define([_OVS_VSWITCHD_START],
 
    dnl Start ovsdb-server.
    AT_CHECK([ovsdb-server --detach --no-chdir --pidfile --log-file --remote=punix:$OVS_RUNDIR/db.sock], [0], [], [stderr])
-   on_exit "kill `cat ovsdb-server.pid`"
+   on_exit "test -e `cat ovsdb-server.pid` && kill `cat ovsdb-server.pid`"
    AT_CHECK([[sed < stderr '
 /vlog|INFO|opened log file/d
 /ovsdb_server|INFO|ovsdb-server (Open vSwitch)/d']])
@@ -354,11 +354,11 @@ add_pmd_of_ports () {
 
 m4_divert_pop([PREPARE_TESTS])
 
-# OVS_VSWITCHD_STOP([WHITELIST])
+# OVS_VSWITCHD_STOP([ALLOWLIST])
 #
 # Gracefully stops ovs-vswitchd and ovsdb-server, checking their log files
 # for messages with severity WARN or higher and signaling an error if any
-# is present.  The optional WHITELIST may contain shell-quoted "sed"
+# is present.  The optional ALLOWLIST may contain shell-quoted "sed"
 # commands to delete any warnings that are actually expected, e.g.:
 #
 #   OVS_VSWITCHD_STOP(["/expected error/d"])
