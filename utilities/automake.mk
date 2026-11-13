@@ -17,18 +17,13 @@ man_MANS += \
 MAN_ROOTS += \
     utilities/ovn-detrace.1.in
 
-# Docker drivers
 bin_SCRIPTS += \
-    utilities/ovn-docker-overlay-driver \
-    utilities/ovn-docker-underlay-driver \
     utilities/ovn_detrace.py
 
 EXTRA_DIST += \
     utilities/ovn-ctl \
     utilities/ovn-lib.in \
     utilities/ovn-ctl.8.xml \
-    utilities/ovn-docker-overlay-driver.in \
-    utilities/ovn-docker-underlay-driver.in \
     utilities/ovn-nbctl.8.xml \
     utilities/ovn-sbctl.8.xml \
     utilities/ovn-ic-nbctl.8.xml \
@@ -42,24 +37,13 @@ EXTRA_DIST += \
     utilities/containers/Makefile \
     utilities/containers/openbfdd.patch \
     utilities/containers/py-requirements.txt \
+    utilities/containers/prepare.sh \
     utilities/containers/fedora/Dockerfile \
-    utilities/containers/ubuntu/Dockerfile \
-    utilities/docker/Makefile \
-    utilities/docker/start-ovn \
-    utilities/docker/ovn_default_nb_port \
-    utilities/docker/ovn_default_sb_port \
-    utilities/docker/ovn_default_northd_host \
-    utilities/docker/debian/Dockerfile \
-    utilities/docker/debian/build.sh \
-    utilities/docker/rhel/Dockerfile \
-    utilities/docker/rhel/build.sh \
-    utilities/docker/install_ovn.sh
+    utilities/containers/ubuntu/Dockerfile
 
 CLEANFILES += \
     utilities/ovn-ctl.8 \
     utilities/ovn-lib \
-    utilities/ovn-docker-overlay-driver \
-    utilities/ovn-docker-underlay-driver \
     utilities/ovn-nbctl.8 \
     utilities/ovn-sbctl.8 \
     utilities/ovn-ic-nbctl.8 \
@@ -70,11 +54,7 @@ CLEANFILES += \
     utilities/ovn-detrace \
     utilities/ovn_detrace.py \
     utilities/ovn-appctl.8 \
-    utilities/ovn-appctl \
-    utilities/ovn-sim
-
-EXTRA_DIST += utilities/ovn-sim.in
-noinst_SCRIPTS += utilities/ovn-sim
+    utilities/ovn-appctl
 
 utilities/ovn-lib: $(top_builddir)/config.status
 
@@ -115,7 +95,7 @@ utilities_ovn_appctl_SOURCES = utilities/ovn-appctl.c
 utilities_ovn_appctl_LDADD = lib/libovn.la $(OVSDB_LIBDIR)/libovsdb.la $(OVS_LIBDIR)/libopenvswitch.la
 
 # ovn-detrace
-INSTALL_DATA_LOCAL += ovn-detrace-install
+INSTALL_DATA_HOOK += ovn-detrace-install
 ovn-detrace-install:
 	ln -sf ovn_detrace.py $(DESTDIR)$(bindir)/ovn-detrace
 
@@ -128,4 +108,10 @@ bin_PROGRAMS += utilities/ovn-debug
 utilities_ovn_debug_SOURCES = utilities/ovn-debug.c
 utilities_ovn_debug_LDADD = lib/libovn.la $(OVSDB_LIBDIR)/libovsdb.la $(OVS_LIBDIR)/libopenvswitch.la
 
-include utilities/bugtool/automake.mk
+# ovn-brctl
+bin_PROGRAMS += utilities/ovn-brctl
+utilities_ovn_brctl_SOURCES = \
+    utilities/ovn-dbctl.c \
+    utilities/ovn-dbctl.h \
+    utilities/ovn-brctl.c
+utilities_ovn_brctl_LDADD = lib/libovn.la $(OVSDB_LIBDIR)/libovsdb.la $(OVS_LIBDIR)/libopenvswitch.la

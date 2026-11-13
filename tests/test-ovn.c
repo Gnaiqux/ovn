@@ -266,6 +266,13 @@ lookup_port_cb(const void *ports_, const char *port_name, unsigned int *portp)
 }
 
 static bool
+lookup_local_port_cb(const void *ports_, const char *port_name)
+{
+    const struct simap *ports = ports_;
+    return !!simap_find(ports, port_name);
+}
+
+static bool
 lookup_tunnel_ofport(const void *ports_, const char *port_name,
                      ofp_port_t *ofport)
 {
@@ -954,7 +961,8 @@ test_tree_shape_exhaustively(struct expr *expr, struct shash *symtab,
                 test_rule = xmalloc(sizeof *test_rule);
                 cls_rule_init(&test_rule->cr, &m->match, 0);
                 classifier_insert(&cls, &test_rule->cr, OVS_VERSION_MIN,
-                                  m->conjunctions, m->n);
+                                  vector_get_array(&m->conjunctions),
+                                  vector_len(&m->conjunctions));
             }
         }
         for (int subst = 0; subst < 1 << (n_bits * n_nvars + n_svars);
@@ -1050,7 +1058,6 @@ test_tree_shape_exhaustively(struct expr *expr, struct shash *symtab,
     }
 }
 
-#ifndef _WIN32
 static void
 wait_pid(pid_t *pids, int *n)
 {
@@ -1079,7 +1086,6 @@ wait_pid(pid_t *pids, int *n)
     }
     ovs_fatal(0, "waitpid returned unknown child");
 }
-#endif
 
 static void
 test_exhaustive(struct ovs_cmdl_context *ctx OVS_UNUSED)
@@ -1110,10 +1116,8 @@ test_exhaustive(struct ovs_cmdl_context *ctx OVS_UNUSED)
         free(name);
     }
 
-#ifndef _WIN32
     pid_t *children = xmalloc(test_parallel * sizeof *children);
     int n_children = 0;
-#endif
 
     int n_tested = 0;
     for (int i = 0; i < 2; i++) {
@@ -1136,7 +1140,6 @@ test_exhaustive(struct ovs_cmdl_context *ctx OVS_UNUSED)
                 ds_destroy(&s);
             }
 
-#ifndef _WIN32
             if (test_parallel > 1) {
                 pid_t pid = xfork();
                 if (!pid) {
@@ -1152,9 +1155,7 @@ test_exhaustive(struct ovs_cmdl_context *ctx OVS_UNUSED)
                     }
                     children[n_children++] = pid;
                 }
-            } else
-#endif
-            {
+            } else {
                 n_tested += test_tree_shape_exhaustively(
                     expr, &symtab, terminals, n_terminals,
                     nvars, test_nvars, test_bits,
@@ -1163,12 +1164,11 @@ test_exhaustive(struct ovs_cmdl_context *ctx OVS_UNUSED)
             expr_destroy(expr);
         }
     }
-#ifndef _WIN32
+
     while (n_children > 0) {
         wait_pid(children, &n_children);
     }
     free(children);
-#endif
 
     printf("Tested ");
     switch (operation) {
@@ -1326,6 +1326,13 @@ test_parse_actions(struct ovs_cmdl_context *ctx OVS_UNUSED)
 
         puts(ds_cstr(&input));
 
+        struct lex_str exp_input;
+        if (!lexer_parse_template_string(&exp_input, ds_cstr(&input),
+                                         &template_vars, NULL)) {
+            printf("    failed to parse %s\n", ds_cstr(&input));
+            continue;
+        }
+
         ofpbuf_init(&ovnacts, 0);
 
         const struct ovnact_parse_params pp = {
@@ -1334,11 +1341,11 @@ test_parse_actions(struct ovs_cmdl_context *ctx OVS_UNUSED)
             .dhcpv6_opts = &dhcpv6_opts,
             .nd_ra_opts = &nd_ra_opts,
             .controller_event_opts = &event_opts,
-            .n_tables = 24,
+            .pipeline = OVNACT_P_INGRESS,
+            .n_tables = LOG_PIPELINE_INGRESS_LEN,
             .cur_ltable = 10,
         };
-        struct lex_str exp_input =
-            lexer_parse_template_string(ds_cstr(&input), &template_vars, NULL);
+
         error = ovnacts_parse_string(lex_str_get(&exp_input), &pp, &ovnacts,
                                      &prereqs);
         if (!error) {
@@ -1353,13 +1360,13 @@ test_parse_actions(struct ovs_cmdl_context *ctx OVS_UNUSED)
             /* Encode the actions into OpenFlow and print. */
             const struct ovnact_encode_params ep = {
                 .lookup_port = lookup_port_cb,
+                .lookup_local_port = lookup_local_port_cb,
                 .tunnel_ofport = lookup_tunnel_ofport,
                 .aux = &ports,
                 .is_switch = true,
                 .group_table = &group_table,
                 .meter_table = &meter_table,
                 .collector_ids = &collector_ids,
-                .explicit_arp_ns_output = true,
 
                 .pipeline = OVNACT_P_INGRESS,
                 .ingress_ptable = OFTABLE_LOG_INGRESS_PIPELINE,
@@ -1371,11 +1378,19 @@ test_parse_actions(struct ovs_cmdl_context *ctx OVS_UNUSED)
                 .lb_hairpin_reply_ptable = OFTABLE_CHK_LB_HAIRPIN_REPLY,
                 .ct_snat_vip_ptable = OFTABLE_CT_SNAT_HAIRPIN,
                 .fdb_ptable = OFTABLE_GET_FDB,
+                .remote_fdb_ptable = OFTABLE_GET_REMOTE_FDB,
                 .fdb_lookup_ptable = OFTABLE_LOOKUP_FDB,
                 .common_nat_ct_zone = MFF_LOG_DNAT_ZONE,
                 .in_port_sec_ptable = OFTABLE_CHK_IN_PORT_SEC,
                 .out_port_sec_ptable = OFTABLE_CHK_OUT_PORT_SEC,
                 .mac_cache_use_table = OFTABLE_MAC_CACHE_USE,
+                .ct_nw_dst_load_table = OFTABLE_CT_ORIG_NW_DST_LOAD,
+                .ct_ip6_dst_load_table = OFTABLE_CT_ORIG_IP6_DST_LOAD,
+                .ct_tp_dst_load_table = OFTABLE_CT_ORIG_TP_DST_LOAD,
+                .ct_proto_load_table = OFTABLE_CT_ORIG_PROTO_LOAD,
+                .flood_remote_table = OFTABLE_FLOOD_REMOTE_CHASSIS,
+                .ct_state_save_table = OFTABLE_CT_STATE_SAVE,
+                .evpn_arp_ptable = OFTABLE_EVPN_ARP_LOOKUP,
                 .lflow_uuid.parts =
                     { 0xaaaaaaaa, 0xbbbbbbbb, 0xcccccccc, 0xdddddddd},
                 .dp_key = 0xabcdef,
@@ -1449,6 +1464,22 @@ test_parse_actions(struct ovs_cmdl_context *ctx OVS_UNUSED)
     ovn_extend_table_destroy(&meter_table);
     flow_collector_ids_destroy(&collector_ids);
     exit(ok ? EXIT_SUCCESS : EXIT_FAILURE);
+}
+
+static void
+test_parse_eth_addr(struct ovs_cmdl_context *ctx)
+{
+    unsigned int plen;
+    struct eth_addr mac;
+
+    if (!eth_addr_parse_masked(ctx->argv[1], &mac, &plen)) {
+        ovs_assert(eth_addr_equals(mac, eth_addr_zero));
+        exit(EXIT_FAILURE);
+    }
+
+    printf(ETH_ADDR_FMT "/" ETH_ADDR_FMT " " ETH_ADDR_FMT "/%u\n",
+           ETH_ADDR_ARGS(mac), ETH_ADDR_ARGS(eth_addr_create_mask(plen)),
+           ETH_ADDR_ARGS(mac), plen);
 }
 
 static unsigned int
@@ -1536,6 +1567,9 @@ exhaustive N\n\
 parse-actions\n\
   Parses OVN actions from stdin and prints the equivalent OpenFlow actions\n\
   on stdout.\n\
+parse-eth-addr\n\
+  Parses masked MAC address from stdin and prints the equivalent MAC/plen\n\
+  and MAC/mask to stdout\n\
 ",
            program_name, program_name);
     exit(EXIT_SUCCESS);
@@ -1660,6 +1694,9 @@ test_ovn_main(int argc, char *argv[])
 
         /* Actions. */
         {"parse-actions", NULL, 0, 0, test_parse_actions, OVS_RO},
+
+        /* Utils. */
+        {"parse-eth-addr", NULL, 1, 1, test_parse_eth_addr, OVS_RO},
 
         {NULL, NULL, 0, 0, NULL, OVS_RO},
     };

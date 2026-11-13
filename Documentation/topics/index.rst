@@ -37,11 +37,13 @@ OVN
    :maxdepth: 2
 
    integration.rst
+   dynamic-routing/index
+   incremental-processing/index
    high-availability
    role-based-access-control
-   ovn-news-2.8
    vif-plug-providers/index
    testing
+   test-development
 
 .. list-table::
 

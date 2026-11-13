@@ -1,5 +1,466 @@
-Post v24.03.0
--------------
+Post v26.09.0
+--------------
+   - Router policies that used the deprecated "nexthop" column used to
+     always be skipped and not applied. Now these router policies are
+     only skipped if their action is "reroute". Router policies of type
+     "allow", "drop", and "jump" will still be accepted, even if the
+     "nexthop" column is set on those policies.
+   - Learn ARP sender hardware address (arp.sha) and IPv6 Neighbor
+     Discovery link-layer addresses (nd.tll, nd.sll) into the FDB
+     table in addition to eth.src.  This allows VRRP virtual MACs to
+     be learned from gratuitous ARP packets and unsolicited Neighbor
+     Advertisements.
+   - Allow FDB learning on logical switch ports that have both
+     port_security and "unknown" addresses configured.
+   - Added a new "options:ttl" key on the NB DNS table to make the TTL of
+     DNS replies from OVN's native DNS resolver configurable per row.
+   - Removed implementations of the commit_ecmp_nh, chk_ecmp_nh, and
+     chk_ecmp_nh_mac actions from the code.
+   - Mark tunnel ports as transient (other_config:transient=true) when the
+     local chassis is a member of an HA chassis group.
+     Systems which invoke ovs-ctl --delete-transient-ports during OVS startup
+     (e.g. via the ovs-delete-transient-ports.service on RHEL/Fedora) will
+     automatically remove stale tunnel ports on reboot, preventing them from
+     interfering with BFD and HA failover after a gateway chassis reboot.
+   - Transit_Router_Port entries with an empty "chassis" column are now
+     instantiated as distributed router ports in every availability zone,
+     instead of being ignored.  Such ports are useful to connect a transit
+     router to a transit switch.  Accordingly, "ovn-ic-nbctl trp-add" no
+     longer requires a trailing network or chassis argument.
+   - Dynamic Routing:
+     * Remove the "other_config:dynamic-routing-arp-prefer-local"
+       option from Logical Switches.  EVPN-learned MAC bindings are
+       now written to the SB MAC_Binding table and consumed at the
+       same priority as dynamic entries, making the preference option
+       obsolete.
+     * The routes of a distributed gateway port are now installed and
+       advertised by every member of its HA chassis group instead of only
+       by the active one.  The standby members use a higher priority band
+       (and hence a higher metric/BGP MED) so the fabric prefers the active
+       chassis while holding a precomputed backup path (BGP PIC Edge).
+     * "options:dynamic-routing-maintain-vrf" on a distributed gateway port
+       now creates the VRF on every member of the port's HA chassis group
+       instead of only on the active one, so the routing daemon can bring
+       up its session in the VRF before a failover.
+     * Add the "options:dynamic-routing-ecmp-selection-fields" option to
+       Logical Routers.  It selects the fields that ECMP groups of learned
+       routes hash on, the same as the "selection_fields" column of a
+       static route.
+     * Add the "other_config:dynamic-routing-fdb-ecmp-selection-fields"
+       option to Logical Switches.  It selects the fields that the
+       OpenFlow groups of multi-path EVPN FDB entries hash on, instead of
+       dp_hash.
+     * Learn routes whose next hop is described by a kernel nexthop object
+       referenced through a nexthop id (RTA_NH_ID) instead of being encoded
+       inline in the route.  Nexthop groups are expanded into one learned
+       route per group member, and the learned routes are updated when the
+       nexthop object they reference changes.
+   - Removed OVN's ovs-bugtool plugin and helper scripts.
+   - Removed ovn-sim utility scripts.
+   - Removed ovn-docker utility scripts.
+   - ovn-controller no longer monitors the whole cluster's Advertised_Route
+     table at startup; it defers its kernel route updates until the initial
+     dump of the advertised routes of the local route-exchange datapaths is
+     complete.
+
+OVN v26.09.0 - xxx xx xxxx
+--------------------------
+   - Logical_Router_Port: Added a new "options:dhcpv4_primary_ip" key
+     that selects which of the port's IPv4 addresses ovn-northd uses as
+     the relay agent address (giaddr) in relayed DHCP packets.  When
+     unset, ovn-northd picks the same address it picked before
+     (whichever CIDR in "networks" sorts first as a string), so
+     existing deployments are unaffected; deployments that need a
+     specific address on a multi-IP port can pin it via the new
+     option.
+   - OVN Interconnection now supports advertising Address_Sets to remote
+     availability zones.  Set options:ic-adv=true on an NB Address_Set to
+     have ovn-ic publish it to the IC-SB database and import it into the
+     Northbound databases of other availability zones.
+   - Load balancer health checks now "fail closed" for newly added backends:
+     ovn-northd initializes a newly created Service_Monitor row to the
+     "offline" state, so traffic is not forwarded to a backend until its first
+     health check probe succeeds.  Previously, such backends were treated as
+     available until the first probe completed.
+   - Added Transit Switch port support with new ovn-ic-nbctl 'tsp-add',
+     'tsp-del' and 'tsp-set-addr' commands.
+   - Added ability to set any "ipsec_*" NB_Global option to configure the
+     IPsec backend.
+   - Added nb_cfg_timestamp to SB_Global, written atomically with each
+     nb_cfg update by ovn-northd.  ovn-controller propagates this value
+     to the local OVS bridge external_ids as "ovn-nb-cfg-sb-ts".  In
+     large deployments where options:enable_chassis_nb_cfg_update is
+     false, this enables per-chassis propagation latency tracking without
+     any southbound database writes.
+   - Documented missing ovn-nbctl commands: "mirror-rule-add",
+     "mirror-rule-del", "lr-nat-update-ext-ip",
+     "ha-chassis-group-set-chassis-prio", "lsp-add-router-port",
+     and "lsp-add-localnet-port".  Also documented missing options for
+     "lb-add", "meter-add", "lr-policy-add", and "lr-policy-del", and
+     fixed the "nfg-list" signature.
+   - Dynamic Routing:
+     * Allow multiple routers to read from and advertise their routes to
+       the same VRF table.
+     * Add support for hub-and-spoke propagation via the "hub-spoke" option
+       in dynamic-routing-redistribute settings.
+     * Add ECMP/multi-homing support for EVPN FDB entries. FDB entries
+       backed by a kernel nexthop group are load-balanced via OpenFlow
+       select groups with weighted buckets.
+     * Add EVPN ARP/ND suppression for logical switches.  When a
+       broadcast ARP request or multicast ND solicitation targets
+       an IP address that was learned via EVPN, ovn-northd now
+       generates proxy-reply flows using a dedicated side table
+       and the new chk_evpn_arp() action, preventing unnecessary
+       flooding to remote VTEPs.
+     * Allow learning routes from the main (254) and default (253) routing
+       tables.
+     * EVPN: distributed dnat_and_snat NAT entries (e.g. floating IPs)
+       are now populated in the SB Advertised_MAC_Binding table on the
+       provider logical switch that carries the distributed gateway
+       port, so that they can be advertised as EVPN Type-2 routes.  This
+       is gated on a new "nat" token of the Logical_Switch
+       "dynamic-routing-redistribute" option, independent of "ip".
+     * ovn-controller now automatically discovers the veth peer interface
+       of a Logical Switch Port referenced by the "routing-protocol-redirect"
+       option, when that port is bound locally and connected through a veth
+       pair.  This removes the need to manually configure
+       "dynamic-routing-port-name" and/or the Open_vSwitch
+       "external_ids:dynamic-routing-port-mapping" for veth-based routing
+       daemon integrations.  This feature is Linux-only and requires
+       OVS version >= 4.0.
+     * Remove the "other_config:dynamic-routing-arp-prefer-local"
+       option from Logical Switches.  EVPN-learned MAC bindings are
+       now written to the SB MAC_Binding table and consumed at the
+       same priority as dynamic entries, making the preference option
+       obsolete.
+   - Added "override-connected" option to Logical Router Static Routes to mark
+     static routes as higher-priority than connected routes, which in turn led
+     to changes in administrative distance for specific route types. Please see
+     the "Route Administrative Distance" section of the ovn-northd manpage.
+   - Windows support was broken since the split from OVS repository.
+     Remaining bits of the build system and the documentation are now removed.
+   - Removed deprecated "port-up-notif", "ct-no-masked-label" and
+     "ovn-ct-lb-related" feature flags. At the same time mark
+     "mac-binding-timestamp", "fdb-timestamp" and "ls-dpg-column" feature
+     flags as deprecated.
+   - Removed the deprecated "ct_lb" action.
+   - Added a new "icmp4.inner_ip4.src" action that rewrites the source
+     IPv4 address embedded in an ICMPv4 error's inner packet.  ovn-northd
+     uses it for stateless "dnat_and_snat" rules, controlled by the new
+     "options:stateless_icmp_helper" NAT option (default true), so that
+     inbound ICMPv4 errors that quote the original datagram - Destination
+     Unreachable (type 3, including "fragmentation needed"), Time Exceeded
+     (type 11) and Parameter Problem (type 12) - generated by an external
+     router are un-NATed correctly.  This makes Path MTU discovery and
+     traceroute work through stateless NAT.
+   - Added the "ic-route-ipv4-next-hop-ipv6" option to Logical_Router (and,
+     as an override, to Logical_Router_Port) to advertise a router's IPv4
+     routes through ovn-ic using the interconnect port's IPv6 address as next
+     hop ("IPv4 over IPv6").
+   - Add vtap mode support for Network Function. In vtap mode, traffic matching
+     ACLs is mirrored to the network function while continuing to flow to the
+     original destination. This enables passive monitoring use cases where
+     network functions can observe traffic without being inline in
+     the data path.
+   - Added a new "ovn-debug lflow-pipeline-oftable-start-list" command that
+     prints the starting OpenFlow table number of the logical ingress and
+     egress pipelines.
+   - The support for co-hosting multiple controller instances is now
+     considered stable.  Its "experimental" tag has been removed.
+   - Added the "ic-route-learn-tag-rules" option to Logical_Router_Port to
+     filter the routes learned through the port by route tag.  This supersedes
+     "ic-route-filter-tag", which is now deprecated and is ignored when
+     "ic-route-learn-tag-rules" is set.
+   - Add Logical_Switch_Port option "is_router" for type=remote ports that
+     represent a logical router port (e.g. ovn-ic transit switch LSPs).
+     Such ports are treated like type=router, including omission from
+     _MC_flood_l2.
+   - Added a new "options:ic-backoff-interval-ms" key to the IC_NB_Global
+     table.  It caps how long ovn-ic postpones the next run of its
+     incremental-processing engine after the previous one finished,
+     coalescing bursts of change-driven runs into fewer, larger runs.  It
+     defaults to 0, which keeps running as soon as there is work to do.  A
+     forced full recompute is never delayed.
+   - ovn-ic now processes database changes incrementally.  Its processing
+     engine is split into one node per subsystem - availability zone,
+     gateways, transit switches and routers, datapath tunnel keys, port
+     bindings, routes, service monitors and address sets - and each node has
+     change handlers, so a change is reconciled in place instead of re-running
+     the whole ovn-ic computation.  The "inc-engine/show-stats" command
+     reports the per-node recompute counters.
+
+OVN v26.03.0 - xxx xx xxxx
+--------------------------
+   - Added LSP/LRP option "requested-encap-ip" to let CMS request a specific
+     SB Port_Binding encap IP (e.g., for transit switch ports in ovn-k8s
+     interconnect mode).
+   - Added DNS query statistics tracking in ovn-controller using OVS coverage
+     counters. Statistics can be queried using "ovn-appctl -t ovn-controller
+     coverage/read-counter <counter_name>" or "coverage/show". Tracked metrics
+     include total queries, query types (A, AAAA, PTR, ANY, Other), cache
+     performance (hits/misses), responses sent, and error conditions.
+   - Added support for TLS Server Name Indication (SNI) with the new
+     --ssl-server-name option in OVN utilities and daemons. This allows
+     specifying the server name for SNI, which is useful when connecting
+     through proxies or service meshes where the connection endpoint differs
+     from the intended server name. Without this option, the hostname from
+     the connection string is used for SNI, as before.
+   - Added disable_garp_rarp option to logical_router table in order to disable
+     GARP/RARP announcements by all the peer ports of this logical router.
+   - Support for specifying output_port for logical router reroute policies.
+   - Added "ic-route-deny-adv" and "ic-route-deny-learn" options to
+     the Logical_Router/Logical_Router_Port tables to allow users to
+     deny filter advertised/learned IC routes.
+   - Dynamic Routing:
+     * Extend the Logical Switch EVPN support to now automatically learn
+       IP neighbors (Type-2 MAC+IP EVPN routes) and automatically inject them
+       into the pipelines of the adjacent logical routers.
+     * Add the "other_config:dynamic-routing-arp-prefer-local" to Logical
+       Switches. If set to "true" ovn-controller will give preference to SB
+       (Static_)MAC_Bindings of adjacent logical routers over ARPs learned
+       through EVPN on the switch.
+     * Add the "other_config:dynamic-routing-redistribute=ip" to Logical
+       Switches to announce local IPs/MAC bindings belonging to the same
+       EVPN domain.
+     * Introduce the capability to specify EVPN device names using
+       Logical_Switch other_config column.
+     * Introduce the capability to specify multiple ips for ovn-evpn-local-ip
+       option.
+     * Add the option "dynamic-routing-vrf-id" to Logical Routers which allows
+       CMS to specify the Linux routing table id for a given vrf.
+     * Add the option "dynamic-routing-v4-prefix-nexthop" to Logical Routers
+       which allows CMS to specify nexthop for IPv4 Advertised routes.
+     * Add the option "dynamic-routing-v6-prefix-nexthop" to Logical Routers
+       which allows CMS to specify nexthop for IPv6 Advertised routes.
+     * Add the "options:dynamic-routing-no-learning" to Logical Routers. If
+       set to true router will not learn routes and will forget learned
+       routes.
+     * Add the "options:dynamic-routing-no-learning" to Logical Routers ports.
+       If set to true, router port will not learn routes and will forget
+       learned routes. This option has priority over its router counterpart.
+     * The EVPN support is now considered stable.  Its "experimental" tag has
+       been removed.
+   - Add support for Network Function insertion in OVN with stateful traffic
+     redirection capability in Logical Switch datapath. The feature introduces
+     three new NB database tables:
+     * Network_Function: Defines network function entities with inport/outport
+       pairs. These logical_switch_ports need to point to each other using
+       "nf-linked-port" option and also "is-nf" option set to true.
+     * Network_Function_Group: Groups multiple network functions for redundancy
+     * Network_Function_Health_Check: Configurable health monitoring with
+       interval, timeout, success_count and failure_count parameters.
+     Traffic matching ACLs can be redirected through inline network functions
+     using the network_function_group column in ACL. A healthy network function
+     from the group gets automatically selected based on ICMP forwarding probes
+     with failover to some other member of the group when currently active
+     network function becomes unavailable. Network functions operate in
+     "inline" mode, transparently processing packets without modifying headers,
+     and support both ingress (from-lport) and egress (to-lport) traffic flows.
+     Two new options have been added to Logical_Switch_Port which need to
+     be set to false for ports used as network function inport or outport.
+     - "lsp_learn_fdb": This can be used to control mac learning on the port.
+     - "receive_multicast": This can used to control whether multicast packets
+       can be received by the port.
+     NOTE:
+     * Network functions must not modify packet headers.
+     * The feature is not supported in conjunction with Load Balancer.
+     * The feature is supported for both VLAN and overlay networks.
+       When network function is used in a VLAN network, geneve tunneling is
+       used for cross host traffic (between the chassis hosting network
+       function and the chassis hosting the port where the ACL is being
+       enforced). Proper MTU needs to be configured to accomodate this
+       encapsulation.
+   - Added Transit Router support:
+    * Support the creation of Transit Routers.
+    * Added new ovn-ic-nbctl 'tr-add','tr-del','tr-list' commands to manage
+        Transit Router.
+    * Support the creation of Transit Router Ports.
+    * Added new ovn-ic-nbctl 'trp-add' and 'tpr-del' commands to manage
+        Transit Router Ports.
+   - Add ovn-nbctl lsp-add-router-port which will create router port on
+     specified LS.
+   - Add ovn-nbctl lsp-add-localnet-port which will create localnet port on
+     specified LS.
+   - Add a new experimental service - ovn-br-controller to program and
+     manage OVS bridges (not managed by ovn-controller) using OVN logical
+     flows. For more details see man ovn-br(5).
+   - Added experimental flow-based tunnel support. Enable via
+     external_ids:ovn-enable-flow-based-tunnels=true to use shared tunnel
+     ports instead of per-chassis ports, reducing port count for large scale
+     environments. Default is disabled.
+   - Add fallback support for Network Function.
+   - Load balancer health checks can now use Logical Router Port IPs as the
+     source IP for health check probes. Previously, health checks required
+     reserving an unused IP from the backend's subnet. This change allows
+     using LRP IPs directly, eliminating the need to reserve additional IPs
+     per backend port.
+   - Add "distributed" option for load balancer, that forces traffic to be
+     routed only to backend instances running locally on the same chassis
+     it arrives on.
+   - Add support for special port_security prefix "VRRPv3". This prefix allows
+     CMS to allow all required traffic for a VRRPv3 virtual router behind LSP.
+     See ovn-nb(5) man page for more details.
+   - Fixed support for fragmented traffic in the userspace datapath. Added the
+     "acl_ct_translation" NB_Global option to enable connection tracking
+     based L4 field translation for stateful ACLs. When enabled allows proper
+     handling of IP fragmentation in userspace datapaths. This option may break
+     hardware offloading and is disabled by default.
+   - Added support for health check monitoring for Logical Switch Ports using
+     tcp, udp, and icmp protocols. The check status from SB database is
+     synchronized to NB database to health check status field for CMS needs.
+
+OVN v25.09.0 - xxx xx xxxx
+--------------------------
+   - STT tunnels are no longer supported in ovn-encap-type.
+     ** WARNING ** Existing setups must be fully reconfigured to use Geneve
+     or VxLAN before upgrading.  To avoid potential database conversion issues
+     all OVN databases should be manually compacted after the reconfiguration.
+     For instructions see:
+       https://docs.openvswitch.org/en/latest/ref/ovsdb.7/#compacting-databases
+   - Added support for "ovn-cleanup-on-exit" config option in Open_vSwitch
+     external-ids, this option allows to specify if ovn-controller should
+     perform cleanup when exiting. The "--restart" exit always has priority
+     to keep the backward compatibility.
+   - Add additional protocol support for options:activation-strategy. The new
+     supported protocols are gARP and NA. The option now supports a comma
+     separated to specify selected group of protocols.
+   - Add CoPP support for DHCP relay.
+   - SSL/TLS:
+     * Support for deprecated TLSv1 and TLSv1.1 protocols on OpenFlow and
+       database connections is now removed.
+   - Introduce exclude-router-ips-from-garp in logical_switch_port column
+     so that the router port IPs are not advertised in the GARPs.
+   - Added support for port mirroring in OVN overlay.
+   - Added "ic-route-filter-adv" and "ic-route-filter-learn" options to
+     the Logical_Router/Logical_Router_Port tables to allow users to
+     filter advertised/learned IC routes.
+   - Add a new logical switch option - enable-stateless-acl-lb with default
+     value of false. This option should be set to true for logical switches
+     with stateless ACL to work with load balancer.
+   - Added new ovn-nbctl command 'pg-get-ports' to get the ports assigned to
+     the port group.
+   - The ovn-controller option ovn-ofctrl-wait-before-clear is no longer
+     supported.  It will be ignored if used. ovn-controller will
+     automatically care about proper delay before clearing lflow.
+   - Added "ic-route-adv-lb" and "ic-route-learn-lb" NB_Global:options to
+     to allow advertising load balancer VIPs through OVN-IC.
+   - Added a new ACL option "--all" to "acl-list" command. When set,
+     "acl-list" command will also list port groups ACLs associated with
+     each port of the target logical switch.
+   - Added support for running tests from the 'check-kernel' system test target
+     under retis by setting OVS_TEST_WITH_RETIS=yes.  See the 'Testing' section
+     of the documentation for more details.
+   - Dynamic Routing:
+     * Add the option "dynamic-routing-redistribute-local-only" to Logical
+       Routers and Logical Router Ports which refines the way in which
+       chassis-specific Advertised_Routes (e.g., for NAT and LB IPs) are
+       advertised.
+     * Add the option "external-ids:ovn-evpn-vxlan-ports" for the
+       Open_vSwitch database. This option allows CMS to set list of UDP
+       destination ports that will be used to create the VXLAN tunnels.
+     * Add the option "external-ids:ovn-evpn-local-ip" for the
+       Open_vSwitch database. This option allows CMS to set IP address that
+       will be used as source for the EVPN traffic egressing through
+       the tunnel.
+     * Add the "other_config:dynamic-routing-vni" to Logical Switches. If set
+       to valid integer the LS is considered to be connected to EVPN L2 domain.
+     * Add the "other_config:dynamic-routing-fdb-prefer-local" to Logical
+       Switches. If set to "true" the LS will prefer SB FDB table for
+       FDB lookup. Default is false.
+     * Add the "other_config:dynamic-routing-redistribute" to Logical
+       Switches. The only accepted value at the moment is "fdb".
+   - ovn-sbctl:
+     * Added --filter option that allows filtering the command output. See
+       ovn-sbctl(8) for more details.
+
+OVN v25.03.0 - 07 Mar 2025
+--------------------------
+   - Added support to choose selection methods - dp_hash or
+     hash (with specified hash fields) for ECMP routes
+     while choosing nexthop.
+   - ovn-ic: Add support for route tag to prevent route learning.
+   - Support for STT tunnels in ovn-encap-type is deprecated and will be
+     removed in the next release.
+   - The LRP option 'centralize_routing' has been removed. The behavior is now
+     enabled in all cases where it is needed.
+   - ovn-nb: Changed schema of ovn-nb to make networks optional within Logical
+     Router Ports.
+   - Added support for Spine-Leaf topology of logical switches by adding
+     a new LSP type 'switch' that can directly connect two logical switches.
+     Supported for both distributed and transit switches.
+   - Bump python version required for building OVN to 3.7.
+   - SSL/TLS:
+     * TLSv1 and TLSv1.1 protocols are deprecated and disabled by default
+       on OpenFlow and database connections.  Use --ssl-protocols to turn
+       them back on.  Support will be fully removed in the next release.
+     * OpenSSL 1.1.1 or newer is now required for SSL/TLS support.
+     * The protocol list in --ssl-protocols or corresponding database column
+       now supports specifying simple protocol ranges like:
+         - "TLSv1-TLSv1.2" to enable all protocols between TLSv1 and TLSv1.2.
+         - "TLSv1.2+" to enable protocol TLSv1.2 and later.
+       The value must be a list of protocols or exactly one protocol range.
+     * Added explicit support for TLSv1.3.  It can now be enabled via
+       --ssl-protocols (TLSv1.3 was supported in earlier versions only when
+       this option was not set).  TLS ciphersuites for TLSv1.3 and later can
+       be configured via --ssl-ciphersuites (--ssl-ciphers only applies to
+       TLSv1.2 and earlier).
+   - Add "arp-nd-max-timeout-sec" config option to vswitchd external-ids to
+     configure the interval (in seconds) between ovn-controller originated
+     ARP/ND packets used for tracking ECMP next hop MAC addresses.
+   - Auto flush ECMP symmetric reply connection states when an ECMP route is
+     removed by the CMS.  This behavior is controlled by the
+     "ecmp_nexthop_monitor_enable" config option in the NB_Global table.
+     Disabled by default.
+   - Improved handling of IPv6 traffic by enabling address prefix tracking
+     in OVS for both IPv4 and IPv6 addresses, whenever possible, reducing
+     the amount of IPv6 datapath flows.
+   - Add concept of Transit Routers, users are now allowed to specify
+     options:requested-chassis for router ports; if the chassis is remote
+     then the router port will behave as a remote port.
+   - Added a new ACL option "persist-established" that allows for
+     established connections to bypass ACL matching. This way, if an ACL
+     match changes, traffic on the established connection can still pass.
+   - Logical router policies can now be arranged in chains. Using the new
+     "jump" action, combined with new "chain" and "jump_chain" columns,
+     allows for policies to be chained together.
+   - Reduce the max number of local datapath to 1024 when OVN is using VXLAN
+     encapsulation type in OVN-interconnect mode.
+   - Added vxlan_mode parameter in IC_NB_GLOBAL option column to enable or
+     disable VXLAN encapsulation type in OVN-interconnect mode.
+   - Dynamic Routing:
+     * Add the option "dynamic-routing" to Logical Routers. If set to true
+       static and connected routes matching the filter below are shared to the
+       southbound "Advertised_Route" table for sharing outside of OVN.
+       The routes can further be configured by setting
+       `dynamic-routing-redistribute` on the LR or LRP. The LRP settings
+       overwrite the LR settings for all routes using this interface to
+       forward traffic on.
+     * Allow Logical Routers to dynamically learn routes from outside the
+       fabric. Routes entered into the "Learned_Route" table in the southbound
+       database will be learned by the respective LR. They are included in the
+       route table with a lower priority than static routes.
+     * Add the option value "connected-as-host" to the
+       "dynamic-routing-redistribute" LR and LRP option. If set then connected
+       routes are announced as individual host routes.
+     * Add the option "dynamic-routing-maintain-vrf" to LRPs. If set the
+       ovn-controller will create a vrf named "ovnvrf" + datapath id that
+       includes all advertised and learned routes.
+       The vrf name can be overwritten with the "dynamic-routing-vrf-name"
+       setting.
+     * Add the option "dynamic-routing-port-name" to LRPs. If set only routes
+       learned from a linux interfaces that is locally bound to the referenced
+       LSP will be learned. Additionally support local overwrites for arbitrary
+       interface names using "dynamic-routing-port-mapping".
+     * The logical router port options "routing-protocol-redirect" and
+       "routing-protocols" are now also usable on distributed gateway ports.
+     * Logical router port options "routing-protocol-redirect" and
+       "routing-protocols" are now considered stable. Their "experimental" tag
+       was removed.
+   - Add "options:ct-commit-all" to LR, that enables commit of all traffic
+     to DNAT and SNAT zone when LR is stateful.
+
+OVN v24.09.0 - 13 Sep 2024
+--------------------------
   - Added a new logical switch port option "pkt_clone_type".
     If the value is set to "mc_unknown", packets destined to the port gets
     cloned to all unknown ports connected to the same Logical Switch.
@@ -20,6 +481,58 @@ Post v24.03.0
   - A new LSP option "force_fdb_lookup" has been added to ensure the additional
     MAC addresses configured on the LSP with "unknown", are learnt via the
     OVN native FDB.
+  - Add support for ovsdb-server `--config-file` option in ovn-ctl.
+  - Add "ovn-bridge-remote" config option to vswitchd external-ids,
+    that allows to specify connection method to management bridge for
+    ovn-controller, defaulting to the unix socket.
+  - Add "ovn-bridge-remote-probe-interval" config option to vswitchd
+    external-ids, that sets probe interval for integration bridge connection,
+    disabled by default.
+  - The "options:ic-route-blacklist" option in the Northbound NB_Global table
+    has been renamed to "options:ic-route-denylist" in order to comply with
+    inclusive language guidelines. The previous name is still recognized to
+    aid with backwards compatibility.
+  - NATs can now be given an arbitrary match condition and priority. This
+    allows for conditional NATs to be configured. See the ovn-nb(5) man
+    page for more information.
+  - Added new global config option NB_Global:options:vxlan_mode to support
+    ability to disable "VXLAN mode" to extend available tunnel IDs space for
+    datapaths from 4095 to 16711680.  For more details see man ovn-nb(5) for
+    mentioned option.
+  - Added new global config option NB_Global:options:always_tunnel.  If set to
+    true, the traffic destined to a logical port of a provider logical switch
+    (having a localnet port) will be tunnelled instead of sending it via the
+    localnet port.
+  - Added support to define boundaries (min and max values) for selected ct
+    zones.
+  - Add support for CT zone limit that can be specified per LR
+    (options:ct-zone-limit), LS (other_config:ct-zone-limit) or LSP
+    (options:ct-zone-limit).
+  - A new LSP option "disable_garp_rarp" has been added to prevent OVN from
+    sending GARP or RARP announcements when a VIF is created on a bridged
+    logical switch.
+  - A new LRP option 'centralize_routing' has been added to a
+    distributed gateway port to centralize routing if the logical
+    switch of its peer doesn't have a localnet port.
+  - The NB_Global.debug_drop_domain_id configured value is now overridden by
+    the ID associated with the Sampling_App record created for drop sampling
+    (Sampling_App.type configured as "drop").
+  - Add support for ACL sampling through the new Sample_Collector and Sample
+    tables.  Sampling is supported for both traffic that creates new
+    connections and for traffic that is part of an existing connection.
+  - Add "external_ids:ovn-encap-ip-default" config for ovn-controller to
+    determine the default encap IP when there are multiple encap IPs
+    configured.
+  - Added a new column in the southbound database "flow_desc" to provide
+    human readable context to flows.
+  - Added two new experimental logical router port options,
+    "routing-protocol-redirect" and "routing-protocols", that allow
+    redirection of routing protocol traffic received by a router port
+    to a different logical switch port.
+  - Allow Static Routes where the address families of ip_prefix and nexthop
+    diverge (e.g. IPv4 packets over IPv6 links). This is currently limited to
+    nexthops that have their mac addresses prepopulated (so
+    dynamic_neigh_routers must be false).
 
 OVN v24.03.0 - 01 Mar 2024
 --------------------------

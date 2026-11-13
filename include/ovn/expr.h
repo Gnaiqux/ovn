@@ -60,6 +60,7 @@
 #include "openvswitch/meta-flow.h"
 #include "logical-fields.h"
 #include "smap.h"
+#include "vec.h"
 
 struct ds;
 struct expr;
@@ -471,8 +472,7 @@ bool expr_evaluate(const struct expr *, const struct flow *uflow,
 struct expr_match {
     struct hmap_node hmap_node;
     struct match match;
-    struct cls_conjunction *conjunctions;
-    size_t n, allocated;
+    struct vector conjunctions; /* Vector of struct cls_conjunction. */
 
     /* Tracked address set information. */
     char *as_name;
@@ -537,8 +537,7 @@ void expr_constant_destroy(const struct expr_constant *,
 
 /* A collection of "union expr_constant"s of the same type. */
 struct expr_constant_set {
-    struct expr_constant *values; /* Constants. */
-    size_t n_values;              /* Number of constants. */
+    struct vector values;         /* Constants. */
     enum expr_constant_type type; /* Type of the constants. */
     bool in_curlies;              /* Whether the constants were in {}. */
 };

@@ -47,6 +47,8 @@
 
 VLOG_DEFINE_THIS_MODULE(ovn_northd);
 
+int search_mode = LFLOW_TABLE_SEARCH_FIELDS;
+
 static unixctl_cb_func ovn_northd_pause;
 static unixctl_cb_func ovn_northd_resume;
 static unixctl_cb_func ovn_northd_is_paused;
@@ -66,7 +68,7 @@ static const char *ovnnb_db;
 static const char *ovnsb_db;
 static const char *unixctl_path;
 
-/* SSL options */
+/* SSL/TLS options. */
 static const char *ssl_private_key_file;
 static const char *ssl_certificate_file;
 static const char *ssl_ca_cert_file;
@@ -125,6 +127,11 @@ static const char *rbac_bfd_auth[] =
     {"chassis_name"};
 static const char *rbac_bfd_update[] =
     {"status"};
+
+static const char *rbac_learned_route_auth[] =
+    {""};
+static const char *rbac_learned_route_update[] =
+    {"datapath", "logical_port", "ip_prefix", "nexthop", "external_ids"};
 
 static struct rbac_perm_cfg {
     const char *table;
@@ -216,6 +223,14 @@ static struct rbac_perm_cfg {
         .n_update = ARRAY_SIZE(rbac_bfd_update),
         .row = NULL
     },{
+        .table = "Learned_Route",
+        .auth = rbac_learned_route_auth,
+        .n_auth = ARRAY_SIZE(rbac_learned_route_auth),
+        .insdel = true,
+        .update = rbac_learned_route_update,
+        .n_update = ARRAY_SIZE(rbac_learned_route_update),
+        .row = NULL
+    },{
         .table = NULL,
         .auth = NULL,
         .n_auth = 0,
@@ -277,20 +292,16 @@ static struct gen_opts_map supported_dhcpv6_opts[] = {
     DHCPV6_OPT_FQDN,
 };
 
+/*
+ * Compare predefined permission against RBAC_Permission record.
+ * Returns true if match, false otherwise.
+ */
 static bool
-ovn_rbac_validate_perm(const struct sbrec_rbac_permission *perm)
+ovn_rbac_match_perm(const struct sbrec_rbac_permission *perm,
+                    const struct rbac_perm_cfg *pcfg)
 {
-    struct rbac_perm_cfg *pcfg;
     int i, j, n_found;
 
-    for (pcfg = rbac_perm_cfg; pcfg->table; pcfg++) {
-        if (!strcmp(perm->table, pcfg->table)) {
-            break;
-        }
-    }
-    if (!pcfg->table) {
-        return false;
-    }
     if (perm->n_authorization != pcfg->n_auth ||
         perm->n_update != pcfg->n_update) {
         return false;
@@ -326,54 +337,71 @@ ovn_rbac_validate_perm(const struct sbrec_rbac_permission *perm)
         return false;
     }
 
-    /* Success, db state matches expected state */
-    pcfg->row = perm;
     return true;
 }
 
+/*
+ * Search predefined permission pcfg in the RBAC_Permission.
+ * If there is no record that match, recover the permission.
+ */
 static void
-ovn_rbac_create_perm(struct rbac_perm_cfg *pcfg,
-                     struct ovsdb_idl_txn *ovnsb_txn,
-                     const struct sbrec_rbac_role *rbac_role)
+ovn_rbac_validate_perm(struct rbac_perm_cfg *pcfg,
+                       struct ovsdb_idl_txn *ovnsb_txn,
+                       struct ovsdb_idl *ovnsb_idl)
 {
-    struct sbrec_rbac_permission *rbac_perm;
+    const struct sbrec_rbac_permission *perm_row;
 
-    rbac_perm = sbrec_rbac_permission_insert(ovnsb_txn);
-    sbrec_rbac_permission_set_table(rbac_perm, pcfg->table);
-    sbrec_rbac_permission_set_authorization(rbac_perm,
+    SBREC_RBAC_PERMISSION_FOR_EACH (perm_row, ovnsb_idl) {
+        if (!strcmp(perm_row->table, pcfg->table)
+            && ovn_rbac_match_perm(perm_row, pcfg)) {
+            pcfg->row = perm_row;
+
+            return;
+        }
+    }
+
+    pcfg->row = sbrec_rbac_permission_insert(ovnsb_txn);
+    sbrec_rbac_permission_set_table(pcfg->row, pcfg->table);
+    sbrec_rbac_permission_set_authorization(pcfg->row,
                                             pcfg->auth,
                                             pcfg->n_auth);
-    sbrec_rbac_permission_set_insert_delete(rbac_perm, pcfg->insdel);
-    sbrec_rbac_permission_set_update(rbac_perm,
+    sbrec_rbac_permission_set_insert_delete(pcfg->row, pcfg->insdel);
+    sbrec_rbac_permission_set_update(pcfg->row,
                                      pcfg->update,
                                      pcfg->n_update);
-    sbrec_rbac_role_update_permissions_setkey(rbac_role, pcfg->table,
-                                              rbac_perm);
 }
 
+/*
+ * Make sure that DB Role 'ovn-controller' exists, has no duplicates
+ * permission list exactly match to predefined permissions.  Recreate if
+ * matching fails.
+ */
 static void
 check_and_update_rbac(struct ovsdb_idl_txn *ovnsb_txn,
                       struct ovsdb_idl *ovnsb_idl)
 {
     const struct sbrec_rbac_role *rbac_role = NULL;
-    const struct sbrec_rbac_permission *perm_row;
     const struct sbrec_rbac_role *role_row;
-    struct rbac_perm_cfg *pcfg;
 
-    for (pcfg = rbac_perm_cfg; pcfg->table; pcfg++) {
-        pcfg->row = NULL;
+    /*
+     * Make sure predefined permissions are presented in the RBAC_Permissions
+     * table. Otherwise create consistent permissions.
+     */
+    for (struct rbac_perm_cfg *pcfg = rbac_perm_cfg; pcfg->table; pcfg++) {
+        ovn_rbac_validate_perm(pcfg, ovnsb_txn, ovnsb_idl);
     }
 
-    SBREC_RBAC_PERMISSION_FOR_EACH_SAFE (perm_row, ovnsb_idl) {
-        if (!ovn_rbac_validate_perm(perm_row)) {
-            sbrec_rbac_permission_delete(perm_row);
-        }
-    }
+    /*
+     * Make sure the role 'ovn-controller' is presented in the RBAC_Role table.
+     * Otherwise create the role. Remove duplicates if any.
+     */
     SBREC_RBAC_ROLE_FOR_EACH_SAFE (role_row, ovnsb_idl) {
-        if (strcmp(role_row->name, "ovn-controller")) {
-            sbrec_rbac_role_delete(role_row);
-        } else {
-            rbac_role = role_row;
+        if (!strcmp(role_row->name, "ovn-controller")) {
+            if (rbac_role) {
+                sbrec_rbac_role_delete(role_row);
+            } else {
+                rbac_role = role_row;
+            }
         }
     }
 
@@ -382,10 +410,38 @@ check_and_update_rbac(struct ovsdb_idl_txn *ovnsb_txn,
         sbrec_rbac_role_set_name(rbac_role, "ovn-controller");
     }
 
-    for (pcfg = rbac_perm_cfg; pcfg->table; pcfg++) {
-        if (!pcfg->row) {
-            ovn_rbac_create_perm(pcfg, ovnsb_txn, rbac_role);
+    /*
+     * Make sure the permission list attached to the role 'ovn-controller'
+     * exactly matches to predefined permissions.
+     * Reassign permission list to the role if any difference has found.
+     */
+    if (ARRAY_SIZE(rbac_perm_cfg) - 1 != rbac_role->n_permissions) {
+        goto rebuild_role_perms;
+    }
+
+    for (struct rbac_perm_cfg *pcfg = rbac_perm_cfg; pcfg->table; pcfg++) {
+        size_t i;
+        for (i = 0; i < rbac_role->n_permissions; i++) {
+            if (!strcmp(pcfg->table, rbac_role->key_permissions[i])
+                && pcfg->row == rbac_role->value_permissions[i]) {
+                break;
+            }
         }
+
+        if (i == rbac_role->n_permissions) {
+            goto rebuild_role_perms;
+        }
+    }
+
+    return;
+
+rebuild_role_perms:
+    sbrec_rbac_role_set_permissions(rbac_role, NULL, NULL, 0);
+
+    for (struct rbac_perm_cfg *pcfg = rbac_perm_cfg; pcfg->table; pcfg++) {
+        sbrec_rbac_role_update_permissions_setkey(rbac_role,
+                                                  pcfg->table,
+                                                  pcfg->row);
     }
 }
 
@@ -485,55 +541,69 @@ update_sequence_numbers(int64_t loop_start_time,
      * Also set up to update sb_cfg once our southbound transaction commits. */
     if (nb->nb_cfg != sb->nb_cfg) {
         sbrec_sb_global_set_nb_cfg(sb, nb->nb_cfg);
+        sbrec_sb_global_set_nb_cfg_timestamp(sb, loop_start_time);
         nbrec_nb_global_set_nb_cfg_timestamp(nb, loop_start_time);
     }
     sb_loop->next_cfg = nb->nb_cfg;
 
     /* Update northbound sb_cfg if appropriate. */
     int64_t sb_cfg = sb_loop->cur_cfg;
-    if (nb && sb_cfg && nb->sb_cfg != sb_cfg) {
+    if (sb_cfg && nb->sb_cfg != sb_cfg) {
         nbrec_nb_global_set_sb_cfg(nb, sb_cfg);
         nbrec_nb_global_set_sb_cfg_timestamp(nb, loop_start_time);
     }
 
     /* Update northbound hv_cfg if appropriate. */
-    if (nb) {
-        /* Find minimum nb_cfg among all chassis. */
-        const struct sbrec_chassis_private *chassis_priv;
-        int64_t hv_cfg = nb->nb_cfg;
-        int64_t hv_cfg_ts = 0;
-        SBREC_CHASSIS_PRIVATE_FOR_EACH (chassis_priv, ovnsb_idl) {
-            const struct sbrec_chassis *chassis = chassis_priv->chassis;
-            if (chassis) {
-                if (smap_get_bool(&chassis->other_config,
-                                  "is-remote", false)) {
-                    /* Skip remote chassises. */
-                    continue;
-                }
-            } else {
-                static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
-                VLOG_WARN_RL(&rl, "Chassis does not exist for "
-                             "Chassis_Private record, name: %s",
-                             chassis_priv->name);
-            }
 
-            /* Detect if overflows happened within the cfg update. */
-            int64_t delta = chassis_priv->nb_cfg - hv_cfg;
-            if (chassis_priv->nb_cfg < hv_cfg || delta > INT32_MAX) {
-                hv_cfg = chassis_priv->nb_cfg;
-                hv_cfg_ts = chassis_priv->nb_cfg_timestamp;
-            } else if (chassis_priv->nb_cfg == hv_cfg &&
-                       chassis_priv->nb_cfg_timestamp > hv_cfg_ts) {
-                hv_cfg_ts = chassis_priv->nb_cfg_timestamp;
+    /* Find minimum nb_cfg among all chassis. */
+    const struct sbrec_chassis_private *chassis_priv;
+    int64_t hv_cfg = nb->nb_cfg;
+    int64_t hv_cfg_ts = 0;
+    SBREC_CHASSIS_PRIVATE_FOR_EACH (chassis_priv, ovnsb_idl) {
+        const struct sbrec_chassis *chassis = chassis_priv->chassis;
+        if (chassis) {
+            if (smap_get_bool(&chassis->other_config,
+                              "is-remote", false)) {
+                /* Skip remote chassises. */
+                continue;
             }
+        } else {
+            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
+            VLOG_WARN_RL(&rl, "Chassis does not exist for "
+                         "Chassis_Private record, name: %s",
+                         chassis_priv->name);
         }
 
-        /* Update hv_cfg. */
-        if (nb->hv_cfg != hv_cfg) {
-            nbrec_nb_global_set_hv_cfg(nb, hv_cfg);
-            nbrec_nb_global_set_hv_cfg_timestamp(nb, hv_cfg_ts);
+        /* Detect if overflows happened within the cfg update. */
+        int64_t delta = chassis_priv->nb_cfg - hv_cfg;
+        if (chassis_priv->nb_cfg < hv_cfg || delta > INT32_MAX) {
+            hv_cfg = chassis_priv->nb_cfg;
+            hv_cfg_ts = chassis_priv->nb_cfg_timestamp;
+        } else if (chassis_priv->nb_cfg == hv_cfg &&
+                   chassis_priv->nb_cfg_timestamp > hv_cfg_ts) {
+            hv_cfg_ts = chassis_priv->nb_cfg_timestamp;
         }
     }
+
+    /* Update hv_cfg. */
+    if (nb->hv_cfg != hv_cfg) {
+        nbrec_nb_global_set_hv_cfg(nb, hv_cfg);
+        nbrec_nb_global_set_hv_cfg_timestamp(nb, hv_cfg_ts);
+    }
+}
+
+static void inc_proc_graph_dump(const char *end_node)
+{
+    struct ovsdb_idl_loop ovnnb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
+        ovsdb_idl_create_unconnected(&nbrec_idl_class, true));
+    struct ovsdb_idl_loop ovnsb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
+        ovsdb_idl_create_unconnected(&sbrec_idl_class, true));
+
+    inc_proc_northd_init(&ovnnb_idl_loop, &ovnsb_idl_loop);
+    engine_dump_graph(end_node);
+
+    ovsdb_idl_loop_destroy(&ovnnb_idl_loop);
+    ovsdb_idl_loop_destroy(&ovnsb_idl_loop);
 }
 
 static void
@@ -550,6 +620,8 @@ Options:\n\
                             (default: %s)\n\
   --dry-run                 start in paused state (do not commit db changes)\n\
   --n-threads=N             specify number of threads\n\
+  --dump-inc-proc-graph[=NODE]\n\
+                            dump incremental processing graph and exit\n\
   --unixctl=SOCKET          override default control socket name\n\
   -h, --help                display this help message\n\
   -o, --options             list available options\n\
@@ -570,6 +642,7 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED,
         SSL_OPTION_ENUMS,
         OPT_DRY_RUN,
         OPT_N_THREADS,
+        OPT_DUMP_INC_PROC_GRAPH,
     };
     static const struct option long_options[] = {
         {"ovnsb-db", required_argument, NULL, 'd'},
@@ -580,6 +653,8 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED,
         {"version", no_argument, NULL, 'V'},
         {"dry-run", no_argument, NULL, OPT_DRY_RUN},
         {"n-threads", required_argument, NULL, OPT_N_THREADS},
+        {"dump-inc-proc-graph", optional_argument, NULL,
+         OPT_DUMP_INC_PROC_GRAPH},
         OVN_DAEMON_LONG_OPTIONS,
         VLOG_LONG_OPTIONS,
         STREAM_SSL_LONG_OPTIONS,
@@ -617,6 +692,14 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED,
 
         case OPT_SSL_CIPHERS:
             stream_ssl_set_ciphers(optarg);
+            break;
+
+        case OPT_SSL_CIPHERSUITES:
+            stream_ssl_set_ciphersuites(optarg);
+            break;
+
+        case OPT_SSL_SERVER_NAME:
+            stream_ssl_set_server_name(optarg);
             break;
 
         case 'd':
@@ -664,6 +747,14 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED,
             *paused = true;
             break;
 
+        /* --dump-inc-proc-graph[=<i-p-node>]: Whether to dump the I-P engine
+         * graph representation in DOT format to stdout.  Optionally only up
+         * to <i-p-node>.
+         */
+        case OPT_DUMP_INC_PROC_GRAPH:
+            inc_proc_graph_dump(optarg);
+            exit(EXIT_SUCCESS);
+
         default:
             break;
         }
@@ -690,39 +781,6 @@ update_ssl_config(void)
     if (ssl_ca_cert_file) {
         stream_ssl_set_ca_cert_file(ssl_ca_cert_file, false);
     }
-}
-
-static struct ovsdb_idl_txn *
-run_idl_loop(struct ovsdb_idl_loop *idl_loop, const char *name,
-             uint64_t *idl_duration)
-{
-    unsigned long long duration, start = time_msec();
-    unsigned int seqno = UINT_MAX;
-    struct ovsdb_idl_txn *txn;
-    int n = 0;
-
-    /* Accumulate database changes as long as there are some,
-     * but no longer than "IDL_LOOP_MAX_DURATION_MS". */
-    while (seqno != ovsdb_idl_get_seqno(idl_loop->idl)
-           && time_msec() - start < IDL_LOOP_MAX_DURATION_MS) {
-        seqno = ovsdb_idl_get_seqno(idl_loop->idl);
-        ovsdb_idl_run(idl_loop->idl);
-        n++;
-    }
-
-    txn = ovsdb_idl_loop_run(idl_loop);
-
-    duration = time_msec() - start;
-    *idl_duration = duration;
-    /* ovsdb_idl_run() is called at least 2 times.  Once directly and
-     * once in the ovsdb_idl_loop_run().  n > 2 means that we received
-     * data on at least 2 subsequent calls. */
-    if (n > 2 || duration > 100) {
-        VLOG(duration > IDL_LOOP_MAX_DURATION_MS ? VLL_INFO : VLL_DBG,
-             "%s IDL run: %d iterations in %lld ms", name, n + 1, duration);
-    }
-
-    return txn;
 }
 
 #define DEFAULT_NORTHD_TRIM_TO_MS 30000
@@ -753,6 +811,15 @@ run_memory_trimmer(struct ovsdb_idl *ovnnb_idl, bool activity)
     memory_trimmer_wait(mt);
 }
 
+static bool
+sb_cfg_is_in_sync(struct ovsdb_idl *ovnnb_idl,
+                  struct ovsdb_idl_loop *sb_loop)
+{
+    const struct nbrec_nb_global *nb = nbrec_nb_global_first(ovnnb_idl);
+
+    return !(nb && sb_loop->cur_cfg && nb->sb_cfg != sb_loop->cur_cfg);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -769,7 +836,6 @@ main(int argc, char *argv[])
     fatal_ignore_sigpipe();
     ovs_cmdl_proctitle_init(argc, argv);
     ovn_set_program_name(argv[0]);
-    service_start(&argc, &argv);
     parse_options(argc, argv, &state.paused, &n_threads);
 
     daemonize_start(false, false);
@@ -804,6 +870,7 @@ main(int argc, char *argv[])
     unixctl_command_register("parallel-build/get-n-threads", "", 0, 0,
                              ovn_northd_get_thread_count_cmd,
                              NULL);
+    ovn_debug_commands_register();
 
     daemonize_complete();
 
@@ -819,6 +886,44 @@ main(int argc, char *argv[])
     ovsdb_idl_omit_alert(ovnnb_idl_loop.idl, &nbrec_nb_global_col_hv_cfg);
     ovsdb_idl_omit_alert(ovnnb_idl_loop.idl,
                          &nbrec_nb_global_col_hv_cfg_timestamp);
+    ovsdb_idl_omit_alert(ovnnb_idl_loop.idl,
+                         &nbrec_logical_router_port_col_status);
+
+    /* Ignore northbound external IDs, except for logical switch, router and
+     * their ports, for which the external IDs are propagated to corresponding
+     * southbound datapath and port binding records. */
+    const struct ovsdb_idl_column *external_ids[] = {
+        &nbrec_acl_col_external_ids,
+        &nbrec_address_set_col_external_ids,
+        &nbrec_bfd_col_external_ids,
+        &nbrec_chassis_template_var_col_external_ids,
+        &nbrec_connection_col_external_ids,
+        &nbrec_copp_col_external_ids,
+        &nbrec_dhcp_options_col_external_ids,
+        &nbrec_dhcp_relay_col_external_ids,
+        &nbrec_dns_col_external_ids,
+        &nbrec_forwarding_group_col_external_ids,
+        &nbrec_gateway_chassis_col_external_ids,
+        &nbrec_ha_chassis_col_external_ids,
+        &nbrec_ha_chassis_group_col_external_ids,
+        &nbrec_load_balancer_col_external_ids,
+        &nbrec_load_balancer_health_check_col_external_ids,
+        &nbrec_logical_router_policy_col_external_ids,
+        &nbrec_logical_router_static_route_col_external_ids,
+        &nbrec_meter_col_external_ids,
+        &nbrec_meter_band_col_external_ids,
+        &nbrec_mirror_col_external_ids,
+        &nbrec_nat_col_external_ids,
+        &nbrec_nb_global_col_external_ids,
+        &nbrec_port_group_col_external_ids,
+        &nbrec_qos_col_external_ids,
+        &nbrec_ssl_col_external_ids,
+        &nbrec_sample_collector_col_external_ids,
+        &nbrec_sampling_app_col_external_ids,
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(external_ids); i++) {
+        ovsdb_idl_omit(ovnnb_idl_loop.idl, external_ids[i]);
+    }
 
     unixctl_command_register("nb-connection-status", "", 0, 0,
                              ovn_conn_show, ovnnb_idl_loop.idl);
@@ -839,8 +944,14 @@ main(int argc, char *argv[])
 
     /* Disable alerting for pure write-only columns. */
     ovsdb_idl_omit_alert(ovnsb_idl_loop.idl, &sbrec_sb_global_col_nb_cfg);
-    ovsdb_idl_omit_alert(ovnsb_idl_loop.idl, &sbrec_address_set_col_name);
-    ovsdb_idl_omit_alert(ovnsb_idl_loop.idl, &sbrec_address_set_col_addresses);
+    ovsdb_idl_omit_alert(ovnsb_idl_loop.idl,
+                         &sbrec_sb_global_col_nb_cfg_timestamp);
+    ovsdb_idl_omit_alert(ovnsb_idl_loop.idl,
+                         &sbrec_ha_chassis_group_col_ref_chassis);
+    for (size_t i = 0; i < SBREC_ADDRESS_SET_N_COLUMNS; i++) {
+        ovsdb_idl_omit_alert(ovnsb_idl_loop.idl,
+                             &sbrec_address_set_columns[i]);
+    }
     for (size_t i = 0; i < SBREC_LOGICAL_FLOW_N_COLUMNS; i++) {
         ovsdb_idl_omit_alert(ovnsb_idl_loop.idl,
                              &sbrec_logical_flow_columns[i]);
@@ -860,6 +971,29 @@ main(int argc, char *argv[])
         ovsdb_idl_omit_alert(ovnsb_idl_loop.idl,
                              &sbrec_logical_dp_group_columns[i]);
     }
+    for (size_t i = 0; i < SBREC_ECMP_NEXTHOP_N_COLUMNS; i++) {
+        ovsdb_idl_omit_alert(ovnsb_idl_loop.idl,
+                             &sbrec_ecmp_nexthop_columns[i]);
+    }
+    for (size_t i = 0; i < SBREC_ACL_ID_N_COLUMNS; i++) {
+        ovsdb_idl_omit_alert(ovnsb_idl_loop.idl,
+                             &sbrec_acl_id_columns[i]);
+    }
+    for (size_t i = 0; i < SBREC_ADVERTISED_ROUTE_N_COLUMNS; i++) {
+        ovsdb_idl_omit_alert(ovnsb_idl_loop.idl,
+                             &sbrec_advertised_route_columns[i]);
+    }
+    for (size_t i = 0; i < SBREC_STATIC_MAC_BINDING_N_COLUMNS; i++) {
+        ovsdb_idl_omit_alert(ovnsb_idl_loop.idl,
+                             &sbrec_static_mac_binding_columns[i]);
+    }
+    for (size_t i = 0; i < SBREC_ADVERTISED_MAC_BINDING_N_COLUMNS; i++) {
+        ovsdb_idl_omit_alert(ovnsb_idl_loop.idl,
+                             &sbrec_advertised_mac_binding_columns[i]);
+    }
+    for (size_t i = 0; i < SBREC_DNS_N_COLUMNS; i++) {
+        ovsdb_idl_omit_alert(ovnsb_idl_loop.idl, &sbrec_dns_columns[i]);
+    }
 
     unixctl_command_register("sb-connection-status", "", 0, 0,
                              ovn_conn_show, ovnsb_idl_loop.idl);
@@ -869,11 +1003,8 @@ main(int argc, char *argv[])
     free(ovn_version);
 
     stopwatch_create(NORTHD_LOOP_STOPWATCH_NAME, SW_MS);
-    stopwatch_create(OVNNB_DB_RUN_STOPWATCH_NAME, SW_MS);
-    stopwatch_create(OVNSB_DB_RUN_STOPWATCH_NAME, SW_MS);
     stopwatch_create(BUILD_LFLOWS_CTX_STOPWATCH_NAME, SW_MS);
     stopwatch_create(CLEAR_LFLOWS_CTX_STOPWATCH_NAME, SW_MS);
-    stopwatch_create(BUILD_LFLOWS_STOPWATCH_NAME, SW_MS);
     stopwatch_create(LFLOWS_DATAPATHS_STOPWATCH_NAME, SW_MS);
     stopwatch_create(LFLOWS_PORTS_STOPWATCH_NAME, SW_MS);
     stopwatch_create(LFLOWS_LBS_STOPWATCH_NAME, SW_MS);
@@ -882,11 +1013,6 @@ main(int argc, char *argv[])
     stopwatch_create(LFLOWS_IGMP_STOPWATCH_NAME, SW_MS);
     stopwatch_create(LFLOWS_DP_GROUPS_STOPWATCH_NAME, SW_MS);
     stopwatch_create(LFLOWS_TO_SB_STOPWATCH_NAME, SW_MS);
-    stopwatch_create(PORT_GROUP_RUN_STOPWATCH_NAME, SW_MS);
-    stopwatch_create(SYNC_METERS_RUN_STOPWATCH_NAME, SW_MS);
-    stopwatch_create(LR_NAT_RUN_STOPWATCH_NAME, SW_MS);
-    stopwatch_create(LR_STATEFUL_RUN_STOPWATCH_NAME, SW_MS);
-    stopwatch_create(LS_STATEFUL_RUN_STOPWATCH_NAME, SW_MS);
 
     /* Initialize incremental processing engine for ovn-northd */
     inc_proc_northd_init(&ovnnb_idl_loop, &ovnsb_idl_loop);
@@ -932,7 +1058,7 @@ main(int argc, char *argv[])
             if (new_ovnnb_cond_seqno != ovnnb_cond_seqno) {
                 if (!new_ovnnb_cond_seqno) {
                     VLOG_INFO("OVN NB IDL reconnected, force recompute.");
-                    eng_ctx.recompute = true;
+                    inc_proc_northd_force_recompute();
                 }
                 ovnnb_cond_seqno = new_ovnnb_cond_seqno;
             }
@@ -945,7 +1071,7 @@ main(int argc, char *argv[])
             if (new_ovnsb_cond_seqno != ovnsb_cond_seqno) {
                 if (!new_ovnsb_cond_seqno) {
                     VLOG_INFO("OVN SB IDL reconnected, force recompute.");
-                    eng_ctx.recompute = true;
+                    inc_proc_northd_force_recompute();
                 }
                 ovnsb_cond_seqno = new_ovnsb_cond_seqno;
             }
@@ -954,12 +1080,14 @@ main(int argc, char *argv[])
                 VLOG_INFO("ovn-northd lock acquired. "
                         "This ovn-northd instance is now active.");
                 state.had_lock = true;
+                search_mode = LFLOW_TABLE_SEARCH_FIELDS;
             } else if (state.had_lock &&
                        !ovsdb_idl_has_lock(ovnsb_idl_loop.idl))
             {
                 VLOG_INFO("ovn-northd lock lost. "
                         "This ovn-northd instance is now on standby.");
                 state.had_lock = false;
+                search_mode = LFLOW_TABLE_SEARCH_FIELDS;
             }
 
             if (ovsdb_idl_has_lock(ovnsb_idl_loop.idl)) {
@@ -967,9 +1095,17 @@ main(int argc, char *argv[])
                 if (ovnnb_txn && ovnsb_txn &&
                     inc_proc_northd_can_run(&eng_ctx)) {
                     int64_t loop_start_time = time_wall_msec();
-                    activity = inc_proc_northd_run(ovnnb_txn, ovnsb_txn,
-                                                   &eng_ctx);
-                    eng_ctx.recompute = false;
+
+                    if (sb_cfg_is_in_sync(ovnnb_idl_loop.idl,
+                                          &ovnsb_idl_loop)) {
+                        activity = inc_proc_northd_run(ovnnb_txn,
+                                                       ovnsb_txn,
+                                                       &eng_ctx);
+                    } else {
+                        poll_immediate_wake();
+                        clear_idl_track = false;
+                    }
+
                     check_and_add_supported_dhcp_opts_to_sb_db(
                                  ovnsb_txn, ovnsb_idl_loop.idl);
                     check_and_add_supported_dhcpv6_opts_to_sb_db(
@@ -982,8 +1118,24 @@ main(int argc, char *argv[])
                                             ovnsb_idl_loop.idl,
                                             ovnnb_txn, ovnsb_txn,
                                             &ovnsb_idl_loop);
-                } else if (!eng_ctx.recompute) {
+                } else if (!inc_proc_northd_get_force_recompute()) {
                     clear_idl_track = false;
+                }
+
+                /* Make sure we don't bump the next_cfg when we shouldn't.
+                 * This should prevent ovn-nbctl sync calls to return before
+                 * the SB updates are actually done.
+                 *
+                 * Track that the abort was intentional so we can distinguish
+                 * it from a real commit failure below; otherwise the abort
+                 * would feed back into the force-recompute path, creating a
+                 * busy loop whenever NB.nb_cfg keeps advancing but the
+                 * engine produces no SB activity. */
+                bool ovnsb_txn_aborted_intentionally = false;
+                if (!activity && ovnsb_txn &&
+                    ovnsb_idl_loop.cur_cfg != ovnsb_idl_loop.next_cfg) {
+                    ovsdb_idl_txn_abort(ovnsb_txn);
+                    ovnsb_txn_aborted_intentionally = true;
                 }
 
                 /* If there are any errors, we force a full recompute in order
@@ -991,13 +1143,14 @@ main(int argc, char *argv[])
                 if (!ovsdb_idl_loop_commit_and_wait(&ovnnb_idl_loop)) {
                     VLOG_INFO("OVNNB commit failed, "
                               "force recompute next time.");
-                    eng_ctx.recompute = true;
+                    inc_proc_northd_force_recompute_immediate();
                 }
 
-                if (!ovsdb_idl_loop_commit_and_wait(&ovnsb_idl_loop)) {
+                if (!ovsdb_idl_loop_commit_and_wait(&ovnsb_idl_loop) &&
+                    !ovnsb_txn_aborted_intentionally) {
                     VLOG_INFO("OVNSB commit failed, "
                               "force recompute next time.");
-                    eng_ctx.recompute = true;
+                    inc_proc_northd_force_recompute_immediate();
                 }
                 run_memory_trimmer(ovnnb_idl_loop.idl, activity);
             } else {
@@ -1006,7 +1159,7 @@ main(int argc, char *argv[])
                 ovsdb_idl_loop_commit_and_wait(&ovnsb_idl_loop);
 
                 /* Force a full recompute next time we become active. */
-                eng_ctx.recompute = true;
+                inc_proc_northd_force_recompute();
             }
         } else {
             /* ovn-northd is paused
@@ -1030,7 +1183,7 @@ main(int argc, char *argv[])
             ovsdb_idl_wait(ovnsb_idl_loop.idl);
 
             /* Force a full recompute next time we become active. */
-            eng_ctx.recompute = true;
+            inc_proc_northd_force_recompute();
         }
 
         if (clear_idl_track) {
@@ -1073,9 +1226,6 @@ main(int argc, char *argv[])
 
         stopwatch_stop(NORTHD_LOOP_STOPWATCH_NAME, time_msec());
         poll_block();
-        if (should_service_stop()) {
-            exit_args.exiting = true;
-        }
         stopwatch_start(NORTHD_LOOP_STOPWATCH_NAME, time_msec());
     }
     inc_proc_northd_cleanup();
@@ -1084,7 +1234,6 @@ main(int argc, char *argv[])
     ovsdb_idl_loop_destroy(&ovnsb_idl_loop);
     ovn_exit_args_finish(&exit_args);
     unixctl_server_destroy(unixctl);
-    service_stop();
     run_update_worker_pool(0);
     ovsrcu_exit();
 
@@ -1098,6 +1247,7 @@ ovn_northd_pause(struct unixctl_conn *conn, int argc OVS_UNUSED,
     struct northd_state  *state = state_;
     state->paused = true;
 
+    poll_immediate_wake();
     unixctl_command_reply(conn, NULL);
 }
 

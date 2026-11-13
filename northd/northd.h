@@ -20,23 +20,33 @@
 #include "lib/ovn-util.h"
 #include "lib/ovs-atomic.h"
 #include "lib/sset.h"
+#include "lib/hmapx.h"
 #include "northd/en-port-group.h"
+#include "northd/en-global-config.h"
 #include "northd/ipam.h"
+#include "northd/lb.h"
 #include "openvswitch/hmap.h"
+#include "simap.h"
 #include "ovs-thread.h"
+#include "en-lr-stateful.h"
+#include "vec.h"
+#include "datapath-sync.h"
+#include "sparse-array.h"
+#include "uuidset.h"
 
 struct northd_input {
     /* Northbound table references */
-    const struct nbrec_logical_switch_table *nbrec_logical_switch_table;
-    const struct nbrec_logical_router_table *nbrec_logical_router_table;
     const struct nbrec_static_mac_binding_table
         *nbrec_static_mac_binding_table;
     const struct nbrec_chassis_template_var_table
         *nbrec_chassis_template_var_table;
     const struct nbrec_mirror_table *nbrec_mirror_table;
+    const struct nbrec_port_group_table *nbrec_port_group_table;
+    const struct nbrec_network_function_table *nbrec_network_function_table;
+    const struct nbrec_network_function_group_table
+        *nbrec_network_function_group_table;
 
     /* Southbound table references */
-    const struct sbrec_datapath_binding_table *sbrec_datapath_binding_table;
     const struct sbrec_port_binding_table *sbrec_port_binding_table;
     const struct sbrec_mac_binding_table *sbrec_mac_binding_table;
     const struct sbrec_ha_chassis_group_table *sbrec_ha_chassis_group_table;
@@ -58,17 +68,29 @@ struct northd_input {
     /* Global config data node inputs. */
     const struct smap *nb_options;
     const struct smap *sb_options;
-    const char *svc_monitor_mac;
-    struct eth_addr svc_monitor_mac_ea;
+    const struct svc_monitor_addresses *svc_global_addresses;
     const struct chassis_features *features;
+    bool vxlan_mode;
+
+    /* ACL ID inputs. */
+    const struct acl_id_data *acl_id_data;
+
+    /* Synced datapath inputs. */
+    const struct ovn_synced_logical_switch_map *synced_lses;
+    const struct ovn_synced_logical_router_map *synced_lrs;
+
+    /* Service Monitor data for interconnect learned records.*/
+    struct hmap *ic_learned_svc_monitors_map;
 
     /* Indexes */
+    struct ovsdb_idl_index *nbrec_mirror_by_type_and_sink;
     struct ovsdb_idl_index *sbrec_chassis_by_name;
     struct ovsdb_idl_index *sbrec_chassis_by_hostname;
+    struct ovsdb_idl_index *sbrec_encap_by_ip;
     struct ovsdb_idl_index *sbrec_ha_chassis_grp_by_name;
     struct ovsdb_idl_index *sbrec_ip_mcast_by_dp;
-    struct ovsdb_idl_index *sbrec_static_mac_binding_by_lport_ip;
     struct ovsdb_idl_index *sbrec_fdb_by_dp_and_port;
+    struct ovsdb_idl_index *sbrec_service_monitor_by_learned_type;
 };
 
 /* A collection of datapaths. E.g. all logical switch datapaths, or all
@@ -77,17 +99,33 @@ struct ovn_datapaths {
     /* Contains struct ovn_datapath elements. */
     struct hmap datapaths;
 
-    /* The array index of each element in 'datapaths'. */
-    struct ovn_datapath **array;
+    struct sparse_array dps;
 };
 
 static inline size_t
 ods_size(const struct ovn_datapaths *datapaths)
 {
-    return hmap_count(&datapaths->datapaths);
+    return sparse_array_len(&datapaths->dps);
 }
 
+struct ovn_datapath *
+ovn_datapath_find_by_key(struct hmap *datapaths, uint32_t dp_key);
+
 bool od_has_lb_vip(const struct ovn_datapath *od);
+
+/* List of routing and routing-related protocols which
+ * OVN is capable of redirecting from LRP to specific LSP. */
+enum redirected_routing_protcol_flag_type {
+    REDIRECT_BGP = (1 << 0),
+    REDIRECT_BFD = (1 << 1),
+};
+
+struct tracked_dps {
+    /* Tracked created or updated datapaths. */
+    struct hmapx crupdated;
+    /* Tracked deleted datapaths. */
+    struct hmapx deleted;
+};
 
 struct tracked_ovn_ports {
     /* tracked created ports.
@@ -120,6 +158,9 @@ enum northd_tracked_data_type {
     NORTHD_TRACKED_LR_NATS  = (1 << 2),
     NORTHD_TRACKED_LS_LBS   = (1 << 3),
     NORTHD_TRACKED_LS_ACLS  = (1 << 4),
+    NORTHD_TRACKED_SWITCHES = (1 << 5),
+    NORTHD_TRACKED_ROUTERS  = (1 << 6),
+    NORTHD_TRACKED_LR_ROUTES = (1 << 7),
 };
 
 /* Track what's changed in the northd engine node.
@@ -128,12 +169,18 @@ enum northd_tracked_data_type {
 struct northd_tracked_data {
     /* Indicates the type of data tracked.  One or all of NORTHD_TRACKED_*. */
     enum northd_tracked_data_type type;
+    struct tracked_dps trk_switches;
+    struct tracked_dps trk_routers;
     struct tracked_ovn_ports trk_lsps;
     struct tracked_lbs trk_lbs;
 
     /* Tracked logical routers whose NATs have changed.
      * hmapx node is 'struct ovn_datapath *'. */
     struct hmapx trk_nat_lrs;
+
+    /* Tracked logical routers whose static routes have changed.
+     * hmapx node is 'struct ovn_datapath *'. */
+    struct hmapx trk_lrs_routes;
 
     /* Tracked logical switches whose load balancers have changed.
      * hmapx node is 'struct ovn_datapath *'. */
@@ -142,6 +189,10 @@ struct northd_tracked_data {
     /* Tracked logical switches whose ACLs have changed.
      * hmapx node is 'struct ovn_datapath *'. */
     struct hmapx ls_with_changed_acls;
+
+    /* Tracked logical switches with IPAM whose LSPs have changed.
+     * hmapx node is 'struct ovn_datapath *'. */
+    struct hmapx ls_with_changed_ipam;
 };
 
 struct northd_data {
@@ -152,30 +203,52 @@ struct northd_data {
     struct hmap lr_ports;
     struct hmap lb_datapaths_map;
     struct hmap lb_group_datapaths_map;
-    struct ovs_list lr_list;
     struct sset svc_monitor_lsps;
-    struct hmap svc_monitor_map;
+    struct hmap local_svc_monitors_map;
+    struct hmapx monitored_ports_map;
 
     /* Change tracking data. */
     struct northd_tracked_data trk_data;
 };
 
+struct route_tracked_data {
+    struct hmapx trk_crupdated_parsed_route;
+    struct hmapx trk_deleted_parsed_route;
+};
+
+struct routes_data {
+    struct hmap parsed_routes; /* Stores struct parsed_route. */
+    struct simap route_tables;
+    struct uuidset bfd_active_connections;
+    struct route_tracked_data trk_data;
+    bool tracked;
+};
+
+struct bfd_sync_data {
+    struct sset bfd_ports;
+};
+
+struct ic_learned_svc_monitors_data {
+    struct hmap ic_learned_svc_monitors_map;
+    struct lflow_ref *lflow_ref;
+};
+
+struct svc_monitors_map_data
+svc_monitors_map_data_init(const struct hmap *local_svc_monitors_map,
+    const struct hmap *ic_learned_svc_monitors_map,
+    struct lflow_ref *ic_learned_svc_monitors_lflow_ref);
+
+struct lflow_ref;
 struct lr_nat_table;
 
 struct lflow_input {
-    /* Northbound table references */
-    const struct nbrec_bfd_table *nbrec_bfd_table;
-
-    /* Southbound table references */
-    const struct sbrec_bfd_table *sbrec_bfd_table;
-    const struct sbrec_logical_flow_table *sbrec_logical_flow_table;
-    const struct sbrec_multicast_group_table *sbrec_multicast_group_table;
-    const struct sbrec_igmp_group_table *sbrec_igmp_group_table;
-    const struct sbrec_logical_dp_group_table *sbrec_logical_dp_group_table;
+    /* Southbound table references (used during lflow computation). */
+    const struct sbrec_acl_id_table *sbrec_acl_id_table;
 
     /* Indexes */
     struct ovsdb_idl_index *sbrec_mcast_group_by_name_dp;
 
+    const struct ovn_synced_datapaths *dps;
     const struct ovn_datapaths *ls_datapaths;
     const struct ovn_datapaths *lr_datapaths;
     const struct hmap *ls_ports;
@@ -185,11 +258,20 @@ struct lflow_input {
     const struct ls_stateful_table *ls_stateful_table;
     const struct shash *meter_groups;
     const struct hmap *lb_datapaths_map;
-    const struct hmap *bfd_connections;
+    const struct sset *bfd_ports;
     const struct chassis_features *features;
-    const struct hmap *svc_monitor_map;
     bool ovn_internal_version_changed;
+    const struct hmap *svc_monitor_map;
     const char *svc_monitor_mac;
+    const struct sampling_app_table *sampling_apps;
+    struct group_ecmp_route_data *route_data;
+    struct sparse_array *dp_route_policies;
+    struct simap *route_tables;
+    struct hmap *igmp_groups;
+    struct lflow_ref *igmp_lflow_ref;
+    const struct hmap *local_svc_monitors_map;
+    const struct hmap *ic_learned_svc_monitors_map;
+    struct lflow_ref *ic_learned_svc_monitors_lflow_ref;
 };
 
 extern int parallelization_state;
@@ -199,6 +281,11 @@ enum {
     STATE_USE_PARALLELIZATION /* parallelization is on */
 };
 
+extern int search_mode;
+enum ovn_lflow_table_search_mode {
+    LFLOW_TABLE_SEARCH_FIELDS,
+    LFLOW_TABLE_SEARCH_SBUUID,
+};
 extern thread_local size_t thread_lflow_counter;
 
 /*
@@ -234,13 +321,6 @@ struct mcast_switch_info {
     int64_t query_max_response; /* Expected time after which reports should
                                  * be received for queries that were sent out.
                                  */
-
-    atomic_uint64_t active_v4_flows;   /* Current number of active IPv4
-                                        * multicast flows.
-                                        */
-    atomic_uint64_t active_v6_flows;   /* Current number of active IPv6
-                                        * multicast flows.
-                                        */
 };
 
 struct mcast_router_info {
@@ -254,7 +334,6 @@ struct mcast_info {
 
     struct hmap group_tnlids;  /* Group tunnel IDs in use on this DP. */
     uint32_t group_tnlid_hint; /* Hint for allocating next group tunnel ID. */
-    struct ovs_list groups;    /* List of groups learnt on this DP. */
 
     union {
         struct mcast_switch_info sw;  /* Switch specific multicast info. */
@@ -269,46 +348,80 @@ struct mcast_port_info {
                          * (e.g., IGMP join/leave). */
 };
 
+#define DRR_MODES                  \
+    DRR_MODE(CONNECTED,         0) \
+    DRR_MODE(CONNECTED_AS_HOST, 1) \
+    DRR_MODE(STATIC,            2) \
+    DRR_MODE(NAT,               3) \
+    DRR_MODE(LB,                4) \
+    DRR_MODE(IC_DYNAMIC,        5)
+
+enum dynamic_routing_redistribute_mode_bits {
+#define DRR_MODE(PROTOCOL, BIT) DRRM_##PROTOCOL##_BIT = BIT,
+    DRR_MODES
+#undef DRR_MODE
+};
+
+enum dynamic_routing_redistribute_mode {
+    DRRM_NONE = 0,
+#define DRR_MODE(PROTOCOL, BIT) DRRM_##PROTOCOL = (1 << DRRM_##PROTOCOL##_BIT),
+    DRR_MODES
+#undef DRR_MODE
+};
+
+#define DRR_MODE(PROTOCOL, BIT)                       \
+    static inline bool drr_mode_##PROTOCOL##_is_set(  \
+        enum dynamic_routing_redistribute_mode value) \
+    {                                                 \
+        return !!(value & DRRM_##PROTOCOL);           \
+    }
+DRR_MODES
+#undef DRR_MODE
+
 /* The 'key' comes from nbs->header_.uuid or nbr->header_.uuid or
- * sb->external_ids:logical-switch. */
+ * sb->header_.uuid. */
 struct ovn_datapath {
     struct hmap_node key_node;  /* Index on 'key'. */
     struct uuid key;            /* (nbs/nbr)->header_.uuid. */
-
-    size_t index;   /* A unique index across all datapaths.
-                     * Datapath indexes are sequential and start from zero. */
 
     struct ovn_datapaths *datapaths; /* The collection of datapaths that
                                         contains this datapath. */
 
     const struct nbrec_logical_switch *nbs;  /* May be NULL. */
     const struct nbrec_logical_router *nbr;  /* May be NULL. */
-    const struct sbrec_datapath_binding *sb; /* May be NULL. */
+    const struct ovn_synced_datapath *sdp; /* May be NULL. */
 
     struct ovs_list list;       /* In list of similar records. */
 
     uint32_t tunnel_key;
 
     /* Logical router data. */
-    struct ovn_datapath **ls_peers;
-    size_t n_ls_peers;
-    size_t n_allocated_ls_peers;
+    struct vector ls_peers; /* Vector of struct ovn_datapath *. */
     struct sset router_ips; /* Router port IPs except the IPv6 LLAs. */
 
     /* Logical switch data. */
-    struct ovn_port **router_ports;
-    size_t n_router_ports;
-    size_t n_allocated_router_ports;
-
+    struct vector router_ports; /* Vector of struct ovn_port *. */
+    struct vector switch_ports; /* Vector of struct ovn_port * of
+                                 * type 'switch'. */
+    struct hmap fdb_ports_tnlids; /* Tunnel keys for enabled LSP with
+                                   * unknown address. */
     struct hmap port_tnlids;
     uint32_t port_key_hint;
+
+    bool port_key_conflict; /* True if a port's requested-tnl-key could
+                              * not be assigned due to a conflict. */
 
     bool has_unknown;
     bool has_vtep_lports;
     bool has_arp_proxy_port;
 
+    /* Set to true if the option 'enable-stateless-acl-with-lb' is enabled
+     * on the logical switch. */
+    bool lb_with_stateless_mode;
+
     /* IPAM data. */
     struct ipam_info ipam_info;
+    bool ipam_info_initialized;
 
     /* Multicast data. */
     struct mcast_info mcast_info;
@@ -318,21 +431,34 @@ struct ovn_datapath {
      * If this is true, then 'l3dgw_ports' will be ignored. */
     bool is_gw_router;
 
+    /* Indicates whether the router should be considered a transit router.
+     * This is applicable only to routers with "remote" ports. */
+    bool is_transit_router;
+
+    /* Indicates that the LS has valid vni associated with it. */
+    bool has_evpn_vni;
+
+    /* True if datapath has some distributed dependencies.
+     * Currently, this only applies to load balancers attached to datapath
+     * with distributed mode enabled. */
+    bool is_distributed;
+
     /* OVN northd only needs to know about logical router gateway ports for
      * NAT/LB on a distributed router.  The "distributed gateway ports" are
      * populated only when there is a gateway chassis or ha chassis group
      * specified for some of the ports on the logical router. Otherwise this
      * will be NULL. */
-    struct ovn_port **l3dgw_ports;
-    size_t n_l3dgw_ports;
+    struct vector l3dgw_ports; /* Vector of struct ovn_port *. */
 
     /* router datapath has a logical port with redirect-type set to bridged. */
     bool redirect_bridged;
+    /* router datapath has the option "dynamic-routing" set to true. */
+    bool dynamic_routing;
+    /* The modes contained in the nbr option "dynamic-routing-redistribute". */
+    enum dynamic_routing_redistribute_mode dynamic_routing_redistribute;
 
-    struct ovn_port **localnet_ports;
-    size_t n_localnet_ports;
+    struct vector localnet_ports; /* Vector of struct ovn_port *. */
 
-    struct ovs_list lr_list; /* In list of logical router datapaths. */
     /* The logical router group to which this datapath belongs.
      * Valid only if it is logical router datapath. NULL otherwise. */
     struct lrouter_group *lr_group;
@@ -340,6 +466,9 @@ struct ovn_datapath {
     /* Map of ovn_port objects belonging to this datapath.
      * This map doesn't include derived ports. */
     struct hmap ports;
+    /* Reference to the lflows belonging to this datapath currently router
+     * only lflows. */
+    struct lflow_ref *datapath_lflows;
 };
 
 const struct ovn_datapath *ovn_datapath_find(const struct hmap *datapaths,
@@ -348,13 +477,16 @@ static inline struct ovn_datapath *
 ovn_datapaths_find_by_index(const struct ovn_datapaths *ovn_datapaths,
                             size_t od_index)
 {
-    ovs_assert(od_index <= hmap_count(&ovn_datapaths->datapaths));
-    return ovn_datapaths->array[od_index];
+    ovs_assert(od_index <= (ovn_datapaths->dps.capacity));
+    return sparse_array_get(&ovn_datapaths->dps, od_index);
 }
 
 struct ovn_datapath *ovn_datapath_from_sbrec(
     const struct hmap *ls_datapaths, const struct hmap *lr_datapaths,
     const struct sbrec_datapath_binding *);
+
+struct ovn_datapath *ovn_datapath_from_sbrec_(
+    const struct hmap *datapaths, const struct sbrec_datapath_binding *);
 
 static inline bool
 ovn_datapath_is_stale(const struct ovn_datapath *od)
@@ -363,109 +495,119 @@ ovn_datapath_is_stale(const struct ovn_datapath *od)
 };
 
 static inline bool
-ovn_datapath_is_transit_switch(const struct ovn_datapath *od)
+ls_has_localnet_port(const struct ovn_datapath *od)
 {
-    return od->tunnel_key >= OVN_MIN_DP_KEY_GLOBAL;
+    return !vector_is_empty(&od->localnet_ports);
 }
 
 /* Pipeline stages. */
+#define PIPELINE_STAGES       \
+   SWITCH_IN_PIPELINE_STAGES  \
+   SWITCH_OUT_PIPELINE_STAGES \
+   ROUTER_IN_PIPELINE_STAGES  \
+   ROUTER_OUT_PIPELINE_STAGES
 
-/* The two purposes for which ovn-northd uses OVN logical datapaths. */
-enum ovn_datapath_type {
-    DP_SWITCH,                  /* OVN logical switch. */
-    DP_ROUTER                   /* OVN logical router. */
-};
-
-/* Returns an "enum ovn_stage" built from the arguments.
- *
- * (It's better to use ovn_stage_build() for type-safety reasons, but inline
- * functions can't be used in enums or switch cases.) */
-#define OVN_STAGE_BUILD(DP_TYPE, PIPELINE, TABLE) \
-    (((DP_TYPE) << 9) | ((PIPELINE) << 8) | (TABLE))
-
-/* A stage within an OVN logical switch or router.
- *
- * An "enum ovn_stage" indicates whether the stage is part of a logical switch
- * or router, whether the stage is part of the ingress or egress pipeline, and
- * the table within that pipeline.  The first three components are combined to
- * form the stage's full name, e.g. S_SWITCH_IN_PORT_SEC_L2,
- * S_ROUTER_OUT_DELIVERY. */
-enum ovn_stage {
-#define PIPELINE_STAGES                                                   \
-    /* Logical switch ingress stages. */                                  \
+/* Logical switch ingress stages. */
+#define SWITCH_IN_PIPELINE_STAGES                                            \
     PIPELINE_STAGE(SWITCH, IN,  CHECK_PORT_SEC, 0, "ls_in_check_port_sec")   \
     PIPELINE_STAGE(SWITCH, IN,  APPLY_PORT_SEC, 1, "ls_in_apply_port_sec")   \
-    PIPELINE_STAGE(SWITCH, IN,  LOOKUP_FDB ,    2, "ls_in_lookup_fdb")    \
-    PIPELINE_STAGE(SWITCH, IN,  PUT_FDB,        3, "ls_in_put_fdb")       \
-    PIPELINE_STAGE(SWITCH, IN,  PRE_ACL,        4, "ls_in_pre_acl")       \
-    PIPELINE_STAGE(SWITCH, IN,  PRE_LB,         5, "ls_in_pre_lb")        \
-    PIPELINE_STAGE(SWITCH, IN,  PRE_STATEFUL,   6, "ls_in_pre_stateful")  \
-    PIPELINE_STAGE(SWITCH, IN,  ACL_HINT,       7, "ls_in_acl_hint")      \
-    PIPELINE_STAGE(SWITCH, IN,  ACL_EVAL,       8, "ls_in_acl_eval")      \
-    PIPELINE_STAGE(SWITCH, IN,  ACL_ACTION,     9, "ls_in_acl_action")    \
-    PIPELINE_STAGE(SWITCH, IN,  QOS,           10, "ls_in_qos")    \
-    PIPELINE_STAGE(SWITCH, IN,  LB_AFF_CHECK,  11, "ls_in_lb_aff_check")  \
-    PIPELINE_STAGE(SWITCH, IN,  LB,            12, "ls_in_lb")            \
-    PIPELINE_STAGE(SWITCH, IN,  LB_AFF_LEARN,  13, "ls_in_lb_aff_learn")  \
-    PIPELINE_STAGE(SWITCH, IN,  PRE_HAIRPIN,   14, "ls_in_pre_hairpin")   \
-    PIPELINE_STAGE(SWITCH, IN,  NAT_HAIRPIN,   15, "ls_in_nat_hairpin")   \
-    PIPELINE_STAGE(SWITCH, IN,  HAIRPIN,       16, "ls_in_hairpin")       \
-    PIPELINE_STAGE(SWITCH, IN,  ACL_AFTER_LB_EVAL,  17, \
-                   "ls_in_acl_after_lb_eval")  \
-    PIPELINE_STAGE(SWITCH, IN,  ACL_AFTER_LB_ACTION,  18, \
+    PIPELINE_STAGE(SWITCH, IN,  MIRROR,         2, "ls_in_mirror")        \
+    PIPELINE_STAGE(SWITCH, IN,  LOOKUP_FDB,     3, "ls_in_lookup_fdb")    \
+    PIPELINE_STAGE(SWITCH, IN,  PUT_FDB,        4, "ls_in_put_fdb")       \
+    PIPELINE_STAGE(SWITCH, IN,  PRE_ACL,        5, "ls_in_pre_acl")       \
+    PIPELINE_STAGE(SWITCH, IN,  PRE_LB,         6, "ls_in_pre_lb")        \
+    PIPELINE_STAGE(SWITCH, IN,  PRE_STATEFUL,   7, "ls_in_pre_stateful")  \
+    PIPELINE_STAGE(SWITCH, IN,  ACL_HINT,       8, "ls_in_acl_hint")      \
+    PIPELINE_STAGE(SWITCH, IN,  ACL_EVAL,       9, "ls_in_acl_eval")      \
+    PIPELINE_STAGE(SWITCH, IN,  ACL_SAMPLE,    10, "ls_in_acl_sample")    \
+    PIPELINE_STAGE(SWITCH, IN,  ACL_ACTION,    11, "ls_in_acl_action")    \
+    PIPELINE_STAGE(SWITCH, IN,  QOS,           12, "ls_in_qos")           \
+    PIPELINE_STAGE(SWITCH, IN,  CT_EXTRACT,    13, "ls_in_ct_extract")    \
+    PIPELINE_STAGE(SWITCH, IN,  LB_AFF_CHECK,  14, "ls_in_lb_aff_check")  \
+    PIPELINE_STAGE(SWITCH, IN,  LB,            15, "ls_in_lb")            \
+    PIPELINE_STAGE(SWITCH, IN,  LB_AFF_LEARN,  16, "ls_in_lb_aff_learn")  \
+    PIPELINE_STAGE(SWITCH, IN,  PRE_HAIRPIN,   17, "ls_in_pre_hairpin")   \
+    PIPELINE_STAGE(SWITCH, IN,  NAT_HAIRPIN,   18, "ls_in_nat_hairpin")   \
+    PIPELINE_STAGE(SWITCH, IN,  HAIRPIN,       19, "ls_in_hairpin")       \
+    PIPELINE_STAGE(SWITCH, IN,  ACL_AFTER_LB_EVAL,  20, \
+                   "ls_in_acl_after_lb_eval")    \
+     PIPELINE_STAGE(SWITCH, IN,  ACL_AFTER_LB_SAMPLE,  21, \
+                   "ls_in_acl_after_lb_sample")  \
+    PIPELINE_STAGE(SWITCH, IN,  ACL_AFTER_LB_ACTION,  22,    \
                    "ls_in_acl_after_lb_action")  \
-    PIPELINE_STAGE(SWITCH, IN,  STATEFUL,      19, "ls_in_stateful")      \
-    PIPELINE_STAGE(SWITCH, IN,  ARP_ND_RSP,    20, "ls_in_arp_rsp")       \
-    PIPELINE_STAGE(SWITCH, IN,  DHCP_OPTIONS,  21, "ls_in_dhcp_options")  \
-    PIPELINE_STAGE(SWITCH, IN,  DHCP_RESPONSE, 22, "ls_in_dhcp_response") \
-    PIPELINE_STAGE(SWITCH, IN,  DNS_LOOKUP,    23, "ls_in_dns_lookup")    \
-    PIPELINE_STAGE(SWITCH, IN,  DNS_RESPONSE,  24, "ls_in_dns_response")  \
-    PIPELINE_STAGE(SWITCH, IN,  EXTERNAL_PORT, 25, "ls_in_external_port") \
-    PIPELINE_STAGE(SWITCH, IN,  L2_LKUP,       26, "ls_in_l2_lkup")       \
-    PIPELINE_STAGE(SWITCH, IN,  L2_UNKNOWN,    27, "ls_in_l2_unknown")    \
-                                                                          \
-    /* Logical switch egress stages. */                                   \
-    PIPELINE_STAGE(SWITCH, OUT, PRE_ACL,      0, "ls_out_pre_acl")        \
-    PIPELINE_STAGE(SWITCH, OUT, PRE_LB,       1, "ls_out_pre_lb")         \
-    PIPELINE_STAGE(SWITCH, OUT, PRE_STATEFUL, 2, "ls_out_pre_stateful")   \
-    PIPELINE_STAGE(SWITCH, OUT, ACL_HINT,     3, "ls_out_acl_hint")       \
-    PIPELINE_STAGE(SWITCH, OUT, ACL_EVAL,     4, "ls_out_acl_eval")       \
-    PIPELINE_STAGE(SWITCH, OUT, ACL_ACTION,   5, "ls_out_acl_action")     \
-    PIPELINE_STAGE(SWITCH, OUT, QOS,          6, "ls_out_qos")       \
-    PIPELINE_STAGE(SWITCH, OUT, STATEFUL,     7, "ls_out_stateful")       \
-    PIPELINE_STAGE(SWITCH, OUT, CHECK_PORT_SEC,  8, "ls_out_check_port_sec") \
-    PIPELINE_STAGE(SWITCH, OUT, APPLY_PORT_SEC, 9, "ls_out_apply_port_sec") \
-                                                                      \
-    /* Logical router ingress stages. */                              \
+    PIPELINE_STAGE(SWITCH, IN,  PRE_NF,        23,                        \
+                   "ls_in_pre_network_function")                          \
+    PIPELINE_STAGE(SWITCH, IN,  STATEFUL,      24, "ls_in_stateful")      \
+    PIPELINE_STAGE(SWITCH, IN,  NF,            25, "ls_in_network_function") \
+    PIPELINE_STAGE(SWITCH, IN,  ARP_ND_PRE_LOOKUP, 26,                    \
+                   "ls_in_arp_nd_pre_lookup")                             \
+    PIPELINE_STAGE(SWITCH, IN,  ARP_ND_RSP,    27, "ls_in_arp_rsp")       \
+    PIPELINE_STAGE(SWITCH, IN,  DHCP_OPTIONS,  28, "ls_in_dhcp_options")  \
+    PIPELINE_STAGE(SWITCH, IN,  DHCP_RESPONSE, 29, "ls_in_dhcp_response") \
+    PIPELINE_STAGE(SWITCH, IN,  DNS_LOOKUP,    30, "ls_in_dns_lookup")    \
+    PIPELINE_STAGE(SWITCH, IN,  DNS_RESPONSE,  31, "ls_in_dns_response")  \
+    PIPELINE_STAGE(SWITCH, IN,  EXTERNAL_PORT, 32, "ls_in_external_port") \
+    PIPELINE_STAGE(SWITCH, IN,  L2_LKUP,       33, "ls_in_l2_lkup")       \
+    PIPELINE_STAGE(SWITCH, IN,  L2_UNKNOWN,    34, "ls_in_l2_unknown")
+
+/* Logical switch egress stages. */
+#define SWITCH_OUT_PIPELINE_STAGES                                           \
+    PIPELINE_STAGE(SWITCH, OUT, LOOKUP_FDB,      0, "ls_out_lookup_fdb")     \
+    PIPELINE_STAGE(SWITCH, OUT, PUT_FDB,         1, "ls_out_put_fdb")        \
+    PIPELINE_STAGE(SWITCH, OUT, PRE_ACL,         2, "ls_out_pre_acl")        \
+    PIPELINE_STAGE(SWITCH, OUT, PRE_LB,          3, "ls_out_pre_lb")         \
+    PIPELINE_STAGE(SWITCH, OUT, PRE_STATEFUL,    4, "ls_out_pre_stateful")   \
+    PIPELINE_STAGE(SWITCH, OUT, ACL_HINT,        5, "ls_out_acl_hint")       \
+    PIPELINE_STAGE(SWITCH, OUT, ACL_EVAL,        6, "ls_out_acl_eval")       \
+    PIPELINE_STAGE(SWITCH, OUT, ACL_SAMPLE,      7, "ls_out_acl_sample")     \
+    PIPELINE_STAGE(SWITCH, OUT, ACL_ACTION,      8, "ls_out_acl_action")     \
+    PIPELINE_STAGE(SWITCH, OUT, MIRROR,          9, "ls_out_mirror")         \
+    PIPELINE_STAGE(SWITCH, OUT, QOS,            10, "ls_out_qos")            \
+    PIPELINE_STAGE(SWITCH, OUT, PRE_NF,         11,                          \
+                   "ls_out_pre_network_function")                            \
+    PIPELINE_STAGE(SWITCH, OUT, STATEFUL,       12, "ls_out_stateful")       \
+    PIPELINE_STAGE(SWITCH, OUT, NF,             13,                          \
+                   "ls_out_network_function")                                \
+    PIPELINE_STAGE(SWITCH, OUT, CHECK_PORT_SEC, 14, "ls_out_check_port_sec") \
+    PIPELINE_STAGE(SWITCH, OUT, APPLY_PORT_SEC, 15, "ls_out_apply_port_sec")
+
+/* Logical router ingress stages. */
+#define ROUTER_IN_PIPELINE_STAGES                                         \
     PIPELINE_STAGE(ROUTER, IN,  ADMISSION,       0, "lr_in_admission")    \
     PIPELINE_STAGE(ROUTER, IN,  LOOKUP_NEIGHBOR, 1, "lr_in_lookup_neighbor") \
     PIPELINE_STAGE(ROUTER, IN,  LEARN_NEIGHBOR,  2, "lr_in_learn_neighbor") \
     PIPELINE_STAGE(ROUTER, IN,  IP_INPUT,        3, "lr_in_ip_input")     \
     PIPELINE_STAGE(ROUTER, IN,  DHCP_RELAY_REQ,  4, "lr_in_dhcp_relay_req") \
     PIPELINE_STAGE(ROUTER, IN,  UNSNAT,          5, "lr_in_unsnat")       \
-    PIPELINE_STAGE(ROUTER, IN,  DEFRAG,          6, "lr_in_defrag")       \
-    PIPELINE_STAGE(ROUTER, IN,  LB_AFF_CHECK,    7, "lr_in_lb_aff_check") \
-    PIPELINE_STAGE(ROUTER, IN,  DNAT,            8, "lr_in_dnat")         \
-    PIPELINE_STAGE(ROUTER, IN,  LB_AFF_LEARN,    9, "lr_in_lb_aff_learn") \
-    PIPELINE_STAGE(ROUTER, IN,  ECMP_STATEFUL,   10, "lr_in_ecmp_stateful") \
-    PIPELINE_STAGE(ROUTER, IN,  ND_RA_OPTIONS,   11, "lr_in_nd_ra_options") \
-    PIPELINE_STAGE(ROUTER, IN,  ND_RA_RESPONSE,  12, "lr_in_nd_ra_response") \
-    PIPELINE_STAGE(ROUTER, IN,  IP_ROUTING_PRE,  13, "lr_in_ip_routing_pre")  \
-    PIPELINE_STAGE(ROUTER, IN,  IP_ROUTING,      14, "lr_in_ip_routing")      \
-    PIPELINE_STAGE(ROUTER, IN,  IP_ROUTING_ECMP, 15, "lr_in_ip_routing_ecmp") \
-    PIPELINE_STAGE(ROUTER, IN,  POLICY,          16, "lr_in_policy")          \
-    PIPELINE_STAGE(ROUTER, IN,  POLICY_ECMP,     17, "lr_in_policy_ecmp")     \
-    PIPELINE_STAGE(ROUTER, IN,  DHCP_RELAY_RESP_CHK, 18,                      \
+    PIPELINE_STAGE(ROUTER, IN,  POST_UNSNAT,     6, "lr_in_post_unsnat")  \
+    PIPELINE_STAGE(ROUTER, IN,  DEFRAG,          7, "lr_in_defrag")       \
+    PIPELINE_STAGE(ROUTER, IN,  CT_EXTRACT,      8, "lr_in_ct_extract")   \
+    PIPELINE_STAGE(ROUTER, IN,  LB_AFF_CHECK,    9, "lr_in_lb_aff_check") \
+    PIPELINE_STAGE(ROUTER, IN,  DNAT,            10, "lr_in_dnat")         \
+    PIPELINE_STAGE(ROUTER, IN,  LB_AFF_LEARN,    11, "lr_in_lb_aff_learn") \
+    PIPELINE_STAGE(ROUTER, IN,  ECMP_STATEFUL,   12, "lr_in_ecmp_stateful") \
+    PIPELINE_STAGE(ROUTER, IN,  ND_RA_OPTIONS,   13, "lr_in_nd_ra_options") \
+    PIPELINE_STAGE(ROUTER, IN,  ND_RA_RESPONSE,  14, "lr_in_nd_ra_response") \
+    PIPELINE_STAGE(ROUTER, IN,  IP_ROUTING_PRE,  15, "lr_in_ip_routing_pre")  \
+    PIPELINE_STAGE(ROUTER, IN,  IP_ROUTING,      16, "lr_in_ip_routing")      \
+    PIPELINE_STAGE(ROUTER, IN,  IP_ROUTING_ECMP, 17, "lr_in_ip_routing_ecmp") \
+    PIPELINE_STAGE(ROUTER, IN,  POLICY,          18, "lr_in_policy")          \
+    PIPELINE_STAGE(ROUTER, IN,  POLICY_ECMP,     19, "lr_in_policy_ecmp")     \
+    PIPELINE_STAGE(ROUTER, IN,  DHCP_RELAY_RESP_CHK, 20,                      \
                   "lr_in_dhcp_relay_resp_chk")                                \
-    PIPELINE_STAGE(ROUTER, IN,  DHCP_RELAY_RESP, 19,                          \
+    PIPELINE_STAGE(ROUTER, IN,  DHCP_RELAY_RESP, 21,                          \
                   "lr_in_dhcp_relay_resp")                                    \
-    PIPELINE_STAGE(ROUTER, IN,  ARP_RESOLVE,     20, "lr_in_arp_resolve")     \
-    PIPELINE_STAGE(ROUTER, IN,  CHK_PKT_LEN,     21, "lr_in_chk_pkt_len")     \
-    PIPELINE_STAGE(ROUTER, IN,  LARGER_PKTS,     22, "lr_in_larger_pkts")     \
-    PIPELINE_STAGE(ROUTER, IN,  GW_REDIRECT,     23, "lr_in_gw_redirect")     \
-    PIPELINE_STAGE(ROUTER, IN,  ARP_REQUEST,     24, "lr_in_arp_request")     \
-                                                                      \
-    /* Logical router egress stages. */                               \
+    PIPELINE_STAGE(ROUTER, IN,  ARP_RESOLVE,     22, "lr_in_arp_resolve")     \
+    PIPELINE_STAGE(ROUTER, IN,  CHK_PKT_LEN,     23, "lr_in_chk_pkt_len")     \
+    PIPELINE_STAGE(ROUTER, IN,  LARGER_PKTS,     24, "lr_in_larger_pkts")     \
+    PIPELINE_STAGE(ROUTER, IN,  GW_REDIRECT,     25, "lr_in_gw_redirect")     \
+    PIPELINE_STAGE(ROUTER, IN,  NETWORK_ID,      26, "lr_in_network_id")      \
+    PIPELINE_STAGE(ROUTER, IN,  ARP_REQUEST,     27, "lr_in_arp_request")     \
+    PIPELINE_STAGE(ROUTER, IN,  ECMP_STATEFUL_EGR, 28,                        \
+                                "lr_in_ecmp_stateful_egr")
+
+/* Logical router egress stages. */
+#define ROUTER_OUT_PIPELINE_STAGES                                           \
     PIPELINE_STAGE(ROUTER, OUT, CHECK_DNAT_LOCAL,   0,                       \
                    "lr_out_chk_dnat_local")                                  \
     PIPELINE_STAGE(ROUTER, OUT, UNDNAT,             1, "lr_out_undnat")      \
@@ -475,15 +617,28 @@ enum ovn_stage {
     PIPELINE_STAGE(ROUTER, OUT, EGR_LOOP,           5, "lr_out_egr_loop")    \
     PIPELINE_STAGE(ROUTER, OUT, DELIVERY,           6, "lr_out_delivery")
 
-#define PIPELINE_STAGE(DP_TYPE, PIPELINE, STAGE, TABLE, NAME)   \
-    S_##DP_TYPE##_##PIPELINE##_##STAGE                          \
-        = OVN_STAGE_BUILD(DP_##DP_TYPE, P_##PIPELINE, TABLE),
-    PIPELINE_STAGES
-#undef PIPELINE_STAGE
+/* A stage within an OVN logical switch or router.
+ *
+ * A "struct ovn_stage" indicates whether the stage is part of a logical switch
+ * or router, whether the stage is part of the ingress or egress pipeline, and
+ * the table within that pipeline.
+ */
+struct ovn_stage {
+    enum ovn_datapath_type dp_type;
+    enum ovn_pipeline pipeline;
+    uint8_t table;
+    const char *name;
 };
 
-enum ovn_datapath_type ovn_stage_to_datapath_type(enum ovn_stage stage);
+bool ovn_stage_equal(const struct ovn_stage *a, const struct ovn_stage *b);
 
+/* Returns the type of the datapath to which a flow with the given 'stage' may
+ * be added. */
+static inline enum ovn_datapath_type
+ovn_stage_to_datapath_type(const struct ovn_stage *stage)
+{
+    return stage->dp_type;
+}
 
 /* Returns 'od''s datapath type. */
 static inline enum ovn_datapath_type
@@ -492,46 +647,43 @@ ovn_datapath_get_type(const struct ovn_datapath *od)
     return od->nbs ? DP_SWITCH : DP_ROUTER;
 }
 
-/* Returns an "enum ovn_stage" built from the arguments. */
-static inline enum ovn_stage
+/* Returns a "struct ovn_stage" built from the arguments.
+ * The stage will not have a proper name, but so far, the only cases
+ * where stages are built from components, a name is not necessary.
+ */
+static inline struct ovn_stage
 ovn_stage_build(enum ovn_datapath_type dp_type, enum ovn_pipeline pipeline,
                 uint8_t table)
 {
-    return OVN_STAGE_BUILD(dp_type, pipeline, table);
+    return (struct ovn_stage) {dp_type, pipeline, table, "<unknown>"};
 }
 
 /* Returns the pipeline to which 'stage' belongs. */
 static inline enum ovn_pipeline
-ovn_stage_get_pipeline(enum ovn_stage stage)
+ovn_stage_get_pipeline(const struct ovn_stage *stage)
 {
-    return (stage >> 8) & 1;
+    return stage->pipeline;
 }
 
 /* Returns the pipeline name to which 'stage' belongs. */
 static inline const char *
-ovn_stage_get_pipeline_name(enum ovn_stage stage)
+ovn_stage_get_pipeline_name(const struct ovn_stage *stage)
 {
     return ovn_stage_get_pipeline(stage) == P_IN ? "ingress" : "egress";
 }
 
 /* Returns the table to which 'stage' belongs. */
 static inline uint8_t
-ovn_stage_get_table(enum ovn_stage stage)
+ovn_stage_get_table(const struct ovn_stage *stage)
 {
-    return stage & 0xff;
+    return stage->table;
 }
 
 /* Returns a string name for 'stage'. */
 static inline const char *
-ovn_stage_to_str(enum ovn_stage stage)
+ovn_stage_to_str(const struct ovn_stage *stage)
 {
-    switch (stage) {
-#define PIPELINE_STAGE(DP_TYPE, PIPELINE, STAGE, TABLE, NAME)       \
-        case S_##DP_TYPE##_##PIPELINE##_##STAGE: return NAME;
-    PIPELINE_STAGES
-#undef PIPELINE_STAGE
-        default: return "<unknown>";
-    }
+    return stage->name;
 }
 
 /* A logical switch port or logical router port.
@@ -572,9 +724,6 @@ struct ovn_port {
                                           * beginning of 'lsp_addrs' extracted
                                           * directly from LSP 'addresses'. */
 
-    struct lport_addresses *ps_addrs;   /* Port security addresses. */
-    unsigned int n_ps_addrs;
-
     bool lsp_can_be_inc_processed; /* If it can be incrementally processed when
                                       the port changes. */
 
@@ -582,26 +731,35 @@ struct ovn_port {
     const struct nbrec_logical_router_port *nbrp; /* May be NULL. */
 
     struct lport_addresses lrp_networks;
+    bool prefix_delegation; /* True if IPv6 prefix delegation enabled. */
+
+    /* The modes contained in the nbrp option "dynamic-routing-redistribute".
+     * If the option is unset it will be initialized based on the nbr
+     * option. */
+    enum dynamic_routing_redistribute_mode dynamic_routing_redistribute;
 
     /* Logical port multicast data. */
     struct mcast_port_info mcast_info;
 
-    /* At most one of l3dgw_port and cr_port can be not NULL. */
+    /* At most one of primary_port and cr_port can be not NULL. */
 
-    /* This is set to a distributed gateway port if and only if this ovn_port
-     * is "derived" from it. Otherwise this is set to NULL. The derived
-     * ovn_port represents the instance of distributed gateway port on the
-     * gateway chassis.*/
-    struct ovn_port *l3dgw_port;
+    /* If this ovn_port is a derived port, then 'primary_port' points to the
+     * port from which this ovn_port is derived. */
+    struct ovn_port *primary_port;
 
     /* This is set to the "derived" chassis-redirect port of this port if and
      * only if this port is a distributed gateway port. Otherwise this is set
      * to NULL. */
     struct ovn_port *cr_port;
 
-    bool has_unknown; /* If the addresses have 'unknown' defined. */
+    /* If this ovn_port is a mirror serving port, this field is set for
+     * a parent port. */
+    struct ovn_port *mirror_target_port;
 
-    bool has_bfd;
+    /* Set to true if this port is attached to lport mirror. */
+    bool has_attached_lport_mirror;
+
+    bool has_unknown; /* If the addresses have 'unknown' defined. */
 
     /* The port's peer:
      *
@@ -609,6 +767,8 @@ struct ovn_port {
      *       and R in turn has S has its peer.
      *
      *     - Two connected logical router ports have each other as peer.
+     *
+     *     - Two connected logical switch ports have each other as peer.
      *
      *     - Other kinds of ports have no peer. */
     struct ovn_port *peer;
@@ -661,14 +821,98 @@ struct ovn_port {
     struct lflow_ref *stateful_lflow_ref;
 };
 
+enum route_source {
+    /* The route is directly connected to the logical router. */
+    ROUTE_SOURCE_CONNECTED,
+    /* The route is derived from a northbound static route entry. */
+    ROUTE_SOURCE_STATIC,
+    /* The route is dynamically learned by an ovn-controller. */
+    ROUTE_SOURCE_LEARNED,
+    /* The route is derived from a NAT's external IP. */
+    ROUTE_SOURCE_NAT,
+    /* The route is derived from a LB's VIP. */
+    ROUTE_SOURCE_LB,
+    /* The route is derived from out_port of connected logical router. */
+    ROUTE_SOURCE_CONNECTED_AS_HOST,
+    /* The route is derived from an ovn-controller and advertised to IC. */
+    ROUTE_SOURCE_IC_DYNAMIC,
+};
+
+struct parsed_route {
+    struct hmap_node key_node;
+    struct in6_addr prefix;
+    struct in6_addr *nexthop; /* NULL for ROUTE_SOURCE_CONNECTED */
+    unsigned int plen;
+    uint32_t route_table_id;
+    uint32_t hash;
+    bool is_src_route;
+    bool ecmp_symmetric_reply;
+    bool override_connected;
+    bool is_discard_route;
+    const struct ovn_datapath *od;
+    struct sset ecmp_selection_fields;
+    enum route_source source;
+    const struct ovsdb_idl_row *source_hint;
+    char *lrp_addr_s;
+    const struct ovn_port *out_port;
+    const struct ovn_port *tracked_port; /* May be NULL. */
+    bool dynamic_routing_advertise;
+};
+
+struct parsed_route *parsed_route_clone(const struct parsed_route *);
+struct parsed_route *parsed_route_lookup(struct hmap *routes, size_t hash,
+                                         struct parsed_route *new_pr);
+struct parsed_route *parsed_route_lookup_by_source(
+    enum route_source source, const struct ovsdb_idl_row *source_hint,
+    const struct hmap *routes);
+size_t parsed_route_hash(const struct parsed_route *);
+void parsed_route_free(struct parsed_route *);
+
+struct parsed_route *parsed_route_add(
+    const struct ovn_datapath *od,
+    struct in6_addr *nexthop,
+    const struct in6_addr *prefix,
+    unsigned int plen,
+    bool is_discard_route,
+    const char *lrp_addr_s,
+    const struct ovn_port *out_port,
+    uint32_t route_table_id,
+    bool is_src_route,
+    bool ecmp_symmetric_reply,
+    bool override_connected,
+    const struct sset *ecmp_selection_fields,
+    enum route_source source,
+    bool dynamic_routing_advertise,
+    const struct ovsdb_idl_row *source_hint,
+    const struct ovn_port *tracked_port,
+    struct hmap *routes);
+
+struct parsed_route *parsed_routes_add_static(
+    const struct ovn_datapath *od,
+    const struct nbrec_logical_router_static_route *route,
+    struct hmap *routes, struct simap *route_tables,
+    struct uuidset *bfd_active_connections);
+
+struct svc_monitors_map_data {
+    const struct hmap *local_svc_monitors_map;
+    const struct hmap *ic_learned_svc_monitors_map;
+    struct lflow_ref *lflow_ref;
+};
+
+bool
+find_route_outport(const struct ovn_datapath *od, const char *output_port,
+                   const char *route_type, const char *route_desc,
+                   const char *nexthop, bool is_ipv4,
+                   bool force_out_port,
+                   struct ovn_port **out_port, const char **lrp_addr_s);
+
 void ovnnb_db_run(struct northd_input *input_data,
                   struct northd_data *data,
-                  struct ovsdb_idl_txn *ovnnb_txn,
                   struct ovsdb_idl_txn *ovnsb_txn);
-void ovnsb_db_run(struct ovsdb_idl_txn *ovnnb_txn,
-                  struct ovsdb_idl_txn *ovnsb_txn,
+void ovnsb_db_run(struct ovsdb_idl_txn *ovnsb_txn,
                   const struct sbrec_port_binding_table *,
                   const struct sbrec_ha_chassis_group_table *,
+                  struct ovsdb_idl_index *,
                   struct hmap *ls_ports,
                   struct hmap *lr_ports);
 bool northd_handle_ls_changes(struct ovsdb_idl_txn *,
@@ -676,37 +920,86 @@ bool northd_handle_ls_changes(struct ovsdb_idl_txn *,
                               struct northd_data *);
 bool northd_handle_lr_changes(const struct northd_input *,
                               struct northd_data *);
+bool northd_handle_pgs_acl_changes(const struct northd_input *ni,
+                                   struct northd_data *nd);
+bool northd_handle_ipam_changes(struct northd_data *nd);
 void destroy_northd_data_tracked_changes(struct northd_data *);
 void northd_destroy(struct northd_data *data);
 void northd_init(struct northd_data *data);
 void northd_indices_create(struct northd_data *data,
                            struct ovsdb_idl *ovnsb_idl);
 
+void build_parsed_routes(const struct ovn_datapath *, struct hmap *,
+                         struct simap *, struct uuidset *);
+uint32_t get_route_table_id(struct simap *, const char *);
+void routes_init(struct routes_data *);
+void routes_destroy(struct routes_data *);
+void routes_clear_tracked(struct routes_data *);
+
+struct bfd_entry {
+    struct hmap_node hmap_node;
+
+    const struct nbrec_bfd *nb_bt;
+    const struct sbrec_bfd *sb_bt;
+
+    char *logical_port;
+    char *dst_ip;
+    char *status;
+};
+
+struct bfd_entry *bfd_alloc_entry(struct hmap *bfd_connections,
+                                  const char *logical_port, const char *dst_ip,
+                                  const char *status);
+void bfd_erase_entry(struct bfd_entry *bfd_e);
+void bfd_set_status(struct bfd_entry *bfd_e, const char *status);
+const char *bfd_get_status(const char *db_status);
+struct bfd_entry *bfd_port_lookup(const struct hmap *bfd_map,
+                                  const char *logical_port,
+                                  const char *dst_ip);
+void bfd_destroy(struct hmap *bfd_connections);
+
+void bfd_sync_init(struct bfd_sync_data *);
+void bfd_sync_swap(struct bfd_sync_data *, struct sset *bfd_ports);
+void bfd_sync_destroy(struct bfd_sync_data *);
+
+void ic_learned_svc_monitors_init(
+    struct ic_learned_svc_monitors_data *data);
+void ic_learned_svc_monitors_cleanup(
+    struct ic_learned_svc_monitors_data *data);
+
 struct lflow_table;
 struct lr_stateful_tracked_data;
 struct ls_stateful_tracked_data;
+struct group_ecmp_datapath;
 
-void build_lflows(struct ovsdb_idl_txn *ovnsb_txn,
-                  struct lflow_input *input_data,
+void build_lflows(struct lflow_input *input_data,
                   struct lflow_table *);
 void lflow_reset_northd_refs(struct lflow_input *);
+void build_route_data_flows_for_lrouter(
+    const struct ovn_datapath *od, struct lflow_table *lflows,
+    const struct group_ecmp_datapath *route_node,
+    const struct sset *bfd_ports);
 
-bool lflow_handle_northd_port_changes(struct ovsdb_idl_txn *ovnsb_txn,
-                                      struct tracked_ovn_ports *,
-                                      struct lflow_input *,
-                                      struct lflow_table *lflows);
-bool lflow_handle_northd_lb_changes(struct ovsdb_idl_txn *ovnsb_txn,
-                                    struct tracked_lbs *,
+void lflow_handle_northd_lr_changes(struct tracked_dps *,
                                     struct lflow_input *,
-                                    struct lflow_table *lflows);
-bool lflow_handle_lr_stateful_changes(struct ovsdb_idl_txn *,
-                                      struct lr_stateful_tracked_data *,
+                                    struct lflow_table *lflows,
+                                    struct hmapx *dirty_lflow_refs);
+void lflow_handle_northd_port_changes(struct tracked_ovn_ports *,
                                       struct lflow_input *,
-                                      struct lflow_table *lflows);
-bool lflow_handle_ls_stateful_changes(struct ovsdb_idl_txn *,
-                                      struct ls_stateful_tracked_data *,
+                                      struct lflow_table *lflows,
+                                      struct hmapx *dirty_lflow_refs);
+void lflow_handle_northd_lb_changes(struct tracked_lbs *,
+                                    struct lflow_input *,
+                                    struct lflow_table *lflows,
+                                    struct hmapx *dirty_lflow_refs);
+void lflow_handle_lr_stateful_changes(struct lr_stateful_tracked_data *,
                                       struct lflow_input *,
-                                      struct lflow_table *lflows);
+                                      struct lflow_table *lflows,
+                                      struct hmapx *dirty_lflow_refs);
+void lflow_handle_ls_stateful_changes(struct ls_stateful_tracked_data *,
+                                      struct lflow_input *,
+                                      struct lflow_table *lflows,
+                                      struct hmapx *dirty_lflow_refs);
 bool northd_handle_sb_port_binding_changes(
     const struct sbrec_port_binding_table *, struct hmap *ls_ports,
     struct hmap *lr_ports);
@@ -717,15 +1010,26 @@ bool northd_handle_lb_data_changes(struct tracked_lb_data *,
                                    struct ovn_datapaths *lr_datapaths,
                                    struct hmap *lb_datapaths_map,
                                    struct hmap *lbgrp_datapaths_map,
+                                   const struct hmap *lr_lb_map,
                                    struct northd_tracked_data *);
 
-void build_bfd_table(struct ovsdb_idl_txn *ovnsb_txn,
-                     const struct nbrec_bfd_table *,
-                     const struct sbrec_bfd_table *,
-                     const struct hmap *lr_ports,
-                     struct hmap *bfd_connections);
-void bfd_cleanup_connections(const struct nbrec_bfd_table *,
-                             struct hmap *bfd_map);
+void bfd_table_sync(struct ovsdb_idl_txn *,
+                    const struct hmap *, struct hmap *,
+                    struct sset *);
+struct route_policies_data;
+bool lflow_handle_route_policies_changes(struct route_policies_data *rp_data,
+                                         struct lflow_input *lflow_input,
+                                         struct lflow_table *lflows,
+                                         struct hmapx *dirty_lflow_refs);
+
+void build_bfd_map(const struct nbrec_bfd_table *,
+                   const struct sbrec_bfd_table *, struct hmap *,
+                   const struct uuidset *);
+
+void build_ic_learned_svc_monitors_map(
+    struct hmap *ic_learned_svc_monitors_map,
+    struct ovsdb_idl_index *sbrec_service_monitor_by_learned_type);
+
 void run_update_worker_pool(int n_threads);
 
 const struct ovn_datapath *northd_get_datapath_for_port(
@@ -735,9 +1039,13 @@ struct lr_stateful_table;
 void sync_pbs(struct ovsdb_idl_txn *, struct hmap *ls_ports,
               struct hmap *lr_ports,
               const struct lr_stateful_table *);
-bool sync_pbs_for_northd_changed_ovn_ports(
+void sync_pbs_for_northd_changed_ovn_ports(
     struct tracked_ovn_ports *,
     const struct lr_stateful_table *);
+
+void sync_pbs_for_lr_stateful_changes(
+    const struct ovn_datapath *od,
+    const struct lr_stateful_table *lr_stateful);
 
 static inline bool
 northd_has_tracked_data(struct northd_tracked_data *trk_nd_changes) {
@@ -763,6 +1071,12 @@ northd_has_lr_nats_in_tracked_data(struct northd_tracked_data *trk_nd_changes)
 }
 
 static inline bool
+northd_has_lr_route_in_tracked_data(struct northd_tracked_data *trk_nd_changes)
+{
+    return trk_nd_changes->type & NORTHD_TRACKED_LR_ROUTES;
+}
+
+static inline bool
 northd_has_ls_lbs_in_tracked_data(struct northd_tracked_data *trk_nd_changes)
 {
     return trk_nd_changes->type & NORTHD_TRACKED_LS_LBS;
@@ -772,6 +1086,20 @@ static inline bool
 northd_has_ls_acls_in_tracked_data(struct northd_tracked_data *trk_nd_changes)
 {
     return trk_nd_changes->type & NORTHD_TRACKED_LS_ACLS;
+}
+
+static inline bool
+northd_has_lswitches_in_tracked_data(
+        struct northd_tracked_data *trk_nd_changes)
+{
+    return trk_nd_changes->type & NORTHD_TRACKED_SWITCHES;
+}
+
+static inline bool
+northd_has_lrouters_in_tracked_data(
+        struct northd_tracked_data *trk_nd_changes)
+{
+    return trk_nd_changes->type & NORTHD_TRACKED_ROUTERS;
 }
 
 /* Returns 'true' if the IPv4 'addr' is on the same subnet with one of the
@@ -788,9 +1116,130 @@ bool lrouter_port_ipv6_reachable(const struct ovn_port *,
 static inline bool
 lr_has_multiple_gw_ports(const struct ovn_datapath *od)
 {
-    return od->n_l3dgw_ports > 1 && !od->is_gw_router;
+    return vector_len(&od->l3dgw_ports) > 1 && !od->is_gw_router;
 }
 
-uint32_t get_ovn_max_dp_key_local(const struct sbrec_chassis_table *);
+/* Returns true if the logical router port 'enabled' column is empty or
+ * set to true.  Otherwise, returns false. */
+static inline bool
+lrport_is_enabled(const struct nbrec_logical_router_port *lrport)
+{
+    return !lrport->enabled || *lrport->enabled;
+}
+
+/* Returns true if the logical switch port 'enabled' column is empty or
+ * set to true.  Otherwise, returns false. */
+static inline bool
+lsp_is_enabled(const struct nbrec_logical_switch_port *lsp)
+{
+    return !lsp->n_enabled || *lsp->enabled;
+}
+
+static inline bool
+lsp_is_router(const struct nbrec_logical_switch_port *nbsp)
+{
+    /* type=router, or a type=remote LSP that CMS marked as representing a
+     * remote LRP (e.g. ovn-ic transit switch ports). */
+    return !strcmp(nbsp->type, "router")
+           || (!strcmp(nbsp->type, "remote")
+               && smap_get_bool(&nbsp->options, "is_router", false));
+}
+
+static inline bool
+lsp_can_receive_multicast(const struct nbrec_logical_switch_port *nbsp)
+{
+    return smap_get_bool(&nbsp->options, "receive_multicast", true);
+}
+
+static inline bool
+lsp_can_learn_mac(const struct nbrec_logical_switch_port *nbsp)
+{
+    return smap_get_bool(&nbsp->options, "lsp_learn_fdb", true);
+}
+
+const char *lrp_find_member_ip(const struct ovn_port *op, const char *ip_s);
+
+/* This function returns true if 'op' is a gateway router port.
+ * False otherwise.
+ * For 'op' to be a gateway router port.
+ *  1. op->nbrp->gateway_chassis or op->nbrp->ha_chassis_group should
+ *     be configured.
+ *  2. op->cr_port should not be NULL.  If op->nbrp->gateway_chassis or
+ *     op->nbrp->ha_chassis_group is set by the user, northd WILL create
+ *     a chassis resident port in the SB port binding.
+ *     See join_logical_ports().
+ */
+static inline bool
+lrp_is_l3dgw(const struct ovn_port *op)
+{
+    return op->cr_port && op->nbrp &&
+           (op->nbrp->n_gateway_chassis || op->nbrp->ha_chassis_group);
+}
+
+/* This function returns false if 'op' is NULL, sb port binding different
+ * from logical port from learned route, datapath has dynamic routing disabled
+ * or if port is lrp l3dgw with no chassis.
+ * True otherwise.
+ */
+static inline bool
+ovn_port_must_learn_route(const struct ovn_port *op,
+                          const struct sbrec_learned_route *sb_route)
+{
+    if (!op) {
+        return false;
+    }
+    if (op->sb != sb_route->logical_port) {
+        return false;
+    }
+    if (!op->od || !op->od->dynamic_routing) {
+        return false;
+    }
+    if (lrp_is_l3dgw(op) && (!op->cr_port->sb || !op->cr_port->sb->chassis)) {
+        return false;
+    }
+    return true;
+}
+
+ /* Returns true if datapath 'od' operates in centralized mode on gateway.
+ *
+ * Returns false when datapath is distributed. A datapath is distributed
+ * only when configured with the 'distributed' option enabled. In distributed
+ * mode, ARP/ND processing is handled locally on each node.
+ */
+static inline bool
+od_is_centralized(const struct ovn_datapath *od)
+{
+    return !od->is_distributed;
+}
+
+struct ovn_port *ovn_port_find(const struct hmap *ports, const char *name);
+
+void build_igmp_lflows(struct hmap *igmp_groups,
+                       const struct hmap *ls_datapaths,
+                       struct lflow_table *lflows,
+                       struct lflow_ref *lflow_ref);
+void build_lswitch_arp_nd_ic_learned_svc_mon(
+    struct svc_monitors_map_data *svc_mons_data,
+    const struct hmap *ls_ports,
+    const char *svc_monitor_mac,
+    struct lflow_table *lflows);
+/* Structure representing logical router port routable addresses. This
+ * includes DNAT and Load Balancer addresses. This structure will only
+ * be filled in if the router port is a gateway router port. Otherwise,
+ * all pointers will be NULL and n_addrs will be 0.
+ */
+struct ovn_port_routable_addresses {
+    /* The parsed routable addresses */
+    struct lport_addresses *laddrs;
+    /* Number of items in the laddrs array */
+    size_t n_addrs;
+};
+
+struct ovn_port_routable_addresses get_op_addresses(
+    const struct ovn_port *op,
+    const struct lr_stateful_record *lr_stateful_rec,
+    bool routable_only);
+
+void destroy_routable_addresses(struct ovn_port_routable_addresses *ra);
 
 #endif /* NORTHD_H */

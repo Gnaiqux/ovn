@@ -36,7 +36,7 @@ except Exception:
 
 
 argv0 = sys.argv[0]
-version = "@VERSION@"
+version = "@VERSION@@VERSION_SUFFIX@"
 DB_CONNECTION_ERR = ('The connection to {0} DB is not available,'
                      ' {0} information will be missing from the detrace.')
 
@@ -62,13 +62,20 @@ The following options are also available:
 
 class Printer(object):
     def __init__(self):
-        pass
+        self.level = 0
+
+    def set_level(self, level):
+        self.level = level
 
     def print_p(self, string):
-        print('  * ' + string)
+        self._print(2, string)
 
     def print_h(self, string):
-        print('   * ' + string)
+        self._print(3, string)
+
+    def _print(self, extra_indent, string):
+        prefix_len = self.level * 4 + extra_indent
+        print(' ' * prefix_len + '* ' + string)
 
 def datapath_str(datapath):
     return '"%s" (%s)' % (str(datapath.external_ids.get('name')),
@@ -469,12 +476,12 @@ def main():
                          "(use --help for help)\n" % argv0)
         sys.exit(1)
 
-    # If at least one of the remotes is SSL, make sure the SSL required args
-    # were passed.
+    # If at least one of the remotes is SSL/TLS, make sure the SSL/TLS required
+    # args were passed.
     for db in [ovnnb_db, ovnsb_db, ovs_db]:
         if remote_is_ssl(db) and \
                 (not ssl_pk or not ssl_cert or not ssl_ca_cert):
-            sys.stderr.write('%s: SSL connection requires private key, '
+            sys.stderr.write('%s: SSL/TLS connection requires private key, '
                              'certificate for private key, and peer CA '
                              'certificate as arguments.\n' % argv0)
             sys.exit(1)
@@ -515,7 +522,7 @@ def main():
     printer = Printer()
     cookie_handlers = get_cookie_handlers(ovsdb_ovnnb, ovsdb_ovnsb, printer)
 
-    regex_cookie = re.compile(r'^.*cookie 0x([0-9a-fA-F]+)')
+    regex_cookie = re.compile(r'^.*cookie[ =]0x([0-9a-fA-F]+)')
     regex_handlers = [
         (regex_cookie, cookie_handlers)
     ]
@@ -537,18 +544,21 @@ def main():
         line = sys.stdin.readline()
         if len(cookies) > 0:
             # Print record info when the current flow block ends.
-            if regex_table_id.match(line) or line.strip() == '':
+            if regex_table_id.match(line) or line.strip() == '' or \
+                regex_cookie.match(line):
                 for cookie, handlers in cookies:
                     print_record_from_cookie(ovsdb_ovnnb, handlers, cookie)
                 cookies = []
 
-        print(line.strip())
+        print(line.rstrip())
         if line == '':
             break
 
         for regex, handlers in regex_handlers:
             m = regex.match(line)
             if m:
+                # Set indentation level to match the line indentation
+                printer.set_level((len(line) - len(line.lstrip(' '))) // 4)
                 cookies.append((m.group(1), handlers))
 
 

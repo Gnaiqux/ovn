@@ -20,10 +20,12 @@
 
 /* OVS includes */
 #include "openvswitch/vlog.h"
+#include "socket-util.h"
 
 /* OVN includes */
 #include "debug.h"
 #include "en-global-config.h"
+#include "en-sampling-app.h"
 #include "include/ovn/features.h"
 #include "ipam.h"
 #include "lib/ovn-nb-idl.h"
@@ -42,10 +44,14 @@ static bool chassis_features_changed(const struct chassis_features *,
 static bool config_out_of_sync(const struct smap *config,
                                const struct smap *saved_config,
                                const char *key, bool must_be_present);
-static bool check_nb_options_out_of_sync(const struct nbrec_nb_global *,
-                                         struct ed_type_global_config *);
+static bool check_nb_options_out_of_sync(
+    const struct nbrec_nb_global *,
+    struct ed_type_global_config *,
+    const struct sampling_app_table *);
 static void update_sb_config_options_to_sbrec(struct ed_type_global_config *,
                                               const struct sbrec_sb_global *);
+static bool is_vxlan_mode(const struct smap *nb_options,
+                          const struct sbrec_chassis_table *);
 
 void *
 en_global_config_init(struct engine_node *node OVS_UNUSED,
@@ -58,20 +64,51 @@ en_global_config_init(struct engine_node *node OVS_UNUSED,
     return data;
 }
 
-void
+static uint32_t
+get_ovn_max_dp_key_local(bool vxlan_mode, bool vxlan_ic_mode)
+{
+    if (vxlan_mode) {
+        /* OVN_MAX_DP_GLOBAL_NUM doesn't apply for VXLAN mode. */
+        return vxlan_ic_mode ? OVN_MAX_DP_VXLAN_KEY_LOCAL
+                             : OVN_MAX_DP_VXLAN_KEY;
+    }
+    return vxlan_ic_mode ? OVN_MAX_DP_VXLAN_KEY_LOCAL : OVN_MAX_DP_KEY_LOCAL;
+}
+
+static void
+update_svc_monitor_addr(const char *new_ip, char **old_ip_pptr)
+{
+    if (new_ip && *old_ip_pptr) {
+        if (!strcmp(new_ip, *old_ip_pptr)) {
+            return;
+        }
+    }
+    free(*old_ip_pptr);
+
+    /* Parse and set the new IP address if valid */
+    struct in6_addr svc_mon_addr;
+    if (new_ip && ip46_parse(new_ip, &svc_mon_addr)) {
+        *old_ip_pptr = xstrdup(new_ip);
+    } else {
+        *old_ip_pptr = NULL;
+    }
+}
+
+enum engine_node_state
 en_global_config_run(struct engine_node *node , void *data)
 {
     const struct engine_context *eng_ctx = engine_get_context();
-    if (!eng_ctx->ovnnb_idl_txn || !eng_ctx->ovnsb_idl_txn) {
-        return;
-    }
-
     const struct nbrec_nb_global_table *nb_global_table =
         EN_OVSDB_GET(engine_get_input("NB_nb_global", node));
+    const struct nbrec_logical_switch_table *nbrec_ls_table =
+        EN_OVSDB_GET(engine_get_input("NB_logical_switch", node));
     const struct sbrec_sb_global_table *sb_global_table =
         EN_OVSDB_GET(engine_get_input("SB_sb_global", node));
     const struct sbrec_chassis_table *sbrec_chassis_table =
         EN_OVSDB_GET(engine_get_input("SB_chassis", node));
+    const struct ed_type_sampling_app_data *sampling_app_data =
+        engine_get_input_data("sampling_app", node);
+    const struct sampling_app_table *sampling_apps = &sampling_app_data->apps;
 
     struct ed_type_global_config *config_data = data;
 
@@ -87,18 +124,41 @@ en_global_config_run(struct engine_node *node , void *data)
     const char *mac_addr_prefix = set_mac_prefix(smap_get(&nb->options,
                                                           "mac_prefix"));
 
-    const char *monitor_mac = smap_get(&nb->options, "svc_monitor_mac");
-    if (monitor_mac) {
-        if (eth_addr_from_string(monitor_mac,
-                                 &config_data->svc_monitor_mac_ea)) {
-            snprintf(config_data->svc_monitor_mac,
-                     sizeof config_data->svc_monitor_mac,
+    struct svc_monitor_addresses *svc_addresses =
+        &config_data->svc_global_addresses;
+
+    const char *src_monitor_mac = smap_get(&nb->options, "svc_monitor_mac");
+    if (src_monitor_mac) {
+        if (eth_addr_from_string(src_monitor_mac,
+                                 &svc_addresses->mac_ea_src)) {
+            snprintf(svc_addresses->mac_src,
+                     sizeof svc_addresses->mac_src,
                      ETH_ADDR_FMT,
-                     ETH_ADDR_ARGS(config_data->svc_monitor_mac_ea));
+                     ETH_ADDR_ARGS(svc_addresses->mac_ea_src));
         } else {
-            monitor_mac = NULL;
+            src_monitor_mac = NULL;
         }
     }
+
+    const char *dst_monitor_mac = smap_get(&nb->options,
+                                           "svc_monitor_mac_dst");
+    if (dst_monitor_mac) {
+        if (eth_addr_from_string(dst_monitor_mac,
+                                 &svc_addresses->mac_ea_dst)) {
+            snprintf(svc_addresses->mac_dst,
+                     sizeof svc_addresses->mac_dst,
+                     ETH_ADDR_FMT,
+                     ETH_ADDR_ARGS(svc_addresses->mac_ea_dst));
+        } else {
+            dst_monitor_mac = NULL;
+        }
+    }
+
+    const char *monitor_ip = smap_get(&nb->options, "svc_monitor_ip");
+    update_svc_monitor_addr(monitor_ip, &svc_addresses->ip_src);
+
+    const char *monitor_ip_dst = smap_get(&nb->options, "svc_monitor_ip_dst");
+    update_svc_monitor_addr(monitor_ip_dst, &svc_addresses->ip_dst);
 
     struct smap *options = &config_data->nb_options;
     smap_destroy(options);
@@ -106,17 +166,37 @@ en_global_config_run(struct engine_node *node , void *data)
 
     smap_replace(options, "mac_prefix", mac_addr_prefix);
 
-    if (!monitor_mac) {
-        eth_addr_random(&config_data->svc_monitor_mac_ea);
-        snprintf(config_data->svc_monitor_mac,
-                 sizeof config_data->svc_monitor_mac, ETH_ADDR_FMT,
-                 ETH_ADDR_ARGS(config_data->svc_monitor_mac_ea));
+    if (!src_monitor_mac) {
+        eth_addr_random(&svc_addresses->mac_ea_src);
+        snprintf(svc_addresses->mac_src,
+                 sizeof svc_addresses->mac_src, ETH_ADDR_FMT,
+                 ETH_ADDR_ARGS(svc_addresses->mac_ea_src));
         smap_replace(options, "svc_monitor_mac",
-                     config_data->svc_monitor_mac);
+                     svc_addresses->mac_src);
     }
 
-    char *max_tunid = xasprintf("%d",
-        get_ovn_max_dp_key_local(sbrec_chassis_table));
+    if (!dst_monitor_mac) {
+        eth_addr_random(&svc_addresses->mac_ea_dst);
+        snprintf(svc_addresses->mac_dst,
+                 sizeof svc_addresses->mac_dst, ETH_ADDR_FMT,
+                 ETH_ADDR_ARGS(svc_addresses->mac_ea_dst));
+        smap_replace(options, "svc_monitor_mac_dst",
+                     svc_addresses->mac_dst);
+    }
+
+    bool ic_vxlan_mode = false;
+    const struct nbrec_logical_switch *nbs;
+    NBREC_LOGICAL_SWITCH_TABLE_FOR_EACH (nbs, nbrec_ls_table) {
+        if (smap_get_bool(&nbs->other_config, "ic-vxlan_mode", false)) {
+            ic_vxlan_mode = true;
+            break;
+        }
+    }
+    config_data->vxlan_mode = is_vxlan_mode(&nb->options, sbrec_chassis_table);
+    config_data->max_dp_tunnel_id =
+        get_ovn_max_dp_key_local(config_data->vxlan_mode, ic_vxlan_mode);
+
+    char *max_tunid = xasprintf("%d", config_data->max_dp_tunnel_id);
     smap_replace(options, "max_tunid", max_tunid);
     free(max_tunid);
 
@@ -143,7 +223,8 @@ en_global_config_run(struct engine_node *node , void *data)
         build_chassis_features(sbrec_chassis_table, &config_data->features);
     }
 
-    init_debug_config(nb);
+    init_debug_config(nb, sampling_app_get_id(sampling_apps,
+                                              SAMPLING_APP_DROP_DEBUG));
 
     const struct sbrec_sb_global *sb =
         sbrec_sb_global_table_first(sb_global_table);
@@ -157,7 +238,7 @@ en_global_config_run(struct engine_node *node , void *data)
     /* Set up SB_Global (depends on chassis features). */
     update_sb_config_options_to_sbrec(config_data, sb);
 
-    engine_set_node_state(node, EN_UPDATED);
+    return EN_UPDATED;
 }
 
 void en_global_config_cleanup(void *data OVS_UNUSED)
@@ -165,6 +246,8 @@ void en_global_config_cleanup(void *data OVS_UNUSED)
     struct ed_type_global_config *config_data = data;
     smap_destroy(&config_data->nb_options);
     smap_destroy(&config_data->sb_options);
+    free(config_data->svc_global_addresses.ip_src);
+    free(config_data->svc_global_addresses.ip_dst);
     destroy_debug_config();
 }
 
@@ -177,30 +260,33 @@ en_global_config_clear_tracked_data(void *data)
     config_data->tracked_data.chassis_features_changed = false;
 }
 
-bool
+enum engine_input_handler_result
 global_config_nb_global_handler(struct engine_node *node, void *data)
 {
     const struct nbrec_nb_global_table *nb_global_table =
         EN_OVSDB_GET(engine_get_input("NB_nb_global", node));
     const struct sbrec_sb_global_table *sb_global_table =
         EN_OVSDB_GET(engine_get_input("SB_sb_global", node));
+    const struct ed_type_sampling_app_data *sampling_app_data =
+        engine_get_input_data("sampling_app", node);
+    const struct sampling_app_table *sampling_apps = &sampling_app_data->apps;
 
     const struct nbrec_nb_global *nb =
         nbrec_nb_global_table_first(nb_global_table);
     if (!nb) {
-        return false;
+        return EN_UNHANDLED;
     }
 
     const struct sbrec_sb_global *sb =
         sbrec_sb_global_table_first(sb_global_table);
     if (!sb) {
-        return false;
+        return EN_UNHANDLED;
     }
 
     /* We are only interested in ipsec and options column. */
     if (!nbrec_nb_global_is_updated(nb, NBREC_NB_GLOBAL_COL_IPSEC)
         && !nbrec_nb_global_is_updated(nb, NBREC_NB_GLOBAL_COL_OPTIONS)) {
-        return true;
+        return EN_HANDLED_UNCHANGED;
     }
 
     if (nb->ipsec != sb->ipsec) {
@@ -211,7 +297,7 @@ global_config_nb_global_handler(struct engine_node *node, void *data)
     config_data->tracked = true;
 
     if (smap_equal(&nb->options, &config_data->nb_options)) {
-        return true;
+        return EN_HANDLED_UNCHANGED;
     }
 
     /* Return false if an option is out of sync and requires updating the
@@ -219,34 +305,54 @@ global_config_nb_global_handler(struct engine_node *node, void *data)
     /* Check if svc_monitor_mac has changed or not. */
     if (config_out_of_sync(&nb->options, &config_data->nb_options,
                            "svc_monitor_mac", true)) {
-        return false;
+        return EN_UNHANDLED;
+    }
+
+    if (config_out_of_sync(&nb->options, &config_data->nb_options,
+                           "svc_monitor_mac_dst", true)) {
+        return EN_UNHANDLED;
+    }
+
+    if (config_out_of_sync(&nb->options, &config_data->nb_options,
+                           "svc_monitor_ip", false)) {
+        return EN_UNHANDLED;
+    }
+
+    if (config_out_of_sync(&nb->options, &config_data->nb_options,
+                           "svc_monitor_ip_dst", false)) {
+        return EN_UNHANDLED;
     }
 
     /* Check if max_tunid has changed or not. */
     if (config_out_of_sync(&nb->options, &config_data->nb_options,
                            "max_tunid", true)) {
-        return false;
+        return EN_UNHANDLED;
     }
 
     /* Check if mac_prefix has changed or not. */
     if (config_out_of_sync(&nb->options, &config_data->nb_options,
                            "mac_prefix", true)) {
-        return false;
+        return EN_UNHANDLED;
     }
 
     /* Check if ignore_chassis_features has changed or not. */
     if (config_out_of_sync(&nb->options, &config_data->nb_options,
                            "ignore_chassis_features", false)) {
-        return false;
+        return EN_UNHANDLED;
     }
 
     /* Check if northd_internal_version has changed or not. */
     if (config_out_of_sync(&nb->options, &config_data->nb_options,
                            "northd_internal_version", false)) {
-        return false;
+        return EN_UNHANDLED;
     }
 
-    if (check_nb_options_out_of_sync(nb, config_data)) {
+    if (config_out_of_sync(&nb->options, &config_data->nb_options,
+                           "vxlan_mode", false)) {
+        return EN_UNHANDLED;
+    }
+
+    if (check_nb_options_out_of_sync(nb, config_data, sampling_apps)) {
         config_data->tracked_data.nb_options_changed = true;
     }
 
@@ -255,11 +361,10 @@ global_config_nb_global_handler(struct engine_node *node, void *data)
 
     update_sb_config_options_to_sbrec(config_data, sb);
 
-    engine_set_node_state(node, EN_UPDATED);
-    return true;
+    return EN_HANDLED_UPDATED;
 }
 
-bool
+enum engine_input_handler_result
 global_config_sb_global_handler(struct engine_node *node, void *data)
 {
     const struct sbrec_sb_global_table *sb_global_table =
@@ -268,20 +373,20 @@ global_config_sb_global_handler(struct engine_node *node, void *data)
     const struct sbrec_sb_global *sb =
         sbrec_sb_global_table_first(sb_global_table);
     if (!sb) {
-        return false;
+        return EN_UNHANDLED;
     }
 
     struct ed_type_global_config *config_data = data;
 
     if (!smap_equal(&sb->options, &config_data->sb_options)) {
-        return false;
+        return EN_UNHANDLED;
     }
 
     /* No need to update the engine node. */
-    return true;
+    return EN_HANDLED_UNCHANGED;
 }
 
-bool
+enum engine_input_handler_result
 global_config_sb_chassis_handler(struct engine_node *node, void *data)
 {
     struct ed_type_global_config *config_data = data;
@@ -295,20 +400,20 @@ global_config_sb_chassis_handler(struct engine_node *node, void *data)
             || sbrec_chassis_is_deleted(chassis)
             || sbrec_chassis_is_updated(chassis,
                                         SBREC_CHASSIS_COL_ENCAPS)) {
-            return false;
+            return EN_UNHANDLED;
         }
 
         for (size_t i = 0; i < chassis->n_encaps; i++) {
             if (sbrec_encap_row_get_seqno(chassis->encaps[i],
                                           OVSDB_IDL_CHANGE_MODIFY) > 0) {
-                return false;
+                return EN_UNHANDLED;
             }
         }
     }
 
     if (smap_get_bool(&config_data->nb_options, "ignore_chassis_features",
                       false)) {
-        return true;
+        return EN_HANDLED_UNCHANGED;
     }
 
     bool reevaluate_chassis_features = false;
@@ -323,7 +428,7 @@ global_config_sb_chassis_handler(struct engine_node *node, void *data)
     }
 
     if (!reevaluate_chassis_features) {
-        return true;
+        return EN_HANDLED_UNCHANGED;
     }
 
     struct chassis_features present_features = config_data->features;
@@ -336,15 +441,15 @@ global_config_sb_chassis_handler(struct engine_node *node, void *data)
     if (chassis_features_changed(&present_features, &config_data->features)) {
         config_data->tracked_data.chassis_features_changed = true;
         config_data->tracked = true;
-        engine_set_node_state(node, EN_UPDATED);
+        return EN_HANDLED_UPDATED;
     }
 
-    return true;
+    return EN_HANDLED_UNCHANGED;
 }
 
 /* generic global config handler for any engine node which has global_config
  * has an input node . */
-bool
+enum engine_input_handler_result
 node_global_config_handler(struct engine_node *node, void *data OVS_UNUSED)
 {
     struct ed_type_global_config *global_config =
@@ -353,10 +458,55 @@ node_global_config_handler(struct engine_node *node, void *data OVS_UNUSED)
     if (!global_config->tracked
         || global_config->tracked_data.chassis_features_changed
         || global_config->tracked_data.nb_options_changed) {
-        return false;
+        return EN_UNHANDLED;
     }
 
-    return true;
+    return EN_HANDLED_UNCHANGED;
+}
+
+enum engine_input_handler_result
+global_config_nb_logical_switch_handler(struct engine_node *node,
+                                        void *data)
+{
+    struct ed_type_global_config *config_data = data;
+    const struct nbrec_logical_switch_table *nbrec_ls_table =
+        EN_OVSDB_GET(engine_get_input("NB_logical_switch", node));
+    const struct nbrec_nb_global *nb = nbrec_nb_global_table_first(
+                EN_OVSDB_GET(engine_get_input("NB_nb_global", node)));
+    enum engine_input_handler_result result;
+
+    bool ic_vxlan_mode = false;
+    const struct nbrec_logical_switch *nbs;
+    NBREC_LOGICAL_SWITCH_TABLE_FOR_EACH (nbs, nbrec_ls_table) {
+        if (smap_get_bool(&nbs->other_config, "ic-vxlan_mode", false)) {
+            ic_vxlan_mode = true;
+            break;
+        }
+    }
+    config_data->max_dp_tunnel_id =
+        get_ovn_max_dp_key_local(config_data->vxlan_mode,
+                                 ic_vxlan_mode);
+    char *max_tunid = xasprintf("%d", config_data->max_dp_tunnel_id);
+    struct smap *options = &config_data->nb_options;
+    const char *cur_max_tunid = smap_get(options, "max_tunid");
+
+    if (!cur_max_tunid || strcmp(max_tunid, cur_max_tunid)) {
+        result = EN_HANDLED_UPDATED;
+    } else {
+        result = EN_HANDLED_UNCHANGED;
+    }
+
+    smap_replace(options, "max_tunid", max_tunid);
+    free(max_tunid);
+
+    if (!smap_equal(&nb->options, options)) {
+        nbrec_nb_global_verify_options(nb);
+        nbrec_nb_global_set_options(nb, options);
+    }
+
+    config_data->tracked = true;
+
+    return result;
 }
 
 /* static functions. */
@@ -364,13 +514,12 @@ static void
 northd_enable_all_features(struct ed_type_global_config *data)
 {
     data->features = (struct chassis_features) {
-        .ct_no_masked_label = true,
-        .mac_binding_timestamp = true,
-        .ct_lb_related = true,
-        .fdb_timestamp = true,
-        .ls_dpg_column = true,
         .ct_commit_nat_v2 = true,
         .ct_commit_to_zone = true,
+        .sample_with_reg = true,
+        .ct_next_zone = true,
+        .ct_label_flush = true,
+        .ct_state_save = true,
     };
 }
 
@@ -383,53 +532,15 @@ build_chassis_features(const struct sbrec_chassis_table *sbrec_chassis_table,
     SBREC_CHASSIS_TABLE_FOR_EACH (chassis, sbrec_chassis_table) {
         /* Only consider local AZ chassis.  Remote ones don't install
          * flows generated by the local northd.
+         *
+         * Skip VTEP chassis too. Those are created by ovn-controller-vtep
+         * (which doesn't process logical flows at all) and therefore never
+         * advertise any feature in other_config. Taking them into account
+         * would disable features for the whole deployment.
          */
-        if (smap_get_bool(&chassis->other_config, "is-remote", false)) {
+        if (smap_get_bool(&chassis->other_config, "is-remote", false) ||
+            smap_get_bool(&chassis->other_config, "is-vtep", false)) {
             continue;
-        }
-
-        bool ct_no_masked_label =
-            smap_get_bool(&chassis->other_config,
-                          OVN_FEATURE_CT_NO_MASKED_LABEL,
-                          false);
-        if (!ct_no_masked_label && chassis_features->ct_no_masked_label) {
-            chassis_features->ct_no_masked_label = false;
-        }
-
-        bool mac_binding_timestamp =
-            smap_get_bool(&chassis->other_config,
-                          OVN_FEATURE_MAC_BINDING_TIMESTAMP,
-                          false);
-        if (!mac_binding_timestamp &&
-            chassis_features->mac_binding_timestamp) {
-            chassis_features->mac_binding_timestamp = false;
-        }
-
-        bool ct_lb_related =
-            smap_get_bool(&chassis->other_config,
-                          OVN_FEATURE_CT_LB_RELATED,
-                          false);
-        if (!ct_lb_related &&
-            chassis_features->ct_lb_related) {
-            chassis_features->ct_lb_related = false;
-        }
-
-        bool fdb_timestamp =
-            smap_get_bool(&chassis->other_config,
-                          OVN_FEATURE_FDB_TIMESTAMP,
-                          false);
-        if (!fdb_timestamp &&
-            chassis_features->fdb_timestamp) {
-            chassis_features->fdb_timestamp = false;
-        }
-
-        bool ls_dpg_column =
-            smap_get_bool(&chassis->other_config,
-                          OVN_FEATURE_LS_DPG_COLUMN,
-                          false);
-        if (!ls_dpg_column &&
-            chassis_features->ls_dpg_column) {
-            chassis_features->ls_dpg_column = false;
         }
 
         bool ct_commit_nat_v2 =
@@ -448,6 +559,42 @@ build_chassis_features(const struct sbrec_chassis_table *sbrec_chassis_table,
         if (!ct_commit_to_zone &&
             chassis_features->ct_commit_to_zone) {
             chassis_features->ct_commit_to_zone = false;
+        }
+
+        bool sample_with_reg =
+                smap_get_bool(&chassis->other_config,
+                              OVN_FEATURE_SAMPLE_WITH_REGISTERS,
+                              false);
+        if (!sample_with_reg &&
+            chassis_features->sample_with_reg) {
+            chassis_features->sample_with_reg = false;
+        }
+
+        bool ct_next_zone =
+                smap_get_bool(&chassis->other_config,
+                              OVN_FEATURE_CT_NEXT_ZONE,
+                              false);
+        if (!ct_next_zone &&
+            chassis_features->ct_next_zone) {
+            chassis_features->ct_next_zone = false;
+        }
+
+        bool ct_label_flush =
+                smap_get_bool(&chassis->other_config,
+                              OVN_FEATURE_CT_LABEL_FLUSH,
+                              false);
+        if (!ct_label_flush &&
+            chassis_features->ct_label_flush) {
+            chassis_features->ct_label_flush = false;
+        }
+
+        bool ct_state_save =
+                smap_get_bool(&chassis->other_config,
+                              OVN_FEATURE_CT_STATE_SAVE,
+                              false);
+        if (!ct_state_save &&
+            chassis_features->ct_state_save) {
+            chassis_features->ct_state_save = false;
         }
     }
 }
@@ -478,8 +625,10 @@ config_out_of_sync(const struct smap *config, const struct smap *saved_config,
 }
 
 static bool
-check_nb_options_out_of_sync(const struct nbrec_nb_global *nb,
-                             struct ed_type_global_config *config_data)
+check_nb_options_out_of_sync(
+    const struct nbrec_nb_global *nb,
+    struct ed_type_global_config *config_data,
+    const struct sampling_app_table *sampling_apps)
 {
     if (config_out_of_sync(&nb->options, &config_data->nb_options,
                            "mac_binding_removal_limit", false)) {
@@ -513,13 +662,16 @@ check_nb_options_out_of_sync(const struct nbrec_nb_global *nb,
 
     if (config_out_of_sync(&nb->options, &config_data->nb_options,
                            "debug_drop_domain_id", false)) {
-        init_debug_config(nb);
+        init_debug_config(nb, sampling_app_get_id(sampling_apps,
+                                                  SAMPLING_APP_DROP_DEBUG));
+
         return true;
     }
 
     if (config_out_of_sync(&nb->options, &config_data->nb_options,
                            "debug_drop_collector_set", false)) {
-        init_debug_config(nb);
+        init_debug_config(nb, sampling_app_get_id(sampling_apps,
+                                                  SAMPLING_APP_DROP_DEBUG));
         return true;
     }
 
@@ -530,6 +682,21 @@ check_nb_options_out_of_sync(const struct nbrec_nb_global *nb,
 
     if (config_out_of_sync(&nb->options, &config_data->nb_options,
                            "install_ls_lb_from_router", false)) {
+        return true;
+    }
+
+    if (config_out_of_sync(&nb->options, &config_data->nb_options,
+                           "always_tunnel", false)) {
+        return true;
+    }
+
+    if (config_out_of_sync(&nb->options, &config_data->nb_options,
+                           "ecmp_nexthop_monitor_enable", false)) {
+        return true;
+    }
+
+    if (config_out_of_sync(&nb->options, &config_data->nb_options,
+                           "acl_ct_translation", false)) {
         return true;
     }
 
@@ -545,16 +712,6 @@ update_sb_config_options_to_sbrec(struct ed_type_global_config *config_data,
     smap_destroy(options);
     smap_clone(options, &config_data->nb_options);
 
-    /* Inform ovn-controllers whether LB flows will use ct_mark (i.e., only
-     * if all chassis support it).  If not explicitly present in the database
-     * the default value to be used for this option is 'true'.
-     */
-    if (!config_data->features.ct_no_masked_label) {
-        smap_replace(options, "lb_hairpin_use_ct_mark", "false");
-    } else {
-        smap_remove(options, "lb_hairpin_use_ct_mark");
-    }
-
     /* Hackaround SB_global.options overwrite by NB_Global.options for
      * 'sbctl_probe_interval' option.
      */
@@ -562,10 +719,6 @@ update_sb_config_options_to_sbrec(struct ed_type_global_config *config_data,
     if (sip) {
         smap_replace(options, "sbctl_probe_interval", sip);
     }
-
-    /* Adds indication that northd is handling explicit output after
-     * arp/nd_ns action. */
-    smap_add(options, "arp_ns_explicit_output", "true");
 
     if (!smap_equal(&sb->options, options)) {
         sbrec_sb_global_set_options(sb, options);
@@ -576,25 +729,48 @@ static bool
 chassis_features_changed(const struct chassis_features *present,
                          const struct chassis_features *updated)
 {
-    if (present->ct_no_masked_label != updated->ct_no_masked_label) {
+    if (present->ct_commit_nat_v2 != updated->ct_commit_nat_v2) {
         return true;
     }
 
-    if (present->mac_binding_timestamp != updated->mac_binding_timestamp) {
+    if (present->ct_commit_to_zone != updated->ct_commit_to_zone) {
         return true;
     }
 
-    if (present->ct_lb_related != updated->ct_lb_related) {
+    if (present->sample_with_reg != updated->sample_with_reg) {
         return true;
     }
 
-    if (present->fdb_timestamp != updated->fdb_timestamp) {
+    if (present->ct_next_zone != updated->ct_next_zone) {
         return true;
     }
 
-    if (present->ls_dpg_column != updated->ls_dpg_column) {
+    if (present->ct_label_flush != updated->ct_label_flush) {
         return true;
     }
 
+    if (present->ct_state_save != updated->ct_state_save) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool
+is_vxlan_mode(const struct smap *nb_options,
+              const struct sbrec_chassis_table *sbrec_chassis_table)
+{
+    if (!smap_get_bool(nb_options, "vxlan_mode", true)) {
+        return false;
+    }
+
+    const struct sbrec_chassis *chassis;
+    SBREC_CHASSIS_TABLE_FOR_EACH (chassis, sbrec_chassis_table) {
+        for (int i = 0; i < chassis->n_encaps; i++) {
+            if (!strcmp(chassis->encaps[i]->type, "vxlan")) {
+                return true;
+            }
+        }
+    }
     return false;
 }

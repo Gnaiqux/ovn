@@ -31,7 +31,10 @@ struct ofpbuf;
 struct ovsrec_bridge;
 struct ovsrec_open_vswitch_table;
 struct sbrec_meter_table;
+struct sbrec_ecmp_nexthop_table;
 struct shash;
+struct tracked_acl_ids;
+struct vector;
 
 struct ovn_desired_flow_table {
     /* Hash map flow table using flow match conditions as hash key.*/
@@ -50,18 +53,23 @@ struct ovn_desired_flow_table {
 /* Interface for OVN main loop. */
 void ofctrl_init(struct ovn_extend_table *group_table,
                  struct ovn_extend_table *meter_table);
-bool ofctrl_run(const struct ovsrec_bridge *br_int,
-                const struct ovsrec_open_vswitch_table *,
-                struct shash *pending_ct_zones);
+bool ofctrl_run(const char *conn_target, int probe_interval,
+                struct shash *pending_ct_zones,
+                struct tracked_acl_ids *tracked_acl_ids);
 enum mf_field_id ofctrl_get_mf_field_id(void);
 void ofctrl_put(struct ovn_desired_flow_table *lflow_table,
                 struct ovn_desired_flow_table *pflow_table,
                 struct shash *pending_ct_zones,
+                struct shash *current_ct_zones,
                 struct hmap *pending_lb_tuples,
+                const struct hmap *local_datapaths,
                 struct ovsdb_idl_index *sbrec_meter_by_name,
+                const struct sbrec_ecmp_nexthop_table *enh_table,
                 uint64_t nb_cfg,
                 bool lflow_changed,
-                bool pflow_changed);
+                bool pflow_changed,
+                struct tracked_acl_ids *tracked_acl_ids,
+                bool monitor_cond_complete);
 bool ofctrl_has_backlog(void);
 void ofctrl_wait(void);
 void ofctrl_destroy(void);
@@ -88,13 +96,13 @@ void ofctrl_add_flow(struct ovn_desired_flow_table *, uint8_t table_id,
                      const struct match *, const struct ofpbuf *ofpacts,
                      const struct uuid *);
 
-void ofctrl_add_or_append_flow(struct ovn_desired_flow_table *,
-                               uint8_t table_id, uint16_t priority,
-                               uint64_t cookie, const struct match *,
-                               const struct ofpbuf *actions,
-                               const struct uuid *sb_uuid,
-                               uint32_t meter_id,
-                               const struct addrset_info *);
+void ofctrl_add_or_append_conj_flow(struct ovn_desired_flow_table *,
+                                    uint8_t table_id, uint16_t priority,
+                                    const struct match *,
+                                    const struct vector *conjunctions,
+                                    const struct uuid *sb_uuid,
+                                    uint32_t meter_id,
+                                    const struct addrset_info *);
 
 void ofctrl_add_flow_metered(struct ovn_desired_flow_table *desired_flows,
                              uint8_t table_id, uint16_t priority,

@@ -11,22 +11,40 @@ env:
   IMAGE_NAMESPACE: ovn-org
   IMAGE_NAME: ovn-tests
   CONTAINERS_PATH: ./utilities/containers
-  DEPENDENCIES: podman
+  DEPENDENCIES:
+  PREINSTALLED_DEPENDENCIES: podman
 
 jobs:
   container:
-    runs-on: ubuntu-22.04
+    if: github.repository_owner == 'ovn-org'
+    runs-on: ubuntu-26.04
     strategy:
       matrix:
         distro: [ fedora, ubuntu ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Update APT cache
         run: sudo apt update
 
+      - name: Ensure pre-installed dependencies
+        run: which ${{ env.PREINSTALLED_DEPENDENCIES }}
+
       - name: Install dependencies
-        run: sudo apt install -y ${{ env.DEPENDENCIES }}
+        run: |
+          if [ -n "${{ env.DEPENDENCIES }}" ]; then
+            sudo apt install -y ${{ env.DEPENDENCIES }}
+          fi
+
+      - name: Fix /etc/hosts file
+        run: |
+          . .ci/linux-util.sh
+          fix_etc_hosts
+
+      - name: Fixup crun
+        run: |
+          . .ci/linux-util.sh
+          fixup_crun
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2

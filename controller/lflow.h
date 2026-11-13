@@ -38,7 +38,7 @@
 
 #include <stdint.h>
 #include "lflow-cache.h"
-#include "lflow-conj-ids.h"
+#include "lib/lflow-conj-ids.h"
 #include "openvswitch/hmap.h"
 #include "openvswitch/uuid.h"
 #include "openvswitch/list.h"
@@ -63,37 +63,55 @@ struct uuid;
  *
  * These are heavily documented in ovn-architecture(7), please update it if
  * you make any changes. */
-#define OFTABLE_PHY_TO_LOG                0
+#define OFTABLE_PHY_TO_LOG                  0
 
 /* Start of LOG_PIPELINE_LEN tables. */
-#define OFTABLE_LOG_INGRESS_PIPELINE      8
-#define OFTABLE_OUTPUT_LARGE_PKT_DETECT  37
-#define OFTABLE_OUTPUT_LARGE_PKT_PROCESS 38
-#define OFTABLE_REMOTE_OUTPUT            39
-#define OFTABLE_LOCAL_OUTPUT             40
-#define OFTABLE_CHECK_LOOPBACK           41
+#define OFTABLE_LOG_INGRESS_PIPELINE        8
+#define OFTABLE_OUTPUT_LARGE_PKT_DETECT    52
+#define OFTABLE_OUTPUT_LARGE_PKT_PROCESS   53
+#define OFTABLE_REMOTE_OUTPUT              54
+#define OFTABLE_REMOTE_VTEP_OUTPUT         55
+#define OFTABLE_LOCAL_OUTPUT               56
+#define OFTABLE_CHECK_LOOPBACK             57
 
 /* Start of the OUTPUT section of the pipeline. */
 #define OFTABLE_OUTPUT_INIT OFTABLE_OUTPUT_LARGE_PKT_DETECT
 
 /* Start of LOG_PIPELINE_LEN tables. */
-#define OFTABLE_LOG_EGRESS_PIPELINE      42
-#define OFTABLE_SAVE_INPORT              64
-#define OFTABLE_LOG_TO_PHY               65
-#define OFTABLE_MAC_BINDING              66
-#define OFTABLE_MAC_LOOKUP               67
-#define OFTABLE_CHK_LB_HAIRPIN           68
-#define OFTABLE_CHK_LB_HAIRPIN_REPLY     69
-#define OFTABLE_CT_SNAT_HAIRPIN          70
-#define OFTABLE_GET_FDB                  71
-#define OFTABLE_LOOKUP_FDB               72
-#define OFTABLE_CHK_IN_PORT_SEC          73
-#define OFTABLE_CHK_IN_PORT_SEC_ND       74
-#define OFTABLE_CHK_OUT_PORT_SEC         75
-#define OFTABLE_ECMP_NH_MAC              76
-#define OFTABLE_ECMP_NH                  77
-#define OFTABLE_CHK_LB_AFFINITY          78
-#define OFTABLE_MAC_CACHE_USE            79
+#define OFTABLE_LOG_EGRESS_PIPELINE        62
+#define OFTABLE_SAVE_INPORT                88
+#define OFTABLE_LOG_TO_PHY                 89
+#define OFTABLE_MAC_BINDING                90
+#define OFTABLE_MAC_LOOKUP                 91
+#define OFTABLE_CHK_LB_HAIRPIN             92
+#define OFTABLE_CHK_LB_HAIRPIN_REPLY       93
+#define OFTABLE_CT_SNAT_HAIRPIN            94
+#define OFTABLE_GET_FDB                    95
+#define OFTABLE_LOOKUP_FDB                 96
+#define OFTABLE_CHK_IN_PORT_SEC            97
+#define OFTABLE_CHK_IN_PORT_SEC_ND         98
+#define OFTABLE_CHK_OUT_PORT_SEC           99
+#define OFTABLE_CHK_LB_AFFINITY           100
+#define OFTABLE_MAC_CACHE_USE             101
+#define OFTABLE_CT_ZONE_LOOKUP            102
+#define OFTABLE_CT_ORIG_NW_DST_LOAD       103
+#define OFTABLE_CT_ORIG_IP6_DST_LOAD      104
+#define OFTABLE_CT_ORIG_TP_DST_LOAD       105
+#define OFTABLE_FLOOD_REMOTE_CHASSIS      106
+#define OFTABLE_CT_STATE_SAVE             107
+#define OFTABLE_CT_ORIG_PROTO_LOAD        108
+#define OFTABLE_GET_REMOTE_FDB            109
+#define OFTABLE_LEARN_REMOTE_FDB          110
+#define OFTABLE_EVPN_ARP_LOOKUP           111
+#define OFTABLE_NF_ORIG_INPORT_LEARN      112
+
+/* Verify that table regions do not overlap. */
+BUILD_ASSERT_DECL(OFTABLE_LOG_INGRESS_PIPELINE + LOG_PIPELINE_INGRESS_LEN
+                  <= OFTABLE_OUTPUT_LARGE_PKT_DETECT);
+BUILD_ASSERT_DECL(OFTABLE_CHECK_LOOPBACK < OFTABLE_LOG_EGRESS_PIPELINE);
+BUILD_ASSERT_DECL(OFTABLE_LOG_EGRESS_PIPELINE + LOG_PIPELINE_EGRESS_LEN
+                  <= OFTABLE_SAVE_INPORT);
+
 
 struct lflow_ctx_in {
     struct ovsdb_idl_index *sbrec_multicast_group_by_name_datapath;
@@ -127,10 +145,9 @@ struct lflow_ctx_in {
     const struct smap *template_vars;
     const struct flow_collector_ids *collector_ids;
     const struct hmap *local_lbs;
-    bool lb_hairpin_use_ct_mark;
+    const struct shash *lbinding_lports;
     bool localnet_learn_fdb;
     bool localnet_learn_fdb_changed;
-    bool explicit_arp_ns_output;
 };
 
 struct lflow_ctx_out {
@@ -160,7 +177,7 @@ bool lflow_handle_addr_set_update(const char *as_name, struct addr_set_diff *,
                                   struct lflow_ctx_out *,
                                   bool *changed);
 bool lflow_handle_changed_ref(enum objdep_type, const char *res_name,
-                              struct ovs_list *objs_todo,
+                              struct uuidset *objs_todo,
                               const void *in_arg, void *out_arg);
 
 void lflow_handle_changed_mac_bindings(
@@ -177,8 +194,7 @@ bool lflow_handle_changed_lbs(struct lflow_ctx_in *l_ctx_in,
                               struct lflow_ctx_out *l_ctx_out,
                               const struct uuidset *deleted_lbs,
                               const struct uuidset *updated_lbs,
-                              const struct uuidset *new_lbs,
-                              const struct hmap *old_lbs);
+                              const struct uuidset *new_lbs);
 bool lflow_handle_changed_fdbs(struct lflow_ctx_in *, struct lflow_ctx_out *);
 void lflow_destroy(void);
 
@@ -187,7 +203,8 @@ bool lflow_add_flows_for_datapath(const struct sbrec_datapath_binding *,
                                   struct lflow_ctx_out *);
 bool lflow_handle_flows_for_lport(const struct sbrec_port_binding *,
                                   struct lflow_ctx_in *,
-                                  struct lflow_ctx_out *);
+                                  struct lflow_ctx_out *,
+                                  bool deleted);
 bool lflow_handle_changed_mc_groups(struct lflow_ctx_in *,
                                     struct lflow_ctx_out *);
 bool lflow_handle_changed_port_bindings(struct lflow_ctx_in *,

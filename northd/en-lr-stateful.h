@@ -59,8 +59,13 @@ struct lr_stateful_record {
 
     bool has_lb_vip;
 
+    bool has_distributed_lb;
+
     /* Load Balancer vIPs relevant for this datapath. */
     struct ovn_lb_ip_set *lb_ips;
+
+    /* sset of vips which are also part of lr nats. */
+    struct sset vip_nats;
 
     /* 'lflow_ref' is used to reference logical flows generated for
      * this lr_stateful_record.
@@ -89,9 +94,6 @@ struct lr_stateful_record {
 
 struct lr_stateful_table {
     struct hmap entries;
-
-    /* The array index of each element in 'entries'. */
-    struct lr_stateful_record **array;
 };
 
 #define LR_STATEFUL_TABLE_FOR_EACH(LR_LB_NAT_REC, TABLE) \
@@ -104,6 +106,12 @@ struct lr_stateful_table {
 struct lr_stateful_tracked_data {
     /* Created or updated logical router with LB and/or NAT data. */
     struct hmapx crupdated; /* Stores 'struct lr_stateful_record'. */
+    /* Deleted logical router with LB and/or NAT data. */
+    struct hmapx deleted;
+
+    /* Indicates if any router's NATs changed which were also LB vips
+     * or vice versa. */
+    bool vip_nats_changed;
 };
 
 struct ed_type_lr_stateful {
@@ -123,19 +131,24 @@ struct lr_stateful_input {
 void *en_lr_stateful_init(struct engine_node *, struct engine_arg *);
 void en_lr_stateful_cleanup(void *data);
 void en_lr_stateful_clear_tracked_data(void *data);
-void en_lr_stateful_run(struct engine_node *, void *data);
+enum engine_node_state en_lr_stateful_run(struct engine_node *, void *data);
 
-bool lr_stateful_northd_handler(struct engine_node *, void *data);
-bool lr_stateful_lr_nat_handler(struct engine_node *, void *data);
-bool lr_stateful_lb_data_handler(struct engine_node *, void *data);
+enum engine_input_handler_result
+lr_stateful_northd_handler(struct engine_node *, void *data);
+enum engine_input_handler_result
+lr_stateful_lr_nat_handler(struct engine_node *, void *data);
+enum engine_input_handler_result
+lr_stateful_lb_data_handler(struct engine_node *, void *data);
 
-const struct lr_stateful_record *lr_stateful_table_find_by_index(
-    const struct lr_stateful_table *, size_t od_index);
+const struct lr_stateful_record *lr_stateful_table_find_by_uuid(
+    const struct lr_stateful_table *, struct uuid nbr_uuid);
 
 static inline bool
 lr_stateful_has_tracked_data(struct lr_stateful_tracked_data *trk_data)
 {
-    return !hmapx_is_empty(&trk_data->crupdated);
+    return !hmapx_is_empty(&trk_data->crupdated) ||
+           !hmapx_is_empty(&trk_data->deleted) ||
+           trk_data->vip_nats_changed;
 }
 
 static inline bool

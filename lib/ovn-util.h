@@ -16,7 +16,9 @@
 #ifndef OVN_UTIL_H
 #define OVN_UTIL_H 1
 
+#include "openvswitch/meta-flow.h"
 #include "ovsdb-idl.h"
+#include "lib/bitmap.h"
 #include "lib/packets.h"
 #include "lib/sset.h"
 #include "lib/svec.h"
@@ -30,15 +32,29 @@
 
 #define ROUTE_ORIGIN_CONNECTED "connected"
 #define ROUTE_ORIGIN_STATIC "static"
+#define ROUTE_ORIGIN_LB "loadbalancer"
+#define ROUTE_ORIGIN_CONNECTED_DYNAMIC "connected-dynamic"
+#define ROUTE_OVERRIDE_CONNECTED "override-connected"
+
+#define OVN_AR_SOURCE_ID "source"
+#define OVN_AR_DISTRIBUTED_LB_ID "distributed-lb"
+/* Semicolon-delimited "protocol,IP,port" tuples stored in
+ * Advertised_Route.external_ids so the controller can look up
+ * matching Service_Monitor rows. */
+#define OVN_AR_HEALTH_CHECKS_KEY "health-checks"
 
 #define ETH_CRC_LENGTH 4
 #define ETHERNET_OVERHEAD (ETH_HEADER_LEN + ETH_CRC_LENGTH)
 
 #define GENEVE_TUNNEL_OVERHEAD 38
-#define STT_TUNNEL_OVERHEAD 18
 #define VXLAN_TUNNEL_OVERHEAD 30
 
+#define IDL_LOOP_MAX_DURATION_MS 500
+
+#define MAX_PREFIX_LEN 128
+
 struct eth_addr;
+struct nbrec_logical_router;
 struct nbrec_logical_router_port;
 struct ovsrec_flow_sample_collector_set_table;
 struct sbrec_datapath_binding;
@@ -48,6 +64,7 @@ struct smap;
 struct svec;
 struct uuid;
 struct unixctl_conn;
+struct rconn;
 
 struct ipv4_netaddr {
     ovs_be32 addr;            /* 192.168.10.123 */
@@ -98,6 +115,7 @@ ipv6_is_all_site_router(const struct in6_addr *addr)
     return ipv6_addr_equals(addr, &in6addr_all_site_routers);
 }
 
+bool lrouter_is_enabled(const struct nbrec_logical_router *);
 bool is_dynamic_lsp_address(const char *address);
 bool extract_addresses(const char *address, struct lport_addresses *,
                        int *ofs);
@@ -106,6 +124,8 @@ bool extract_ip_addresses(const char *address, struct lport_addresses *);
 bool extract_ip_address(const char *address, struct lport_addresses *);
 bool extract_lrp_networks(const struct nbrec_logical_router_port *,
                           struct lport_addresses *);
+void lrp_network_to_string(const struct lport_addresses *, struct ds *,
+                           bool include_generated_v6);
 bool extract_sbrec_binding_first_mac(const struct sbrec_port_binding *binding,
                                      struct eth_addr *ea);
 
@@ -121,12 +141,16 @@ const char *find_lport_address(const struct lport_addresses *laddrs,
 void split_addresses(const char *addresses, struct svec *ipv4_addrs,
                      struct svec *ipv6_addrs);
 
+bool lport_addresses_contains_ip(const struct lport_addresses *lport_address,
+                                 size_t n_lsp_addrs, const char *ip_s);
+
 char *alloc_nat_zone_key(const char *name, const char *type);
 
 const char *default_nb_db(void);
 const char *default_sb_db(void);
 const char *default_ic_nb_db(void);
 const char *default_ic_sb_db(void);
+const char *default_br_db(void);
 char *get_abs_unix_ctl_path(const char *path);
 
 struct ovsdb_idl_table_class;
@@ -145,12 +169,17 @@ enum ovn_pipeline {
 uint32_t sbrec_logical_flow_hash(const struct sbrec_logical_flow *);
 uint32_t ovn_logical_flow_hash(uint8_t table_id, enum ovn_pipeline pipeline,
                                uint16_t priority,
-                               const char *match, const char *actions);
+                               const char *match, const char *actions,
+                               bool acl_ct_translation);
 void ovn_conn_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
                    const char *argv[] OVS_UNUSED, void *idl_);
 
 void set_idl_probe_interval(struct ovsdb_idl *idl, const char *remote,
                             int interval);
+
+struct ovsdb_idl_txn *run_idl_loop(struct ovsdb_idl_loop *idl_loop,
+                                          const char *name,
+                                          uint64_t *idl_duration);
 
 #define OVN_MAX_DP_KEY ((1u << 24) - 1)
 #define OVN_MAX_DP_GLOBAL_NUM ((1u << 16) - 1)
@@ -160,7 +189,14 @@ void set_idl_probe_interval(struct ovsdb_idl *idl, const char *remote,
 #define OVN_MAX_DP_KEY_GLOBAL OVN_MAX_DP_KEY
 
 #define OVN_MAX_DP_VXLAN_KEY ((1u << 12) - 1)
-#define OVN_MAX_DP_VXLAN_KEY_LOCAL (OVN_MAX_DP_KEY - OVN_MAX_DP_GLOBAL_NUM)
+#define OVN_MAX_DP_VXLAN_KEY_LOCAL  ((1u << 10) - 1)
+#define OVN_MIN_DP_VXLAN_KEY_GLOBAL (OVN_MAX_DP_VXLAN_KEY_LOCAL + 1)
+#define OVN_MAX_DP_VXLAN_KEY_GLOBAL ((1u << 12) - 1)
+
+#define OVN_EVPN_KEY_FLAG 31
+#define OVN_MIN_EVPN_KEY (1u << OVN_EVPN_KEY_FLAG)
+#define OVN_MAX_EVPN_KEY (OVN_MAX_DP_GLOBAL_NUM | OVN_MIN_EVPN_KEY)
+#define OVN_IS_EVPN_KEY(key) (((key) & OVN_MIN_EVPN_KEY) == OVN_MIN_EVPN_KEY)
 
 struct hmap;
 void ovn_destroy_tnlids(struct hmap *tnlids);
@@ -195,6 +231,8 @@ get_sb_port_group_name(const char *nb_pg_name, int64_t dp_tunnel_key,
 }
 
 char *ovn_chassis_redirect_name(const char *port_name);
+char *ovn_mirror_port_name(const char *datapath_name,
+                           const char *port_name);
 void ovn_set_pidfile(const char *name);
 
 bool ip46_parse_cidr(const char *str, struct in6_addr *prefix,
@@ -204,11 +242,16 @@ bool ip46_parse(const char *ip_str, struct in6_addr *ip);
 char *normalize_ipv4_prefix(ovs_be32 ipv4, unsigned int plen);
 char *normalize_ipv6_prefix(const struct in6_addr *ipv6, unsigned int plen);
 char *normalize_v46_prefix(const struct in6_addr *prefix, unsigned int plen);
+char *normalize_v46(const struct in6_addr *prefix);
 
 /* Returns a lowercase copy of orig.
  * Caller must free the returned string.
  */
 char *str_tolower(const char *orig);
+
+long long ovn_smap_get_llong(const struct smap *smap, const char *key,
+                             long long def);
+bool ovn_str_to_ushort(const char *, int base, unsigned short *);
 
 /* OVN daemon options. Taken from ovs/lib/daemon.h. */
 #define OVN_DAEMON_OPTION_ENUMS                     \
@@ -304,7 +347,8 @@ BUILD_ASSERT_DECL(
 #define SCTP_ABORT_CHUNK_FLAG_T (1 << 0)
 
 /* The number of tables for the ingress and egress pipelines. */
-#define LOG_PIPELINE_LEN 29
+#define LOG_PIPELINE_INGRESS_LEN 35
+#define LOG_PIPELINE_EGRESS_LEN 16
 
 static inline uint32_t
 hash_add_in6_addr(uint32_t hash, const struct in6_addr *addr)
@@ -324,15 +368,16 @@ hash_add_in6_addr(uint32_t hash, const struct in6_addr *addr)
     return hash;
 }
 
-/* Must be a bit-field ordered from most-preferred (higher number) to
+/* Tunnel types ordered from most-preferred (higher number) to
  * least-preferred (lower number). */
 enum chassis_tunnel_type {
-    GENEVE = 1 << 2,
-    STT    = 1 << 1,
-    VXLAN  = 1 << 0
+    TUNNEL_TYPE_INVALID = -1,
+    VXLAN  = 0,
+    GENEVE = 1,
+    TUNNEL_TYPE_MAX = 2  /* Number of valid tunnel types */
 };
 
-uint32_t get_tunnel_type(const char *name);
+enum chassis_tunnel_type get_tunnel_type(const char *name);
 
 struct ovsrec_bridge_table;
 const struct ovsrec_bridge *get_bridge(const struct ovsrec_bridge_table *,
@@ -399,6 +444,7 @@ enum en_lport_type {
     LP_UNKNOWN,
     LP_VIF,
     LP_CONTAINER,
+    LP_MIRROR,
     LP_PATCH,
     LP_L3GATEWAY,
     LP_LOCALNET,
@@ -413,7 +459,6 @@ enum en_lport_type {
 
 enum en_lport_type get_lport_type(const struct sbrec_port_binding *);
 char *get_lport_type_str(enum en_lport_type lport_type);
-bool is_pb_router_type(const struct sbrec_port_binding *);
 
 /* A wrapper that holds sorted arrays of strings. */
 struct sorted_array {
@@ -453,6 +498,22 @@ sorted_array_from_sset(struct sset *s)
     return sorted_array_create(sset_sort(s), sset_count(s), true);
 }
 
+static inline int
+name_cmp(const void *s1_, const void *s2_)
+{
+    const char *s1 = *(char **) s1_;
+    const char *s2 = *(char **) s2_;
+    return strcmp(s1, s2);
+}
+
+static inline struct sorted_array
+sorted_array_from_unsorted(const char **unsorted_data, size_t n,
+                           bool take_ownership)
+{
+    qsort(unsorted_data, n, sizeof *unsorted_data, name_cmp);
+    return sorted_array_create(unsorted_data, n, take_ownership);
+}
+
 /* DB set columns are already sorted, just wrap them into a sorted array. */
 #define sorted_array_from_dbrec(dbrec, column)           \
     sorted_array_create((const char **) (dbrec)->column, \
@@ -465,6 +526,190 @@ void sorted_array_apply_diff(const struct sorted_array *a1,
                                                     bool add),
                              const void *arg);
 
+/* */
+struct dynamic_bitmap {
+    unsigned long *map;
+    size_t n_elems;
+    size_t capacity;
+};
+
+static inline unsigned long *
+ovn_bitmap_realloc(unsigned long *bitmap, size_t n_bits_old,
+                   size_t n_bits_new)
+{
+    ovs_assert(n_bits_new >= n_bits_old);
+
+    if (bitmap_n_bytes(n_bits_old) == bitmap_n_bytes(n_bits_new)) {
+        return bitmap;
+    }
+
+    bitmap = xrealloc(bitmap, bitmap_n_bytes(n_bits_new));
+    /* Set the unitialized bits to 0 as xrealloc doesn't initialize the
+     * added memory. */
+    size_t delta = BITMAP_N_LONGS(n_bits_new) - BITMAP_N_LONGS(n_bits_old);
+    memset(&bitmap[BITMAP_N_LONGS(n_bits_old)], 0, delta * sizeof *bitmap);
+
+    return bitmap;
+}
+
+static inline ssize_t
+dynamic_bitmap_last_set(const struct dynamic_bitmap *db)
+{
+    for (ssize_t i = bitmap_n_longs(db->capacity) - 1; i >= 0; i--) {
+        if (!db->map[i]) {
+            continue;
+        }
+
+        /* raw_clz64() operates on values promoted to uint64_t (64-bit). */
+        return 63 - raw_clz64(db->map[i]) + (BITMAP_ULONG_BITS * i);
+    }
+
+    return -1;
+}
+
+static inline void
+dynamic_bitmap_alloc(struct dynamic_bitmap *db, size_t n_elems)
+{
+    db->map = bitmap_allocate(n_elems);
+    db->capacity = n_elems;
+    db->n_elems = 0;
+}
+
+static inline void
+dynamic_bitmap_free(struct dynamic_bitmap *db)
+{
+    bitmap_free(db->map);
+}
+
+static inline void
+dynamic_bitmap_realloc(struct dynamic_bitmap *db, size_t new_n_elems)
+{
+    if (new_n_elems > db->capacity) {
+        db->map = ovn_bitmap_realloc(db->map, db->capacity, new_n_elems);
+        db->capacity = new_n_elems;
+    }
+}
+
+static inline bool
+dynamic_bitmap_is_empty(const struct dynamic_bitmap *db)
+{
+    return !db->n_elems;
+}
+
+static inline int
+dynamic_bitmap_get_n_elems(const struct dynamic_bitmap *db)
+{
+    return db->n_elems;
+}
+
+static inline bool
+dynamic_bitmap_is_set(const struct dynamic_bitmap *db, size_t offset)
+{
+    return bitmap_is_set(db->map, offset);
+}
+
+static inline size_t
+dynamic_bitmap_count1(const struct dynamic_bitmap *db)
+{
+    return bitmap_count1(db->map, db->capacity);
+}
+
+static inline void
+dynamic_bitmap_set1(struct dynamic_bitmap *db, int index)
+{
+    ovs_assert(index < db->capacity);
+    if (!dynamic_bitmap_is_set(db, index)) {
+        bitmap_set1(db->map, index);
+        db->n_elems++;
+    }
+}
+
+static inline void
+dynamic_bitmap_set0(struct dynamic_bitmap *db, int index)
+{
+    ovs_assert(index < db->capacity);
+    if (dynamic_bitmap_is_set(db, index)) {
+        bitmap_set0(db->map, index);
+        db->n_elems--;
+    }
+}
+
+static inline void
+dynamic_bitmap_or(struct dynamic_bitmap *db,
+                  const unsigned long *arg, size_t n)
+{
+    ovs_assert(db->capacity == n);
+    bitmap_or(db->map, arg, n);
+    db->n_elems = dynamic_bitmap_count1(db);
+}
+
+static inline unsigned long *
+dynamic_bitmap_clone_map(const struct dynamic_bitmap *db)
+{
+    return bitmap_clone(db->map, db->capacity);
+}
+
+static inline bool
+dynamic_bitmap_equal(const struct dynamic_bitmap *a,
+                     const struct dynamic_bitmap *b)
+{
+    return bitmap_equal(a->map, b->map, MIN(a->capacity, b->capacity));
+}
+
+static inline void
+dynamic_bitmap_clone_from_db(struct dynamic_bitmap *dst,
+                             const struct dynamic_bitmap *orig)
+{
+    if (dst->map) {
+        bitmap_free(dst->map);
+    }
+    dst->map = dynamic_bitmap_clone_map(orig);
+    dst->n_elems = dynamic_bitmap_count1(orig);
+    dst->capacity = orig->capacity;
+}
+
+static inline size_t
+dynamic_bitmap_scan(struct dynamic_bitmap *dp, bool target, size_t start)
+{
+    return bitmap_scan(dp->map, target, start, dp->capacity);
+}
+
+#define DYNAMIC_BITMAP_FOR_EACH_1(IDX, MAP)   \
+        BITMAP_FOR_EACH_1(IDX, (MAP)->capacity, (MAP)->map)
+
+
+static inline const char *
+strip_leading_zero(const char *s)
+{
+    return s + strspn(s, "0");
+}
+
+static inline bool
+is_uuid_with_prefix(const char *uuid)
+{
+     return uuid[0] == '0' && (uuid[1] == 'x' || uuid[1] == 'X');
+}
+
+static inline struct eth_addr
+eth_addr_create_mask(unsigned int len)
+{
+    struct eth_addr mac;
+    eth_addr_from_uint64((UINT64_MAX << (48 - len)), &mac);
+
+    return mac;
+}
+
+static inline unsigned int
+eth_addr_get_prefix_len(struct eth_addr mac)
+{
+    uint64_t n = (UINT64_C(0xffff) << 48) | eth_addr_to_uint64(mac);
+    return 48 - ctz64(n);
+}
+
+bool eth_addr_parse_masked(const char *, struct eth_addr *, unsigned int *);
+
+bool is_partial_uuid_match(const struct uuid *uuid, const char *match);
+
 /* Utilities around properly handling exit command. */
 struct ovn_exit_args {
     struct unixctl_conn **conns;
@@ -476,5 +721,129 @@ struct ovn_exit_args {
 void ovn_exit_command_callback(struct unixctl_conn *conn, int argc,
                                const char *argv[], void *exit_args_);
 void ovn_exit_args_finish(struct ovn_exit_args *exit_args);
+
+bool ovn_update_swconn_at(struct rconn *swconn, const char *target,
+                          int probe_interval, const char *where);
+
+bool prefix_is_link_local(const struct in6_addr *prefix, unsigned int plen);
+
+bool find_prefix_in_set(const struct in6_addr *prefix, unsigned int plen,
+                        const struct sset *prefix_set,
+                        const char *filter_name);
+
+void ovn_debug_commands_register(void);
+
+bool ovn_is_valid_vni(int64_t vni);
+
+void ovn_ecmp_selection_fields_add(const char *field,
+                                   struct sset *selection_fields);
+bool ovn_ecmp_selection_fields_parse(const char *fields_s,
+                                     struct sset *selection_fields);
+char *ovn_ecmp_selection_fields_to_hash_fields(
+    const struct sset *selection_fields);
+
+const struct sbrec_port_binding *lport_lookup_by_name(
+    struct ovsdb_idl_index *sbrec_port_binding_by_name,
+    const char *name);
+
+void put_load_bytes(const void *value, size_t len, enum mf_field_id dst,
+                    size_t ofs, size_t n_bits, struct ofpbuf *ofpacts);
+void put_load(uint64_t value, enum mf_field_id dst, size_t ofs, size_t n_bits,
+              struct ofpbuf *ofpacts);
+
+/* __NARG__ provides a way to count the number of arguments passed to a
+ * variadic macro. As defined below, it's capable of counting up to
+ * 16 arguments. This should be more than enough for our purposes. However
+ * the __ARG_N and __RSEQ_N macros can be updated to include more numbers
+ * if we wish to be able to count higher.
+ * */
+#define __NARG__(...)  __NARG_I_(__VA_ARGS__,__RSEQ_N())
+#define __NARG_I_(...) __ARG_N(__VA_ARGS__)
+#define __ARG_N( \
+      _1, _2, _3, _4, _5, _6, _7, _8, _9, \
+      _10, _11, _12, _13, _14, _15, _16, N,...) N
+#define __RSEQ_N() \
+     16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0
+
+/* VFUNC provides a way to overload macros so that they can
+ * accept a variable number of arguments.
+ *
+ * It works by using __NARG__ to count the number of arguments
+ * that were passed into the macro. Then this is concatenated
+ * to the end of the macro name. Then this concatenated macro
+ * is called.
+ *
+ * As an example, let's say we have
+ * # define FOO(...) VFUNC(FOO, __VA_ARGS)
+ *
+ * Then if a caller were to call FOO(bar)
+ * then we would count one argument (bar), concatenate
+ * the 1 to the end of FOO, and end up calling FOO1(bar).
+ *
+ * If a caller were to call FOO(bar, baz), then the
+ * result would be to call FOO2(bar, baz).
+ */
+#define _VFUNC_(name, n) name##n
+#define _VFUNC(name, n) _VFUNC_(name, n)
+#define VFUNC(func, ...) _VFUNC(func, __NARG__(__VA_ARGS__)) (__VA_ARGS__)
+
+bool datapath_get_nb_uuid_and_type(const struct sbrec_datapath_binding *sb,
+                                   struct uuid *nb_uuid, const char **type);
+
+bool datapath_get_nb_uuid(const struct sbrec_datapath_binding *sb,
+                          struct uuid *nb_uuid);
+
+const char *datapath_get_nb_type(const struct sbrec_datapath_binding *sb);
+
+struct sset *lrp_network_sset(const char **networks, int n_networks);
+
+char *normalize_ipv4_prefix_str(const char *orig_prefix);
+
+char *normalize_ipv6_prefix_str(const char *orig_prefix);
+
+char *normalize_prefix_str(const char *orig_prefix);
+
+char *normalize_ipv4_addr_str(const char *orig_addr);
+
+char *normalize_ipv6_addr_str(const char *orig_addr);
+
+char *normalize_addr_str(const char *orig_addr);
+
+bool port_contains_duplicate_ip(struct lport_addresses *laddrs1,
+                                struct lport_addresses *laddrs2,
+                                const char *port_name, char **error_str);
+
+#define NEIGH_REDISTRIBUTE_MODES    \
+    NEIGH_REDISTRIBUTE_MODE(FDB, 0) \
+    NEIGH_REDISTRIBUTE_MODE(IP, 1)  \
+    NEIGH_REDISTRIBUTE_MODE(NAT, 2)
+
+enum neigh_redistribute_mode_bits {
+#define NEIGH_REDISTRIBUTE_MODE(PROTOCOL, BIT) NRM_##PROTOCOL##_BIT = BIT,
+    NEIGH_REDISTRIBUTE_MODES
+#undef NEIGH_REDISTRIBUTE_MODE
+};
+
+enum neigh_redistribute_mode {
+    NRM_NONE = 0,
+#define NEIGH_REDISTRIBUTE_MODE(PROTOCOL, BIT)  \
+    NRM_##PROTOCOL = (1 << NRM_##PROTOCOL##_BIT),
+    NEIGH_REDISTRIBUTE_MODES
+#undef NEIGH_REDISTRIBUTE_MODE
+};
+
+#define NEIGH_REDISTRIBUTE_MODE(PROTOCOL, BIT)          \
+    static inline bool nrm_mode_##PROTOCOL##_is_set(    \
+            enum neigh_redistribute_mode value)         \
+    {                                                   \
+        return !!(value & NRM_##PROTOCOL);             \
+    }
+NEIGH_REDISTRIBUTE_MODES
+#undef NEIGH_REDISTRIBUTE_MODE
+
+enum neigh_redistribute_mode
+parse_neigh_dynamic_redistribute(const struct smap *options);
+
+size_t *shuffled_range(size_t n);
 
 #endif /* OVN_UTIL_H */

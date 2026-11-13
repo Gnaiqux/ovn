@@ -30,6 +30,7 @@
 struct hmap;
 struct ovsdb_idl_index;
 struct ovsrec_bridge;
+struct ovn_extend_table;
 struct simap;
 struct sbrec_multicast_group_table;
 struct sbrec_port_binding_table;
@@ -51,6 +52,7 @@ struct physical_debug {
 struct physical_ctx {
     struct ovsdb_idl_index *sbrec_port_binding_by_name;
     struct ovsdb_idl_index *sbrec_port_binding_by_datapath;
+    struct ovsdb_idl_index *sbrec_chassis_by_name;
     const struct sbrec_port_binding_table *port_binding_table;
     const struct ovsrec_interface_table *ovs_interface_table;
     const struct sbrec_multicast_group_table *mc_group_table;
@@ -60,15 +62,26 @@ struct physical_ctx {
     const struct sset *active_tunnels;
     const struct if_status_mgr *if_mgr;
     struct hmap *local_datapaths;
-    struct sset *local_lports;
-    const struct simap *ct_zones;
+    const struct shash *ct_zones;
     enum mf_field_id mff_ovn_geneve;
     struct shash *local_bindings;
     struct simap *patch_ofports;
     struct hmap *chassis_tunnels;
+    bool use_flow_based_tunnels;
+    struct flow_based_tunnel *flow_tunnels;
     size_t n_encap_ips;
     const char **encap_ips;
     struct physical_debug debug;
+    bool always_tunnel;
+    const struct hmap *evpn_bindings;
+    const struct hmap *evpn_multicast_groups;
+    const struct hmap *evpn_fdbs;
+    const struct hmap *evpn_arps;
+    struct ovn_extend_table *group_table;
+
+    /* Set of port binding names that have been already reprocessed during
+     * the I-P run. */
+    struct sset reprocessed_pbs;
 };
 
 void physical_register_ovs_idl(struct ovsdb_idl *);
@@ -80,4 +93,20 @@ bool physical_handle_flows_for_lport(const struct sbrec_port_binding *,
                                      bool removed,
                                      struct physical_ctx *,
                                      struct ovn_desired_flow_table *);
+void physical_multichassis_reprocess(const struct sbrec_port_binding *,
+                                     struct physical_ctx *,
+                                     struct ovn_desired_flow_table *);
+void physical_handle_evpn_binding_changes(
+    struct physical_ctx *, struct ovn_desired_flow_table *,
+    const struct hmapx *updated_bindings,
+    const struct hmapx *updated_multicast_groups,
+    const struct uuidset *removed_bindings,
+    const struct uuidset *removed_multicast_groups);
+void physical_handle_evpn_fdb_changes(struct ovn_desired_flow_table *,
+                                      struct ovn_extend_table *group_table,
+                                      const struct hmapx *updated_fdbs,
+                                      const struct uuidset *removed_fdbs);
+void physical_handle_evpn_arp_changes(struct ovn_desired_flow_table *,
+                                      const struct hmapx *updated_arps,
+                                      const struct uuidset *removed_arps);
 #endif /* controller/physical.h */

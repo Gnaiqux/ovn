@@ -36,7 +36,7 @@ validating basic functionality of OVN. Before running any of the tests
 described here, you must bootstrap, configure and build OVN as
 described in :doc:`/intro/install/general`. You do not need to install
 OVN, Open vSwitch or to build or load the kernel module to run these test
-suites.You do not need supervisor privilege to run these test suites.
+suites. You do not need superuser privilege to run these test suites.
 
 Unit Tests
 ~~~~~~~~~~
@@ -78,7 +78,7 @@ To see a complete list of test options, run::
     $ make check TESTSUITEFLAGS=--help
 
 The results of a testing run are reported in ``tests/testsuite.log``. Report
-report test failures as bugs and include the ``testsuite.log`` in your report.
+test failures as bugs and include the ``testsuite.log`` in your report.
 
 .. note::
   Sometimes a few tests may fail on some runs but not others. This is usually a
@@ -220,6 +220,30 @@ All the features documented under `Unit Tests`_ are available for the
 datapath testsuites, except that the datapath testsuites do not
 support running tests in parallel.
 
+It is also possible to run `retis`_ capture along with the `check-kernel` tests
+by setting `OVS_TEST_WITH_RETIS` environment variable to 'yes'.  This can be
+useful for debugging the test cases.  For example, the following command can be
+used to run the test 168 under `retis`::
+
+    $ make check-kernel OVS_TEST_WITH_RETIS=yes TESTSUITEFLAGS='168 -d'
+
+After the test is completed, the following data will be available in the test
+directory:
+
+* `retis.err` - standard error stream of the `retis collect`.
+* `retis.log` - standard output of the `retis collect`, contains all captured
+  events in the order they appeared.
+* `retis.data` - raw events collected by retis, `retis sort` or other commands
+  can be used on this file for further analysis.
+* `retis.sorted` - text file containing the output of `retis sort` executed on
+  the `retis.data`, for convenience.
+
+Requires retis version 1.5 or newer.  And this also requires OVS submodule to
+be built with `--enable-usdt-probes`.
+
+.. _retis: https://github.com/retis-org/retis
+
+
 Performance testing
 ~~~~~~~~~~~~~~~~~~~
 
@@ -242,7 +266,7 @@ cached. In order to force the tests to rebuild all these objects, run::
 A typical workflow for a developer trying to improve the performance of OVN
 would be the following:
 
-0. Optional: Modify/add a performance test to buld the topology that you are
+0. Optional: Modify/add a performance test to build the topology that you are
    benchmarking, if required.
 1. Run ``make check-perf TESTSUITEFLAGS="--rebuild"`` to generate cached
    databases (and complete a test run). The results of each test run are
@@ -259,7 +283,7 @@ would be the following:
 2. Run ``make check-perf`` to measure the performance metric that you are
    benchmarking against. If you are only using one test, you can specify the
    test to run by adding the test number to the ``make`` command.
-   (e.g. ``make check-perf TESTSUITEFLAGS="--rebuild <test number>"``)
+   (e.g. ``make check-perf TESTSUITEFLAGS="<test number>"``)
 3. Modify OVN code to implement the change that you believe will improve the
    performance.
 4. Go to Step 2. to continue making improvements.
@@ -269,3 +293,216 @@ of these cached objects, be sure to rebuild the test.
 
 The cached objects are stored under the relevant folder in
 ``tests/perf-testsuite.dir/cached``.
+
+ovn-benchmark
++++++++++++++
+
+The ``tutorial/`` directory contains a memory and performance benchmarking
+tool that can be used to detect regressions between commits:
+
+- ``ovn-benchmark.sh``: Shell wrapper that tracks peak memory and
+  execution time for ``ovn-northd`` and ``ovn-controller``.  By default
+  it reports peak virtual memory (VmPeak) from ``/proc/<pid>/status``,
+  which captures all allocated memory including pages not yet accessed.
+  Pass ``--valgrind`` to restart the tracked processes under Valgrind
+  Massif and report peak heap memory instead; this is more accurate but
+  10-50x slower.
+- ``ovn-benchmark.py``: Python script that populates the Northbound database
+  with a realistic ovn-kubernetes-style topology.
+
+The generated topology includes gateway routers, logical switches, NAT rules,
+ACLs, DHCP/DHCPv6, DNS, load balancers, QoS rules, address sets, port groups,
+static routes, and routing policies -- all with both IPv4 and IPv6 coverage.
+After creation, incremental add/modify/delete operations exercise the northd
+engine and flag unexpected recomputes.
+
+The benchmark must be run from inside the OVN sandbox.  Run
+``./ovn-benchmark.sh --help`` for the full list of options::
+
+    $ make sandbox
+    $ ./ovn-benchmark.sh
+
+By default, the topology is generated through many individual OVSDB
+transactions via ``ovn-benchmark.py``.
+
+.. note::
+
+   The ``-f`` option loads a Northbound database file via ``ovsdb-client
+   restore`` instead, which applies the entire database as a single
+   transaction.  This may yield different memory and timing results because
+   ``ovn-northd`` and ``ovn-controller`` process one large batch of changes
+   rather than reacting to each transaction incrementally.
+
+OVN Upgrade Testing
+~~~~~~~~~~~~~~~~~~~
+
+Overview
+++++++++
+
+OVN upgrade tests validate that the system continues to function correctly
+during rolling upgrades, specifically testing the intermediate state where
+ovn-controller is upgraded before ovn-northd and the databases.
+
+The upgrade tests run the system test suite from an older OVN version using
+binaries (ovn-controller, ovs-vswitchd, etc.) from the current development
+version, ensuring backward compatibility.
+
+Running Upgrade Tests Locally
++++++++++++++++++++++++++++++
+
+Basic usage::
+
+    $ make check-upgrade
+
+This will test upgrades from branch-24.03 (the default base version).
+
+Specify a different base version::
+
+    $ make check-upgrade BASE_VERSION=branch-24.09
+
+Run a specific range of tests::
+
+    $ make check-upgrade BASE_VERSION=branch-25.03 TESTSUITEFLAGS="1-100"
+
+Run only unstable tests::
+
+    $ make check-upgrade UNSTABLE=1 TESTSUITEFLAGS="-k unstable"
+
+Environment Variables
++++++++++++++++++++++
+
+*BASE_VERSION*
+  Git branch to use as the base version (default: ``branch-24.03``)
+
+  - branch-24.03: the local repo will be used as the source repo.
+  - origin/branch-24.03: the local repo origin is used as the source repo.
+  - If branch is not found in local repo, it will be searched in its origin
+    (e.g. private github repo or ovn_org repo). If not found in private
+    github repo, it will be searched in ovn_org repo.
+
+*TESTSUITEFLAGS*
+  Test range to run, using autotest syntax (default: ``1-``, meaning all tests)
+
+  - ``1-100`` - Run tests 1 through 100
+  - ``50-`` - Run tests 50 and above
+  - ``-k unstable`` - Run tests with 'unstable' keyword
+
+  Additional flags to pass to the testsuite. Use ``-d`` to keep test
+  directories on success for debugging.
+
+*UNSTABLE*
+  Set to ``1`` to run unstable tests (default: disabled)
+
+How Upgrade Tests Work
+++++++++++++++++++++++
+
+The upgrade test workflow:
+
+1. *Save Current Binaries*
+
+   The test framework saves binaries from your current working tree:
+
+   - ``ovn-controller``
+   - ``ovs-vswitchd``, ``ovsdb-server``
+   - ``ovs-vsctl``, ``ovs-ofctl``, ``ovs-appctl``, ``ovs-dpctl``
+   - Flow table definitions from ``controller/lflow.h``
+
+2. *Clone and Checkout Base Version*
+
+   Creates ``upgrade-testsuite.dir/ovn-upgrade-base/`` and checks out the
+   specified base version.
+
+3. *Patch Old Tests*
+
+   - Updates hardcoded flow table numbers if tables were renumbered
+   - Adds schema compatibility filters to suppress expected warnings
+   - Replaces OFTABLE_* m4 macros with current values
+
+4. *Build Base Version*
+
+   Builds the base version twice:
+
+   - With patched ``lflow.h`` to create hybrid ``ovn-debug`` tool
+   - With original ``lflow.h`` for proper ``ovn-northd`` and ``ovn-nbctl``
+
+5. *Swap Binaries*
+
+   Replaces the base version's binaries with current versions:
+
+   - Base version: ``ovn-northd``, ``ovn-nbctl`` (test infrastructure)
+   - Current version: ``ovn-controller``, ``ovs-vswitchd``, ``ovsdb-server``
+
+6. *Run Tests*
+
+   Executes the system test suite from the base version with the mixed
+   binary set.
+
+Interpreting Test Failures
+++++++++++++++++++++++++++
+
+Test failures during upgrade testing can indicate:
+
+*Backward Compatibility Issues*
+  The new ovn-controller is incompatible with the old northd/databases.
+  This is a critical issue that must be fixed before release.
+
+*Flow Generation Changes*
+  If flow table contents changed intentionally, the (old) test may need the
+  ``TAG_TEST_NOT_UPGRADABLE`` tag.
+
+Debugging Failed Tests
+++++++++++++++++++++++
+
+On failure, the test directory is preserved in ``upgrade-testsuite.dir/``.
+
+Check the logs::
+
+    $ upgrade-testsuite.dir/git.log  # Git operations
+    $ upgrade-testsuite.dir/build-base.log  # Build output
+    $ upgrade-testsuite.dir/ovn-upgrade-base/tests/system-kmod-testsuite.log
+
+Keep test directory for debugging::
+
+    $ make check-upgrade TESTSUITEFLAGS="-d"
+
+Marking Tests as Non-Upgradable
++++++++++++++++++++++++++++++++
+
+Some tests cannot run in upgrade scenarios: tests for features not yet
+fully present in the base version.
+
+Mark these tests with the ``TAG_TEST_NOT_UPGRADABLE`` keyword::
+
+    AT_SETUP([test that checks flow details])
+    AT_KEYWORDS([TAG_TEST_NOT_UPGRADABLE])
+    # ... test code ...
+    AT_CLEANUP
+
+These tests will be skipped during upgrade testing but run normally otherwise.
+
+CI Integration
+++++++++++++++
+
+Upgrade tests run automatically in GitHub Actions:
+
+*On Schedule (Weekly)*
+  - Tests all supported versions.
+
+Implementation Details
+++++++++++++++++++++++
+
+Tests are run locally through ``check-upgrade`` Makefile target.
+The flow for make check-upgrade is:
+
+- Makefile
+- ci/ovn_upgrade_test.py: run_upgrade_workflow, run_tests
+- ci/linux-build.sh(TESTSUITE=system-test)
+- execute_system_tests "check-kernel" "system-kmod-testsuite.log"
+- run_system_tests check-kernel
+
+Through the ci the flow is:
+
+- ci.sh: run_in_container ./.ci/linux-build.sh (TESTSUITE=upgrade-test)
+- execute_system_tests "check-upgrade" "system-kmod-testsuite.log"
+- run_system_tests check-upgrade
+- Back to make check-upgrade-flow.

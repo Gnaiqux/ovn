@@ -12,74 +12,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-dpdk:
-    env:
-      dependencies: gcc libnuma-dev ninja-build
-      CC: gcc
-      DPDK_GIT: https://dpdk.org/git/dpdk
-      DPDK_VER: 23.11
-    name: dpdk gcc
-    outputs:
-      dpdk_key: ${{ steps.gen_dpdk_key.outputs.key }}
-    runs-on: ubuntu-20.04
-    timeout-minutes: 30
-
-    steps:
-    - name: checkout
-      uses: actions/checkout@v4
-
-    - name: update PATH
-      run: |
-        echo "$HOME/bin"        >> $GITHUB_PATH
-        echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-    - name: create ci signature file for the dpdk cache key
-      # This will collect most of DPDK related lines, so hash will be different
-      # if something changed in a way we're building DPDK including DPDK_VER.
-      # This also allows us to use cache from any branch as long as version
-      # and a way we're building DPDK stays the same.
-      run: |
-        grep -irE 'RTE_|DPDK|meson|ninja' .ci/dpdk-* > dpdk-ci-signature
-        grep -rwE 'DPDK_GIT|DPDK_VER' .github/ >> dpdk-ci-signature
-        if [ "${DPDK_VER##refs/*/}" != "${DPDK_VER}" ]; then
-            git ls-remote --heads $DPDK_GIT $DPDK_VER >> dpdk-ci-signature
-        fi
-        cat dpdk-ci-signature
-
-    - name: generate ci DPDK key
-      id: gen_dpdk_key
-      env:
-        ci_key: ${{ hashFiles('dpdk-ci-signature') }}
-      run: echo 'key=dpdk-${{ env.ci_key }}' >> $GITHUB_OUTPUT
-
-    - name: cache
-      id: dpdk_cache
-      uses: actions/cache@v4
-      with:
-        path: dpdk-dir
-        key: ${{ steps.gen_dpdk_key.outputs.key }}
-
-    - name: set up python
-      if: steps.dpdk_cache.outputs.cache-hit != 'true'
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.9'
-
-    - name: update APT cache
-      if: steps.dpdk_cache.outputs.cache-hit != 'true'
-      run: sudo apt update || true
-    - name: install common dependencies
-      if: steps.dpdk_cache.outputs.cache-hit != 'true'
-      run: sudo apt install -y ${{ env.dependencies }}
-
-    - name: prepare
-      if: steps.dpdk_cache.outputs.cache-hit != 'true'
-      run: ./.ci/dpdk-prepare.sh
-
-    - name: build
-      if: steps.dpdk_cache.outputs.cache-hit != 'true'
-      run: ./.ci/dpdk-build.sh
-
   prepare-container:
     # This job has the following matrix, x: Job trigger, y: Branch
     # (scheduled jobs run only on main):
@@ -91,18 +23,41 @@ jobs:
     # | !main |  Builds - Ubuntu  | xxxxxxxxxxxxxxxxx |
     # +-------+-------------------+-------------------+
     env:
-      DEPENDENCIES: podman
+      DEPENDENCIES:
+      PREINSTALLED_DEPENDENCIES: podman
     name: Prepare container
-    runs-on: ubuntu-22.04
+    if: github.repository_owner == 'ovn-org' || github.event_name != 'schedule'
+    runs-on: ubuntu-26.04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Update APT cache
         run: sudo apt update
 
+      - name: Ensure pre-installed dependencies
+        run: which ${{ env.PREINSTALLED_DEPENDENCIES }}
+
       - name: Install dependencies
-        run: sudo apt install -y ${{ env.DEPENDENCIES }}
+        run: |
+          if [ -n "${{ env.DEPENDENCIES }}" ]; then
+            sudo apt install -y ${{ env.DEPENDENCIES }}
+          fi
+
+      - name: Fix /etc/hosts file
+        run: |
+          . .ci/linux-util.sh
+          fix_etc_hosts
+
+      - name: Disable apparmor
+        run: |
+          . .ci/linux-util.sh
+          disable_apparmor
+
+      - name: Fixup crun
+        run: |
+          . .ci/linux-util.sh
+          fixup_crun
 
       - name: Choose image distro
         if: github.event_name == 'push' || github.event_name == 'pull_request'
@@ -123,18 +78,21 @@ jobs:
         if: github.ref_name == 'main'
         run: podman pull ghcr.io/ovn-org/ovn-tests:${{ env.IMAGE_DISTRO }}
 
+      - name: Tag image
+        run: podman tag ovn-org/ovn-tests:${{ env.IMAGE_DISTRO }} ovn-org/ovn-tests
+
       - name: Export image
-        run: podman save -o /tmp/image.tar ovn-org/ovn-tests
+        run: podman save -o /tmp/image.tar --format oci-archive ovn-org/ovn-tests
 
       - name: Cache image
         id: image_cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /tmp/image.tar
-          key: ${{ github.sha }}
+          key: ${{ github.sha }}/${{ github.event_name }}
 
   build-linux:
-    needs: [build-dpdk, prepare-container]
+    needs: [prepare-container]
     env:
       ARCH:        ${{ matrix.cfg.arch }}
       CC:          ${{ matrix.cfg.compiler }}
@@ -147,7 +105,7 @@ jobs:
       UNSTABLE:    ${{ matrix.cfg.unstable }}
 
     name: linux ${{ join(matrix.cfg.*, ' ') }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
 
     strategy:
       fail-fast: false
@@ -155,6 +113,7 @@ jobs:
         cfg:
         - { compiler: gcc, opts: --disable-ssl }
         - { compiler: clang, opts: --disable-ssl }
+        - { compiler: gcc, testsuite: dist-test }
         - { compiler: gcc, testsuite: test, test_range: "-300" }
         - { compiler: gcc, testsuite: test, test_range: "301-600" }
         - { compiler: gcc, testsuite: test, test_range: "601-", unstable: unstable }
@@ -165,32 +124,42 @@ jobs:
         - { compiler: gcc, testsuite: test, libs: -ljemalloc, test_range: "301-600" }
         - { compiler: gcc, testsuite: test, libs: -ljemalloc, test_range: "601-", unstable: unstable }
         - { compiler: gcc, testsuite: system-test-dpdk, dpdk: dpdk, test_range: "-100" }
-        - { compiler: gcc, testsuite: system-test-dpdk, dpdk: dpdk, test_range: "101-", unstable: unstable }
+        - { compiler: gcc, testsuite: system-test-dpdk, dpdk: dpdk, test_range: "101-200" }
+        - { compiler: gcc, testsuite: system-test-dpdk, dpdk: dpdk, test_range: "201-", unstable: unstable }
         - { compiler: gcc, testsuite: system-test-userspace, test_range: "-100" }
-        - { compiler: gcc, testsuite: system-test-userspace, test_range: "101-", unstable: unstable }
+        - { compiler: gcc, testsuite: system-test-userspace, test_range: "101-200" }
+        - { compiler: gcc, testsuite: system-test-userspace, test_range: "201-", unstable: unstable }
         - { compiler: gcc, testsuite: system-test, test_range: "-100" }
-        - { compiler: gcc, testsuite: system-test, test_range: "101-", unstable: unstable }
+        - { compiler: gcc, testsuite: system-test, test_range: "101-200" }
+        - { compiler: gcc, testsuite: system-test, test_range: "201-", unstable: unstable }
         - { compiler: clang, testsuite: system-test, sanitizers: sanitizers, test_range: "-100" }
-        - { compiler: clang, testsuite: system-test, sanitizers: sanitizers, test_range: "101-", unstable: unstable }
+        - { compiler: clang, testsuite: system-test, sanitizers: sanitizers, test_range: "101-200" }
+        - { compiler: clang, testsuite: system-test, sanitizers: sanitizers, test_range: "201-", unstable: unstable }
         - { arch: x86, compiler: gcc, opts: --disable-ssl }
 
     steps:
+    - name: system-level-dependencies
+      if: ${{ startsWith(matrix.cfg.testsuite, 'system-test') }}
+      run: |
+        sudo apt update
+        sudo apt -y install linux-modules-$(uname -r)
+
     - name: checkout
       if: github.event_name == 'push' || github.event_name == 'pull_request'
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: recursive
 
     # For weekly runs, don't update submodules
     - name: checkout without submodule
       if: github.event_name == 'schedule'
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
 
     # Weekly runs test using the tip of the most recent stable OVS branch
     # instead of the submodule.
     - name: checkout OVS
       if: github.event_name == 'schedule'
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         repository: 'openvswitch/ovs'
         fetch-depth: 0
@@ -204,34 +173,32 @@ jobs:
             sort -V | tail -1)
       working-directory: ovs
 
-    - name: cache dpdk
-      if: matrix.cfg.dpdk != ''
-      uses: actions/cache@v4
-      with:
-        path: dpdk-dir
-        key: ${{ needs.build-dpdk.outputs.dpdk_key }}
+    - name: Fix /etc/hosts file
+      run: |
+        . .ci/linux-util.sh
+        fix_etc_hosts
+
+    - name: Disable apparmor
+      run: |
+        . .ci/linux-util.sh
+        disable_apparmor
+
+    - name: Fixup crun
+      run: |
+        . .ci/linux-util.sh
+        fixup_crun
+
+    - name: Preserve env
+      run: |
+        . .ci/linux-util.sh
+        sudo_preserve_env
 
     - name: image cache
-      uses: actions/cache@v4
+      id: image_cache
+      uses: actions/cache@v5
       with:
         path: /tmp/image.tar
-        key: ${{ github.sha }}
-
-    # XXX This should be removed when native crun >=1.9.1
-    - name: update crun script
-      run: |
-        crun --version
-        sudo curl -L "https://github.com/containers/crun/releases/download/1.14.1/crun-1.14.1-linux-amd64" -o /usr/bin/crun
-        sudo chmod +x /usr/bin/crun
-        echo "New crun version: "$(crun --version)
-
-    - name: Reduce ASLR entropy
-      if:   matrix.cfg.sanitizers != ''
-      # Asan in llvm 14 provided in ubuntu-22.04 is incompatible with
-      # high-entropy ASLR configured in much newer kernels that GitHub
-      # runners are using leading to random crashes:
-      #   https://github.com/actions/runner-images/issues/9491
-      run: sudo sysctl -w vm.mmap_rnd_bits=28
+        key: ${{ github.sha }}/${{ github.event_name }}
 
     - name: load image
       run: |
@@ -241,15 +208,15 @@ jobs:
 
     - name: build
       if: ${{ startsWith(matrix.cfg.testsuite, 'system-test') }}
-      run: sudo -E ./.ci/ci.sh --archive-logs
+      run: sudo ./.ci/ci.sh --archive-logs --timeout=2h
 
     - name: build
       if: ${{ !startsWith(matrix.cfg.testsuite, 'system-test') }}
-      run: ./.ci/ci.sh --archive-logs
+      run: ./.ci/ci.sh --archive-logs --timeout=2h
 
     - name: upload logs on failure
       if: failure() || cancelled()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: logs-linux-${{ join(matrix.cfg.*, '-') }}
         path: logs.tgz
@@ -260,6 +227,7 @@ jobs:
       OPTS:  --disable-ssl
 
     name:    osx clang --disable-ssl
+    if: github.repository_owner == 'ovn-org' || github.event_name != 'schedule'
     runs-on: macos-latest
 
     strategy:
@@ -268,18 +236,18 @@ jobs:
     steps:
     - name: checkout
       if: github.event_name == 'push' || github.event_name == 'pull_request'
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: recursive
     # For weekly runs, don't update submodules
     - name: checkout without submodule
       if: github.event_name == 'schedule'
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
     # Weekly runs test using the tip of the most recent stable OVS branch
     # instead of the submodule.
     - name: checkout OVS
       if: github.event_name == 'schedule'
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         repository: 'openvswitch/ovs'
         fetch-depth: 0
@@ -298,7 +266,7 @@ jobs:
         echo "$HOME/bin"        >> $GITHUB_PATH
         echo "$HOME/.local/bin" >> $GITHUB_PATH
     - name: set up python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: '3.12'
     - name: prepare
@@ -307,15 +275,16 @@ jobs:
       run:  ./.ci/osx-build.sh
     - name: upload logs on failure
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: logs-osx-clang---disable-ssl
         path: config.log
 
   build-linux-rpm:
     name: linux rpm fedora
-    runs-on: ubuntu-22.04
-    container: fedora:latest
+    if: github.repository_owner == 'ovn-org' || github.event_name != 'schedule'
+    runs-on: ubuntu-26.04
+    container: quay.io/fedora/fedora:44
     timeout-minutes: 30
 
     strategy:
@@ -326,7 +295,7 @@ jobs:
         run: dnf install -y dnf-plugins-core git rpm-build
 
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -335,6 +304,11 @@ jobs:
           sed -e 's/@VERSION@/0.0.1/' rhel/ovn-fedora.spec.in \
           > /tmp/ovn.spec
           dnf builddep -y /tmp/ovn.spec
+
+      - name: Fix /etc/hosts file
+        run: |
+          . .ci/linux-util.sh
+          fix_etc_hosts
 
       - name: configure OvS
         run: ./boot.sh && ./configure
@@ -354,7 +328,7 @@ jobs:
         run:  make rpm-fedora
 
       - name: upload rpm packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rpm-packages
           path: |

@@ -30,7 +30,6 @@
 .dirstamp
 .libs
 .tmp_versions
-.vagrant
 /Makefile
 /Makefile.in
 /aclocal.m4
@@ -61,6 +60,9 @@
 /missing
 /missing-distfiles
 /ovn-architecture.7
+/ovn-br.5
+/ovn-br.gv
+/ovn-br.pic
 /ovn-nb.5
 /ovn-nb.gv
 /ovn-nb.pic
@@ -85,7 +87,6 @@ _debian
 odp-netlink.h
 odp-netlink-macros.h
 OvsDpInterface.h
-/.vagrant/
 testsuite.tmp.orig
 /rpm/
 /openvswitch*.tar.gz

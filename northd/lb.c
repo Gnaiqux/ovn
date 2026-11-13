@@ -48,9 +48,11 @@ ovn_lb_ip_set_create(void)
     sset_init(&lb_ip_set->ips_v4);
     sset_init(&lb_ip_set->ips_v4_routable);
     sset_init(&lb_ip_set->ips_v4_reachable);
+    sset_init(&lb_ip_set->ips_v4_adv);
     sset_init(&lb_ip_set->ips_v6);
     sset_init(&lb_ip_set->ips_v6_routable);
     sset_init(&lb_ip_set->ips_v6_reachable);
+    sset_init(&lb_ip_set->ips_v6_adv);
 
     return lb_ip_set;
 }
@@ -64,9 +66,11 @@ ovn_lb_ip_set_destroy(struct ovn_lb_ip_set *lb_ip_set)
     sset_destroy(&lb_ip_set->ips_v4);
     sset_destroy(&lb_ip_set->ips_v4_routable);
     sset_destroy(&lb_ip_set->ips_v4_reachable);
+    sset_destroy(&lb_ip_set->ips_v4_adv);
     sset_destroy(&lb_ip_set->ips_v6);
     sset_destroy(&lb_ip_set->ips_v6_routable);
     sset_destroy(&lb_ip_set->ips_v6_reachable);
+    sset_destroy(&lb_ip_set->ips_v6_adv);
     free(lb_ip_set);
 }
 
@@ -78,37 +82,52 @@ ovn_lb_ip_set_clone(struct ovn_lb_ip_set *lb_ip_set)
     sset_clone(&clone->ips_v4, &lb_ip_set->ips_v4);
     sset_clone(&clone->ips_v4_routable, &lb_ip_set->ips_v4_routable);
     sset_clone(&clone->ips_v4_reachable, &lb_ip_set->ips_v4_reachable);
+    sset_clone(&clone->ips_v4_adv, &lb_ip_set->ips_v4_adv);
     sset_clone(&clone->ips_v6, &lb_ip_set->ips_v6);
     sset_clone(&clone->ips_v6_routable, &lb_ip_set->ips_v6_routable);
     sset_clone(&clone->ips_v6_reachable, &lb_ip_set->ips_v6_reachable);
+    sset_clone(&clone->ips_v6_adv, &lb_ip_set->ips_v6_adv);
 
     return clone;
 }
 
-static
-void ovn_northd_lb_vip_init(struct ovn_northd_lb_vip *lb_vip_nb,
-                            const struct ovn_lb_vip *lb_vip,
-                            const struct nbrec_load_balancer *nbrec_lb,
-                            const char *vip_port_str, const char *backend_ips,
-                            bool template)
+static void
+ovn_northd_lb_vip_init(struct ovn_northd_lb_vip *lb_vip_nb,
+                       const struct ovn_lb_vip *lb_vip,
+                       const struct nbrec_load_balancer *nbrec_lb,
+                       const char *vip_port_str, const char *backend_ips,
+                       bool template)
 {
     lb_vip_nb->backend_ips = xstrdup(backend_ips);
-    lb_vip_nb->n_backends = lb_vip->n_backends;
+    lb_vip_nb->n_backends = vector_len(&lb_vip->backends);
     lb_vip_nb->backends_nb = xcalloc(lb_vip_nb->n_backends,
                                      sizeof *lb_vip_nb->backends_nb);
     lb_vip_nb->lb_health_check =
         ovn_lb_get_health_check(nbrec_lb, vip_port_str, template);
 }
 
+/*
+ * Parses ip_port_mappings in the format :
+ * "ip:logical_port[:src_ip][:az_name]".
+ * src_ip parameter is optional when distributed mode is enabled,
+ * without health checks configured.
+ * If az_name is present and non-empty, it indicates this is a
+ * remote service monitor (backend is in another availability zone),
+ * it should be propogated to another AZ by interconnection processing.
+ */
 static void
-ovn_lb_vip_backends_health_check_init(const struct ovn_northd_lb *lb,
-                                      const struct ovn_lb_vip *lb_vip,
-                                      struct ovn_northd_lb_vip *lb_vip_nb)
+ovn_lb_vip_backends_ip_port_mappings_init(const struct ovn_northd_lb *lb,
+                                          const struct ovn_lb_vip *lb_vip,
+                                          struct ovn_northd_lb_vip *lb_vip_nb)
 {
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
     struct ds key = DS_EMPTY_INITIALIZER;
+    bool allow_without_src_ip = lb->is_distributed
+                                && !lb_vip_nb->lb_health_check;
 
-    for (size_t j = 0; j < lb_vip->n_backends; j++) {
-        struct ovn_lb_backend *backend = &lb_vip->backends[j];
+    for (size_t j = 0; j < vector_len(&lb_vip->backends); j++) {
+        const struct ovn_lb_backend *backend =
+            vector_get_ptr(&lb_vip->backends, j);
         ds_clear(&key);
         ds_put_format(&key, IN6_IS_ADDR_V4MAPPED(&lb_vip->vip)
                       ? "%s" : "[%s]", backend->ip_str);
@@ -118,32 +137,88 @@ ovn_lb_vip_backends_health_check_init(const struct ovn_northd_lb *lb,
             continue;
         }
 
+        struct ovn_northd_lb_backend *backend_nb = NULL;
         char *svc_mon_src_ip = NULL;
-        char *port_name = xstrdup(s);
-        char *p = strstr(port_name, ":");
-        if (p) {
-            *p = 0;
-            p++;
-            struct sockaddr_storage svc_mon_src_addr;
-            if (!inet_parse_address(p, &svc_mon_src_addr)) {
-                static struct vlog_rate_limit rl =
-                    VLOG_RATE_LIMIT_INIT(5, 1);
-                VLOG_WARN_RL(&rl, "Invalid svc mon src IP %s", p);
-            } else {
-                struct ds src_ip_s = DS_EMPTY_INITIALIZER;
-                ss_format_address_nobracks(&svc_mon_src_addr,
-                                            &src_ip_s);
-                svc_mon_src_ip = ds_steal_cstr(&src_ip_s);
+        char *az_name = NULL;
+        char *src_ip = NULL;
+        char *port_name = NULL;
+        char *first_colon = NULL;
+        bool is_remote = false;
+
+        port_name = xstrdup(s);
+        first_colon = strchr(port_name, ':');
+
+        if (!first_colon && allow_without_src_ip) {
+            if (!*port_name) {
+                VLOG_WARN_RL(&rl, "Empty port name in distributed "
+                             "mode for IP %s", ds_cstr(&key));
+                goto cleanup;
+            }
+            is_remote = false;
+            goto init_backend;
+        } else if (!first_colon) {
+            VLOG_WARN_RL(&rl, "Expected ':' separator for: %s", port_name);
+            goto cleanup;
+        }
+
+        *first_colon = '\0';
+        if (first_colon[1] == '[') {
+            /* IPv6 case - format: port:[ipv6]:az or port:[ipv6] */
+            char *ip_end = strchr(first_colon + 2, ']');
+            if (!ip_end) {
+                VLOG_WARN_RL(&rl, "Malformed IPv6 address in backend %s", s);
+                goto cleanup;
+            }
+
+            src_ip = first_colon + 2;
+            *ip_end = '\0';
+
+            if (ip_end[1] == ':') {
+                az_name = ip_end + 2;
+                if (!*az_name) {
+                    VLOG_WARN_RL(&rl, "Empty AZ name specified for backend %s",
+                                 port_name);
+                    goto cleanup;
+                }
+                is_remote = true;
+            }
+        } else {
+            /* IPv4 case - format: port:ip:az or port:ip */
+            src_ip = first_colon + 1;
+            char *az_colon = strchr(src_ip, ':');
+            if (az_colon) {
+                *az_colon = '\0';
+                az_name = az_colon + 1;
+                if (!*az_name) {
+                    VLOG_WARN_RL(&rl, "Empty AZ name specified for backend %s",
+                                 port_name);
+                    goto cleanup;
+                }
+                is_remote = true;
             }
         }
 
-        if (svc_mon_src_ip) {
-            struct ovn_northd_lb_backend *backend_nb =
-                &lb_vip_nb->backends_nb[j];
-            backend_nb->health_check = true;
-            backend_nb->logical_port = xstrdup(port_name);
-            backend_nb->svc_mon_src_ip = svc_mon_src_ip;
+        struct sockaddr_storage svc_mon_src_addr;
+        if (!src_ip || !inet_parse_address(src_ip, &svc_mon_src_addr)) {
+            VLOG_WARN_RL(&rl, "Invalid svc mon src IP %s",
+                         src_ip ? src_ip : "NULL");
+            goto cleanup;
+        } else {
+            struct ds src_ip_s = DS_EMPTY_INITIALIZER;
+            ss_format_address_nobracks(&svc_mon_src_addr, &src_ip_s);
+            svc_mon_src_ip = ds_steal_cstr(&src_ip_s);
         }
+
+init_backend:
+        backend_nb = &lb_vip_nb->backends_nb[j];
+        backend_nb->health_check = lb_vip_nb->lb_health_check;
+        backend_nb->logical_port = xstrdup(port_name);
+        backend_nb->svc_mon_src_ip = svc_mon_src_ip;
+        backend_nb->az_name = is_remote ? xstrdup(az_name) : NULL;
+        backend_nb->remote_backend = is_remote;
+        backend_nb->svc_mon_lrp = NULL;
+        backend_nb->distributed_backend = lb->is_distributed;
+cleanup:
         free(port_name);
     }
 
@@ -157,6 +232,7 @@ void ovn_northd_lb_vip_destroy(struct ovn_northd_lb_vip *vip)
     for (size_t i = 0; i < vip->n_backends; i++) {
         free(vip->backends_nb[i].logical_port);
         free(vip->backends_nb[i].svc_mon_src_ip);
+        free(vip->backends_nb[i].az_name);
     }
     free(vip->backends_nb);
 }
@@ -256,6 +332,14 @@ ovn_lb_get_health_check(const struct nbrec_load_balancer *nbrec_lb,
     return NULL;
 }
 
+static bool
+validate_snap_ip_address(const char *snat_ip)
+{
+    ovs_be32 ip;
+
+    return ip_parse(snat_ip, &ip);
+}
+
 static void
 ovn_northd_lb_init(struct ovn_northd_lb *lb,
                    const struct nbrec_load_balancer *nbrec_lb)
@@ -296,6 +380,18 @@ ovn_northd_lb_init(struct ovn_northd_lb *lb,
     }
     lb->affinity_timeout = affinity_timeout;
 
+    lb->use_stateless_nat = smap_get_bool(&nbrec_lb->options,
+                                          "use_stateless_nat", false);
+
+    const char *snat_ip = smap_get(&nbrec_lb->options, "hairpin_snat_ip");
+
+    if (snat_ip && validate_snap_ip_address(snat_ip)) {
+        lb->hairpin_snat_ip = xstrdup(snat_ip);
+    }
+
+    lb->is_distributed = smap_get_bool(&nbrec_lb->options, "distributed",
+                                       false);
+
     sset_init(&lb->ips_v4);
     sset_init(&lb->ips_v6);
     struct smap_node *node;
@@ -335,8 +431,8 @@ ovn_northd_lb_init(struct ovn_northd_lb *lb,
         }
         n_vips++;
 
-        if (lb_vip_nb->lb_health_check) {
-            ovn_lb_vip_backends_health_check_init(lb, lb_vip, lb_vip_nb);
+        if (lb_vip_nb->lb_health_check || lb->is_distributed) {
+            ovn_lb_vip_backends_ip_port_mappings_init(lb, lb_vip, lb_vip_nb);
         }
     }
 
@@ -365,6 +461,44 @@ ovn_northd_lb_init(struct ovn_northd_lb *lb,
         ds_chomp(&sel_fields, ',');
         lb->selection_fields = ds_steal_cstr(&sel_fields);
     }
+}
+
+/* If the LB backend is configured to be monitored from an IP address that
+ * belongs to an LRP, this function stores the reference to the LRP into the
+ * backend's 'svc_mon_lrp' member.
+ * Only LRPs that are connected to the same switch as the LB backend are
+ * considered.  If no matching LRP is found, the 'svc_mon_lrp' is set to
+ * NULL. */
+void
+ovn_northd_lb_backend_set_mon_port(const struct ovn_lb_datapaths *lb_dps,
+                                   const struct ovn_port *backend_op,
+                                   struct ovn_northd_lb_backend *backend_nb)
+{
+    if (backend_op && !backend_nb->remote_backend) {
+        struct ovn_port *svc_mon_op;
+        VECTOR_FOR_EACH (&backend_op->od->router_ports, svc_mon_op) {
+            if (!svc_mon_op->peer) {
+                continue;
+            }
+
+            /* Skip routers this load balancer is not applied onto. */
+            const struct ovn_datapath *rtr_od = svc_mon_op->peer->od;
+            if (!dynamic_bitmap_is_set(&lb_dps->nb_lr_map,
+                                       rtr_od->sdp->index)) {
+                continue;
+            }
+
+            const char *lrp_ip = lrp_find_member_ip(
+                svc_mon_op->peer,
+                backend_nb->svc_mon_src_ip);
+            if (lrp_ip && !strcmp(lrp_ip,
+                                  backend_nb->svc_mon_src_ip)) {
+                backend_nb->svc_mon_lrp = svc_mon_op->peer;
+                return;
+            }
+        }
+    }
+    backend_nb->svc_mon_lrp = NULL;
 }
 
 struct ovn_northd_lb *
@@ -412,6 +546,7 @@ ovn_northd_lb_cleanup(struct ovn_northd_lb *lb)
     sset_destroy(&lb->ips_v4);
     sset_destroy(&lb->ips_v6);
     free(lb->selection_fields);
+    free(lb->hairpin_snat_ip);
     lb->selection_fields = NULL;
     lb->health_checks = false;
 }
@@ -444,7 +579,9 @@ ovn_lb_group_init(struct ovn_lb_group *lb_group,
         const struct uuid *lb_uuid =
             &nbrec_lb_group->load_balancer[i]->header_.uuid;
         lb_group->lbs[i] = ovn_northd_lb_find(lbs, lb_uuid);
+        lb_group->has_health_checks |= lb_group->lbs[i]->health_checks;
         lb_group->has_routable_lb |= lb_group->lbs[i]->routable;
+        lb_group->has_distributed_lb |= lb_group->lbs[i]->is_distributed;
     }
 }
 
@@ -466,7 +603,9 @@ ovn_lb_group_cleanup(struct ovn_lb_group *lb_group)
 {
     ovn_lb_ip_set_destroy(lb_group->lb_ips);
     lb_group->lb_ips = NULL;
+    lb_group->has_health_checks = false;
     lb_group->has_routable_lb = false;
+    lb_group->has_distributed_lb = false;
     free(lb_group->lbs);
 }
 
@@ -508,12 +647,16 @@ void
 build_lrouter_lb_ips(struct ovn_lb_ip_set *lb_ips,
                      const struct ovn_northd_lb *lb)
 {
-    add_ips_to_lb_ip_set(lb_ips, lb->routable, &lb->ips_v4, &lb->ips_v6);
+    bool advertise = lb->nlb
+        ? smap_get_bool(&lb->nlb->options, "dynamic-routing-advertise", true)
+        : true;
+    add_ips_to_lb_ip_set(lb_ips, lb->routable, advertise,
+                         &lb->ips_v4, &lb->ips_v6);
 }
 
 void
 add_ips_to_lb_ip_set(struct ovn_lb_ip_set *lb_ips,
-                     bool is_routable,
+                     bool is_routable, bool advertise,
                      const struct sset *lb_ips_v4,
                      const struct sset *lb_ips_v6)
 {
@@ -524,11 +667,17 @@ add_ips_to_lb_ip_set(struct ovn_lb_ip_set *lb_ips,
         if (is_routable) {
             sset_add(&lb_ips->ips_v4_routable, ip_address);
         }
+        if (advertise) {
+            sset_add(&lb_ips->ips_v4_adv, ip_address);
+        }
     }
     SSET_FOR_EACH (ip_address, lb_ips_v6) {
         sset_add(&lb_ips->ips_v6, ip_address);
         if (is_routable) {
             sset_add(&lb_ips->ips_v6_routable, ip_address);
+        }
+        if (advertise) {
+            sset_add(&lb_ips->ips_v6_adv, ip_address);
         }
     }
 }
@@ -543,12 +692,14 @@ remove_ips_from_lb_ip_set(struct ovn_lb_ip_set *lb_ips,
 
     SSET_FOR_EACH (ip_address, lb_ips_v4) {
         sset_find_and_delete(&lb_ips->ips_v4, ip_address);
+        sset_find_and_delete(&lb_ips->ips_v4_adv, ip_address);
         if (is_routable) {
             sset_find_and_delete(&lb_ips->ips_v4_routable, ip_address);
         }
     }
     SSET_FOR_EACH (ip_address, lb_ips_v6) {
         sset_find_and_delete(&lb_ips->ips_v6, ip_address);
+        sset_find_and_delete(&lb_ips->ips_v6_adv, ip_address);
         if (is_routable) {
             sset_find_and_delete(&lb_ips->ips_v6_routable, ip_address);
         }
@@ -562,43 +713,42 @@ ovn_lb_datapaths_create(const struct ovn_northd_lb *lb, size_t n_ls_datapaths,
 {
     struct ovn_lb_datapaths *lb_dps = xzalloc(sizeof *lb_dps);
     lb_dps->lb = lb;
-    lb_dps->nb_ls_map = bitmap_allocate(n_ls_datapaths);
-    lb_dps->nb_lr_map = bitmap_allocate(n_lr_datapaths);
+    dynamic_bitmap_alloc(&lb_dps->nb_ls_map, n_ls_datapaths);
+    dynamic_bitmap_alloc(&lb_dps->nb_lr_map, n_lr_datapaths);
     lb_dps->lflow_ref = lflow_ref_create();
-
+    hmapx_init(&lb_dps->ls_lb_with_stateless_mode);
     return lb_dps;
 }
 
 void
 ovn_lb_datapaths_destroy(struct ovn_lb_datapaths *lb_dps)
 {
-    bitmap_free(lb_dps->nb_lr_map);
-    bitmap_free(lb_dps->nb_ls_map);
+    dynamic_bitmap_free(&lb_dps->nb_lr_map);
+    dynamic_bitmap_free(&lb_dps->nb_ls_map);
     lflow_ref_destroy(lb_dps->lflow_ref);
+    hmapx_destroy(&lb_dps->ls_lb_with_stateless_mode);
     free(lb_dps);
 }
 
 void
 ovn_lb_datapaths_add_lr(struct ovn_lb_datapaths *lb_dps, size_t n,
-                        struct ovn_datapath **ods)
+                        struct ovn_datapath **ods,
+                        size_t n_lr_datapaths)
 {
+    dynamic_bitmap_realloc(&lb_dps->nb_lr_map, n_lr_datapaths);
     for (size_t i = 0; i < n; i++) {
-        if (!bitmap_is_set(lb_dps->nb_lr_map, ods[i]->index)) {
-            bitmap_set1(lb_dps->nb_lr_map, ods[i]->index);
-            lb_dps->n_nb_lr++;
-        }
+        dynamic_bitmap_set1(&lb_dps->nb_lr_map, ods[i]->sdp->index);
     }
 }
 
 void
 ovn_lb_datapaths_add_ls(struct ovn_lb_datapaths *lb_dps, size_t n,
-                        struct ovn_datapath **ods)
+                        struct ovn_datapath **ods,
+                        size_t n_ls_datapaths)
 {
+    dynamic_bitmap_realloc(&lb_dps->nb_ls_map, n_ls_datapaths);
     for (size_t i = 0; i < n; i++) {
-        if (!bitmap_is_set(lb_dps->nb_ls_map, ods[i]->index)) {
-            bitmap_set1(lb_dps->nb_ls_map, ods[i]->index);
-            lb_dps->n_nb_ls++;
-        }
+        dynamic_bitmap_set1(&lb_dps->nb_ls_map, ods[i]->sdp->index);
     }
 }
 
@@ -624,8 +774,10 @@ ovn_lb_group_datapaths_create(const struct ovn_lb_group *lb_group,
     struct ovn_lb_group_datapaths *lb_group_dps =
         xzalloc(sizeof *lb_group_dps);
     lb_group_dps->lb_group = lb_group;
-    lb_group_dps->ls = xmalloc(max_ls_datapaths * sizeof *lb_group_dps->ls);
-    lb_group_dps->lr = xmalloc(max_lr_datapaths * sizeof *lb_group_dps->lr);
+    lb_group_dps->ls = VECTOR_CAPACITY_INITIALIZER(struct ovn_datapath *,
+                                                   max_ls_datapaths);
+    lb_group_dps->lr = VECTOR_CAPACITY_INITIALIZER(struct ovn_datapath *,
+                                                   max_lr_datapaths);
 
     return lb_group_dps;
 }
@@ -633,8 +785,8 @@ ovn_lb_group_datapaths_create(const struct ovn_lb_group *lb_group,
 void
 ovn_lb_group_datapaths_destroy(struct ovn_lb_group_datapaths *lb_group_dps)
 {
-    free(lb_group_dps->ls);
-    free(lb_group_dps->lr);
+    vector_destroy(&lb_group_dps->ls);
+    vector_destroy(&lb_group_dps->lr);
     free(lb_group_dps);
 }
 

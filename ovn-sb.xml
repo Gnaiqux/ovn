@@ -73,7 +73,7 @@
 
   <p>
     The <ref table="Logical_Flow"/>, <ref table="Multicast_Group"/>, <ref
-    table="Address_Group"/>, <ref table="DHCP_Options"/>, <ref
+    table="Address_Set"/>, <ref table="DHCP_Options"/>, <ref
     table="DHCPv6_Options"/>, and <ref table="DNS"/> tables contain logical
     network data.
   </p>
@@ -145,7 +145,7 @@
     </p>
 
     <group title="Status">
-      This column allow a client to track the overall configuration state of
+      This column allows a client to track the overall configuration state of
       the system.
 
       <column name="nb_cfg">
@@ -155,6 +155,15 @@
         the northbound database.  In turn, when <code>ovn-northd</code> updates
         the southbound database to bring it up to date with these changes, it
         updates this column to the same value.
+      </column>
+
+      <column name="nb_cfg_timestamp">
+        The time at which <code>ovn-northd</code> last wrote
+        <ref column="nb_cfg"/> to the southbound database, in milliseconds
+        since the Unix epoch.  Set atomically with each update to
+        <ref column="nb_cfg"/>.  Hypervisors read this value to measure
+        end-to-end propagation latency from northbound commit to local
+        datapath programming completion.
       </column>
     </group>
 
@@ -171,6 +180,17 @@
       <column name="options">
         This column provides general key/value settings. The supported
         options are described individually below.
+      </column>
+
+      <column name="options" key="enable_chassis_nb_cfg_update">
+        <p>
+          If set to <code>false</code>, ovn-controller will no longer update the
+          <ref column="nb_cfg" table="Chassis_Private" db="OVN_Southbound"/>
+          column in the <ref table="Chassis_Private" db="OVN_Southbound"/>
+          table of the <ref db="OVN_Southbound"/> database.  It will still
+          update the <code>external_ids:ovn-nb-cfg</code> in the local
+          OVS integration bridge.
+        </p>
       </column>
 
       <group title="Options for configuring BFD">
@@ -198,7 +218,9 @@
           BFD option <code>mult</code> value to use when configuring BFD on
           tunnel interfaces.
         </column>
+      </group>
 
+      <group title="Options for debug drop sampling">
         <column name="options" key="debug_drop_domain_id">
           <p>
             If set to a 8-bit number and if
@@ -226,25 +248,6 @@
             The value must match that of the local OVS configuration as
             described in <code>ovs-actions</code>(7).
           </p>
-        </column>
-      </group>
-
-      <group title="Options for configuring Load Balancers">
-        <p>
-          These options apply when <code>ovn-controller</code> configures
-          load balancer related flows.
-        </p>
-
-        <column name="options" key="lb_hairpin_use_ct_mark">
-          By default this option is turned on (even if not present in the
-          database) unless its value is explicitly set to <code>false</code>.
-
-          This value is automatically set to <code>false</code> by
-          <code>ovn-northd</code> when action <code>ct_lb_mark</code> cannot be
-          used for new load balancer sessions and action <code>ct_lb</code>
-          will be used instead.  <code>ovn-controller</code> then
-          knows that it should check <code>ct_label.natted</code> to detect
-          load balanced traffic.
         </column>
       </group>
 
@@ -283,7 +286,7 @@
         table for more information.
       </column>
       <column name="ssl">
-        Global SSL configuration.
+        Global SSL/TLS configuration.
       </column>
     </group>
     <group title="Security Configurations">
@@ -396,11 +399,6 @@
       table. See <code>ovn-controller</code>(8) for more information.
     </column>
 
-    <column name="other_config" key="port-up-notif">
-      <code>ovn-controller</code> populates this key with <code>true</code>
-      when it supports <code>Port_Binding.up</code>.
-    </column>
-
     <group title="Common Columns">
       The overall purpose of these columns is described under <code>Common
       Columns</code> at the beginning of this document.
@@ -450,8 +448,8 @@
       any other chassis.  These data are stored in this separate table instead
       of the <ref table="Chassis"/> table for performance considerations:
       the rows in this table can be conditionally monitored by chassises so
-      that each chassis only get update notifications for its own row, to avoid
-      unnecessary chassis private data update flooding in a large scale
+      that each chassis only gets update notifications for its own row, to
+      avoid unnecessary chassis private data update flooding in a large scale
       deployment.
     </p>
 
@@ -497,8 +495,8 @@
 
     <column name="type">
       The encapsulation to use to transmit packets to this chassis.
-      Hypervisors and gateways must use one of: <code>geneve</code>,
-      <code>vxlan</code>, or <code>stt</code>.
+      Hypervisors and gateways must use <code>geneve</code> or
+      <code>vxlan</code>.
     </column>
 
     <column name="options">
@@ -557,13 +555,22 @@
 
     <column name="options" key="dst_port" type='{"type": "integer"}'>
       <p>
-        If set, overrides the UDP (for <code>geneve</code> and
-        <code>vxlan</code>) or TCP (for <code>stt</code>) destination port.
+        If set, overrides the UDP destination port.
+      </p>
+    </column>
+
+    <column name="options" key="is_default" type='{"type": "boolean"}'>
+      <p>
+        When there are multiple encaps for a chassis with different IPs, this
+        option indicates if the encap is the default one that matches the IP in
+        <ref table="Open_vSwitch" column="external_ids:ovn-encap-ip-default"/>
+        column of the Open_vSwitch database's <ref table="Open_vSwitch"
+        db="Open_vSwitch"/> table.
       </p>
     </column>
 
     <column name="ip">
-      The IPv4 address of the encapsulation tunnel endpoint.
+      The IPv4 or IPv6 address of the encapsulation tunnel endpoint.
     </column>
     <column name="chassis_name">
       The name of the chassis that created this encap.
@@ -587,6 +594,7 @@
 
     <column name="name"/>
     <column name="addresses"/>
+    <column name="options"/>
   </table>
 
   <table name="Port_Group" title="Port Groups">
@@ -663,9 +671,9 @@
       column="match"/> that is true for the packet.  If none is found, OVN
       drops the packet.  If OVN finds more than one, it chooses the match with
       the highest <ref column="priority"/>.  Then OVN executes
-      each of the actions specified in the row's <ref table="actions"/> column,
-      in the order specified.  Some actions, such as those to modify packet
-      headers, require no further details.  The <code>next</code> and
+      each of the actions specified in the row's <ref column="actions"/>
+      column, in the order specified.  Some actions, such as those to modify
+      packet headers, require no further details.  The <code>next</code> and
       <code>output</code> actions are special.
     </p>
 
@@ -689,7 +697,7 @@
       register data, e.g. <code>reg0</code> ...  <code>reg9</code> and
       connection tracking state, to achieve uniform behavior regardless
       of whether the egress pipeline is on a different hypervisor
-      (because registers aren't preserve across tunnel encapsulation).
+      (because registers aren't preserved across tunnel encapsulation).
     </p>
 
     <p>
@@ -872,7 +880,7 @@
           </p>
 
           <p>
-            Any use of a ordinal field may specify a single bit or a range of
+            Any use of an ordinal field may specify a single bit or a range of
             bits, e.g. <code>vlan.tci[13..15]</code> refers to the PCP field
             within the VLAN TCI, and <code>eth.dst[40]</code> refers to the
             multicast bit in the Ethernet destination address.
@@ -890,7 +898,7 @@
         <li>
           <p>
             <dfn>Nominal</dfn>.  In statistics, nominal values cannot be
-            usefully compared except for equality.  This is true of OpenFlow
+            usefully compared except for equality.  OpenFlow
             port numbers, Ethernet types, and IP protocols are examples: all of
             these are just identifiers assigned arbitrarily with no deeper
             meaning.  In OpenFlow and Open vSwitch, bits in these fields
@@ -932,7 +940,7 @@
       <p>
         <em>Prerequisites</em>.  Any symbol can have prerequisites, which are
         additional condition implied by the use of the symbol.  For example,
-        For example, <code>icmp4.type</code> symbol might have prerequisite
+        <code>icmp4.type</code> symbol might have prerequisite
         <code>icmp4</code>, which would cause an expression <code>icmp4.type ==
         0</code> to be interpreted as <code>icmp4.type == 0 &amp;&amp;
         icmp4</code>, which would in turn expand to <code>icmp4.type == 0
@@ -1035,7 +1043,7 @@
 
       <p>
         For a one-bit field or predicate, a mention of its name is equivalent
-        to <code><var>symobl</var> == 1</code>, e.g. <code>vlan.present</code>
+        to <code><var>symbol</var> == 1</code>, e.g. <code>vlan.present</code>
         is equivalent to <code>vlan.present == 1</code>.  The same is true for
         one-bit subfields, e.g. <code>vlan.tci[12]</code>.  There is no
         technical limitation to implementing the same for ordinal fields of all
@@ -1075,10 +1083,11 @@
       <p>
         Most of the symbols below have integer type.  Only <code>inport</code>
         and <code>outport</code> have string type.  <code>inport</code> names a
-        logical port.  Thus, its value is a <ref column="logical_port"/> name
-        from the <ref table="Port_Binding"/> table.  <code>outport</code> may
-        name a logical port, as <code>inport</code>, or a logical multicast
-        group defined in the <ref table="Multicast_Group"/> table.  For both
+        logical port.  Thus, its value is a
+        <ref column="logical_port" table="Port_Binding"/> name from the
+        <ref table="Port_Binding"/> table.  <code>outport</code> may name a
+        logical port, as <code>inport</code>, or a logical multicast group
+        defined in the <ref table="Multicast_Group"/> table.  For both
         symbols, only names within the flow's logical datapath may be used.
       </p>
 
@@ -1133,7 +1142,7 @@
           </ul>
           <p>
             The <code>ct_dnat</code>, <code>ct_snat</code>, and
-            <code>ct_lb</code> actions initialize the following subfields:
+            <code>ct_lb_mark</code> actions initialize the following subfields:
           </p>
           <ul>
             <li>
@@ -1155,6 +1164,7 @@
       <ul>
         <li><code>eth.bcast</code> expands to <code>eth.dst == ff:ff:ff:ff:ff:ff</code></li>
         <li><code>eth.mcast</code> expands to <code>eth.dst[40]</code></li>
+        <li><code>eth.mcastv6</code> expands to <code>eth.dst[32..47] == 0x3333</code></li>
         <li><code>vlan.present</code> expands to <code>vlan.tci[12]</code></li>
         <li><code>ip4</code> expands to <code>eth.type == 0x800</code></li>
         <li><code>ip4.src_mcast</code> expands to
@@ -1170,8 +1180,10 @@
         <li><code>ip.first_frag</code> expands to <code>ip.is_frag &amp;&amp; !ip.later_frag</code></li>
         <li><code>arp</code> expands to <code>eth.type == 0x806</code></li>
         <li><code>rarp</code> expands to <code>eth.type == 0x8035</code></li>
+        <li><code>ip6.mcast</code> expands to <code>eth.mcastv6 &amp;&amp; ip6.dst[120..127] == 0xff</code></li>
         <li><code>nd</code> expands to <code>icmp6.type == {135, 136} &amp;&amp; icmp6.code == 0 &amp;&amp; ip.ttl == 255</code></li>
         <li><code>nd_ns</code> expands to <code>icmp6.type == 135 &amp;&amp; icmp6.code == 0 &amp;&amp; ip.ttl == 255</code></li>
+        <li><code>nd_ns_mcast</code> expands to <code>ip6.mcast  &amp;&amp; icmp6.type == 135 &amp;&amp; icmp6.code == 0 &amp;&amp; ip.ttl == 255</code></li>
         <li><code>nd_na</code> expands to <code>icmp6.type == 136 &amp;&amp; icmp6.code == 0 &amp;&amp; ip.ttl == 255</code></li>
         <li><code>nd_rs</code> expands to <code>icmp6.type == 133 &amp;&amp;
         icmp6.code == 0 &amp;&amp; ip.ttl == 255</code></li>
@@ -1269,10 +1281,10 @@
           <p>
             Not all fields are modifiable (e.g. <code>eth.type</code> and
             <code>ip.proto</code> are read-only), and not all modifiable fields
-            may be partially modified (e.g. <code>ip.ttl</code> must assigned
-            as a whole).  The <code>outport</code> field is modifiable in the
-            <code>ingress</code> pipeline but not in the <code>egress</code>
-            pipeline.
+            may be partially modified (e.g. <code>ip.ttl</code> must be
+            assigned as a whole).  The <code>outport</code> field is modifiable
+            in the <code>ingress</code> pipeline but not in the
+            <code>egress</code> pipeline.
           </p>
         </dd>
 
@@ -1302,9 +1314,34 @@
                 defined in the RFC 1191 with the value specified in
                 <var>constant</var>.
               </p>
+            </li>
+
+            <li>
+              <code>icmp4.inner_ip4.src</code>
+              <p>
+                This field rewrites the source IPv4 address carried in the
+                inner (original-packet) IPv4 header that is embedded in the
+                payload of an ICMPv4 error message, setting it to
+                <var>constant</var>.  The inner IPv4 header checksum and the
+                outer ICMP checksum are recomputed accordingly.  The action
+                has no effect on packets that are not ICMPv4 errors.
+              </p>
 
               <p>
-                Eg. icmp4.frag_mtu = 1500;
+                It can be used by stateless NAT to fix up inbound ICMPv4
+                errors, for example <code>Fragmentation Needed</code> messages
+                used for Path MTU discovery (RFC 1191).  A stateless
+                <code>dnat_and_snat</code> rule rewrites only the outer
+                destination of such an error, while the embedded inner header
+                still carries the external (post-NAT) IP as its source.  As a
+                result conntrack in the downstream logical switch cannot
+                correlate the error with the tracked flow.  Un-NATing the inner
+                source back to the logical IP lets conntrack relate the error
+                and lets the originating workload honor the PMTU signal.
+              </p>
+
+              <p>
+                Eg. <code>icmp4.inner_ip4.src = 10.0.0.10;</code>
               </p>
             </li>
           </ul>
@@ -1375,6 +1412,8 @@
         </dd>
 
         <dt><code>ct_next;</code></dt>
+        <dt><code>ct_next(dnat);</code></dt>
+        <dt><code>ct_next(snat);</code></dt>
         <dd>
           <p>
             Apply connection tracking to the flow, initializing
@@ -1397,7 +1436,7 @@
           <p>
             It is possible to have actions follow <code>ct_next</code>,
             but they will not have access to any of its side-effects and
-            is not generally useful.
+            are not generally useful.
           </p>
         </dd>
 
@@ -1484,7 +1523,7 @@
           <p>
             <code>ct_snat(<var>IP</var>)</code> sends the packet through the
             SNAT zone to change the source IP address of the packet to
-            the one provided inside the parenthesis and commits the connection.
+            the one provided inside the parentheses and commits the connection.
             The packet is then automatically sent to the next tables as if
             followed by <code>next;</code> action.  The next tables will see the
             changes in the packet caused by the connection tracker.
@@ -1525,9 +1564,9 @@
             tracker.
           </p>
           <p>
-            <code>ct_snat_in_czone(<var>IP</var>)</code> sends the packet\
+            <code>ct_snat_in_czone(<var>IP</var>)</code> sends the packet
             through the common NAT zone to change the source IP address of
-            the packet to the one provided inside the parenthesis and commits
+            the packet to the one provided inside the parentheses and commits
             the connection.  The packet is then automatically sent to the next
             tables as if followed by <code>next;</code> action.  The next
             tables will see the changes in the packet caused by the connection
@@ -1690,19 +1729,85 @@
           </p>
         </dd>
 
+        <dt>
+          <code><var>R</var> = chk_evpn_arp(<var>A</var>);</code>
+        </dt>
+
+        <dd>
+          <p>
+            <b>Parameters</b>: 32-bit or 128-bit IP address field
+            <var>A</var>.
+          </p>
+
+          <p>
+            <b>Result</b>: stored to a 1-bit subfield <var>R</var>.
+          </p>
+
+          <p>
+            Looks up <var>A</var> in the EVPN ARP side table for the
+            current logical datapath.  If a matching entry is found,
+            stores <code>1</code> in the 1-bit subfield <var>R</var>
+            and loads the resolved MAC address into
+            <code>eth.dst</code>.  Otherwise, stores
+            <code>0</code> in <var>R</var> and <code>eth.dst</code>
+            is left unchanged.
+          </p>
+
+          <p>
+            This action is used for EVPN ARP/ND suppression on
+            logical switches.  When an ARP request or ND solicitation
+            targets an IP address that was learned via EVPN, the
+            switch can proxy-reply using the MAC from
+            <code>eth.dst</code> instead of flooding the request
+            to remote VTEPs.
+          </p>
+
+          <p>
+            <b>Example:</b>
+            <code>
+              reg9[5] = chk_evpn_arp(arp.tpa);
+            </code>
+          </p>
+        </dd>
+
         <dt><code><var>P</var> = get_fdb(<var>A</var>);</code></dt>
 
         <dd>
           <p>
-            <b>Parameters</b>:48-bit MAC address field <var>A</var>.
+            <b>Parameters</b>: 48-bit MAC address field <var>A</var>.
           </p>
 
           <p>
-            Looks up <var>A</var> in fdb table. If an entry is found, stores
-            the logical port key to the out parameter <code>P</code>.
+            Looks up <var>A</var> in the <ref table="FDB"/> table. If an entry
+            is found, stores the logical port key to the out parameter
+            <code>P</code>.
           </p>
 
           <p><b>Example:</b> <code>outport = get_fdb(eth.src);</code></p>
+        </dd>
+
+        <dt><code><var>P</var> = get_remote_fdb(<var>A</var>);
+        </code></dt>
+
+        <dd>
+          <p>
+            <b>Parameters</b>: 48-bit MAC address field <var>A</var>.
+          </p>
+
+          <p>
+            <b>Result</b>: stored to a logical port field <var>P</var>.
+          </p>
+
+          <p>
+            Looks up <var>A</var> in the remote <ref table="FDB"/> table. If an
+            entry is found, store the logical port key to the out parameter
+            <code>P</code>.  This is similar to <code>get_fdb</code>
+            but looks up remote <ref table="FDB"/> entries learned from other
+            chassis.
+          </p>
+
+          <p><b>Example:</b> <code>outport = get_remote_fdb(eth.dst);
+          </code></p>
         </dd>
 
         <dt>
@@ -1717,10 +1822,11 @@
 
           <p>
             Adds or updates the entry for Ethernet address <var>A</var> in
-            fdb table, setting its logical port key to <var>P</var>.
+            the <ref table="FDB"/> table, setting its logical port key to
+            <var>P</var>.
           </p>
 
-          <p><b>Example:</b> <code>put_fdb(inport, arp.spa);</code></p>
+          <p><b>Example:</b> <code>put_fdb(inport, eth.src);</code></p>
         </dd>
 
         <dt>
@@ -1729,8 +1835,8 @@
 
         <dd>
           <p>
-            <b>Parameters</b>: 48-bit MAC address field <var>M</var>,
-            logical port string field <var>P</var>.
+            <b>Parameters</b>: logical port string field <var>P</var>,
+            48-bit MAC address field <var>A</var>.
           </p>
 
           <p>
@@ -1738,8 +1844,8 @@
           </p>
 
           <p>
-            Looks up <var>A</var> in fdb table. If an entry is found
-            and the logical port key is <var>P</var>, <code>P</code>,
+            Looks up <var>A</var> in the <ref table="FDB"/> table. If an entry
+            is found and the logical port key is <var>P</var>, <code>P</code>,
             stores <code>1</code> in the 1-bit subfield
             <var>R</var>, else 0. If <code>flags.localnet</code> is set
             then <code>1</code> is stored if an entry is found and the
@@ -1751,6 +1857,63 @@
             <b>Example:</b>
             <code>
               reg0[0] = lookup_fdb(inport, eth.src);
+            </code>
+          </p>
+        </dd>
+
+        <dt>
+          <code>nf_learn_orig_inport(ipv6 = <var>B</var>);</code>
+        </dt>
+
+        <dd>
+          <p>
+            Records the logical input port that the current IP packet
+            entered the logical switch on by learning a flow.  The learned
+            flow matches a later packet of the same flow (same logical
+            datapath and IP source and destination addresses) when its
+            logical output port equals that input port, that is, when the
+            packet is about to be sent back out of the port it originally
+            arrived on.
+          </p>
+
+          <p>
+            <var>B</var> must be <code>true</code> to learn an IPv6 flow or
+            <code>false</code> to learn an IPv4 flow.  The learned flow has a
+            60 second idle timeout.  This action is used together with
+            <code>nf_lookup_orig_inport()</code> to drop the duplicate
+            copies that a network function (NF) redirection can produce when
+            the destination MAC address is still unknown, which would
+            otherwise cause MAC address flaps or L2 loops.
+          </p>
+
+          <p>
+            <b>Example:</b>
+            <code>nf_learn_orig_inport(ipv6 = false);</code>
+          </p>
+        </dd>
+
+        <dt>
+          <code><var>R</var> = nf_lookup_orig_inport();</code>
+        </dt>
+
+        <dd>
+          <p>
+            <b>Result</b>: stored to a 1-bit subfield <var>R</var>.
+          </p>
+
+          <p>
+            Looks up the flow learned by
+            <code>nf_learn_orig_inport()</code>.  Stores <code>1</code> in
+            <var>R</var> if the current packet matches a learned flow, that is,
+            if it is an IP packet that, after network function redirection, is
+            about to be sent back out of the logical input port it originally
+            arrived on.  Otherwise stores <code>0</code>.
+          </p>
+
+          <p>
+            <b>Example:</b>
+            <code>
+              reg0[0] = nf_lookup_orig_inport();
             </code>
           </p>
         </dd>
@@ -1998,7 +2161,7 @@
           </p>
 
           <p>
-            The contents of the <ref table="DHCP_Option"/> table control the
+            The contents of the <ref table="DHCP_Options"/> table control the
             DHCP option names and values that this action supports.
           </p>
 
@@ -2036,7 +2199,7 @@
 
           <p>
             When this action is applied to a non-DHCPv6 packet or an invalid
-            DHCPv6 request packet , it leaves the packet unchanged and stores
+            DHCPv6 request packet, it leaves the packet unchanged and stores
             0 in <var>R</var>.
           </p>
 
@@ -2077,11 +2240,11 @@
           <p><b>Example:</b> <code>set_queue(10);</code></p>
         </dd>
 
-        <dt><code>ct_lb;</code></dt>
-        <dt><code>ct_lb(backends=<var>ip</var>[:<var>port</var>][,...][; hash_fields=<var>field1</var>,<var>field2</var>,...][; ct_flag]);</code></dt>
+        <dt><code>ct_lb_mark;</code></dt>
+        <dt><code>ct_lb_mark(backends=<var>ip</var>[:<var>port</var>][,...][; hash_fields=<var>field1</var>,<var>field2</var>,...][; ct_flag]);</code></dt>
         <dd>
           <p>
-            With arguments, <code>ct_lb</code> commits the packet
+            With arguments, <code>ct_lb_mark</code> commits the packet
             to the connection tracking table and DNATs the packet's destination
             IP address (and port) to the IP address or addresses (and optional
             ports) specified in the <code>backends</code>.  If multiple
@@ -2093,15 +2256,16 @@
             listed are used as the hash fields. The <code>ct_flag</code>
             field represents one of supported flag: <code>skip_snat</code> or
             <code>force_snat</code>, this flag will be stored in
-            <code>ct_label</code> register.
+            <code>ct_mark</code> register.
           </p>
           <p>
-            Without arguments, <code>ct_lb</code> sends the packet to the
+            Without arguments, <code>ct_lb_mark</code> sends the packet to the
             connection tracking table to NAT the packets.  If the packet is
             part of an established connection that was previously committed to
-            the connection tracker via <code>ct_lb(</code>...<code>)</code>, it
-            will automatically get DNATed to the same IP address as the first
-            packet in that connection.
+            the connection tracker via
+            <code>ct_lb_mark(</code>...<code>)</code>, it will automatically
+            get DNATed to the same IP address as the first packet in that
+            connection.
           </p>
           <p>
             Processing automatically moves on to the next table,
@@ -2114,13 +2278,14 @@
           </p>
         </dd>
 
-        <dt><code>ct_lb_mark;</code></dt>
-        <dt><code>ct_lb_mark(backends=<var>ip</var>[:<var>port</var>][,...][; hash_fields=<var>field1</var>,<var>field2</var>,...][; ct_flag]);</code></dt>
+        <dt><code>ct_lb_mark_local;</code></dt>
+        <dt><code>ct_lb_mark_local(backends=<var>lport_name</var>[<var>ip</var>[:<var>port</var>][,...][; hash_fields=<var>field1</var>,<var>field2</var>,...][; ct_flag]);</code></dt>
         <dd>
           <p>
-              Same as <code>ct_lb</code>, except that it internally uses ct_mark
-              to store the NAT flag, while <code>ct_lb</code> uses ct_label for
-              the same purpose.
+              Same as <code>ct_lb_mark</code>, with the key difference that it
+              implements local-only load balancing. This mode selects backends
+              only from those running on the current chassis, preventing
+              traffic from being forwarded to backends on remote nodes.
           </p>
         </dd>
 
@@ -2235,7 +2400,7 @@
 
           <p>
             When this action is applied to a non-IPv6 Router solicitation
-            packet or an invalid IPv6 request packet , it leaves the packet
+            packet or an invalid IPv6 request packet, it leaves the packet
             unchanged and stores 0 in <var>R</var>.
           </p>
 
@@ -2296,7 +2461,7 @@
             that processes it.  Packet logging currently uses the same logging
             mechanism as other Open vSwitch and OVN messages, which means that
             whether and where log messages appear depends on the local logging
-            configuration that can be configured with <code>ovs-appctl</code>,
+            configuration that can be configured with <code>ovn-appctl</code>,
             etc.
           </p>
           <p>
@@ -2328,7 +2493,7 @@
               The <var>string</var> should reference a
               <ref column="name" table="Meter"/> entry from the
               <ref table="Meter"/> table.  The only meter
-              <ref column="action" table="meter"/> that is appropriate
+              <ref column="action" table="Meter_Band"/> that is appropriate
               is <code>drop</code>.
             </dd>
           </dl>
@@ -2429,7 +2594,8 @@
           <p><b>Prerequisite:</b> <code>ip6</code></p>
         </dd>
 
-        <dt><code>tcp_reset;</code></dt>
+        <dt><code>tcp_reset { <var>action</var>; </code>...<code> };
+        </code></dt>
         <dd>
           <p>
             This action transforms the current TCP packet according to the
@@ -2449,9 +2615,23 @@ tcp.flags = RST;
           <p>
             Then, the action drops all TCP options and payload data, and
             updates the TCP checksum. IP ttl is set to 255.
+            The nested actions are executed on the resulting RST packet.
           </p>
 
           <p><b>Prerequisite:</b> <code>tcp</code></p>
+        </dd>
+
+        <dt><code>sctp_abort { <var>action</var>; </code>...<code> };
+        </code></dt>
+        <dd>
+          <p>
+            This action transforms the current SCTP packet into an
+            ABORT chunk.  The nested actions, such as
+            <code>output</code>, are executed on the resulting ABORT
+            packet.
+          </p>
+
+          <p><b>Prerequisite:</b> <code>sctp</code></p>
         </dd>
 
         <dt><code>reject { <var>action</var>; </code>...<code> };</code></dt>
@@ -2470,12 +2650,13 @@ tcp.flags = RST;
           </p>
         </dd>
 
-        <dt><code>trigger_event;</code></dt>
+        <dt><code>trigger_event(event = "<var>event_type</var>", ...);
+        </code></dt>
         <dd>
           <p>
             This action is used to allow ovs-vswitchd to report CMS related
-            events writing them in <ref table="Controller_Event"/> table.
-            It is possible to associate a meter to a each event in order to
+            events writing them in the <ref table="Controller_Event"/> table.
+            It is possible to associate a meter to each event in order to
             not overload pinctrl thread under heavy load; each meter is
             identified though a defined naming convention. Supported events:
           </p>
@@ -2541,14 +2722,48 @@ tcp.flags = RST;
         <dd>
           <p>
             Handle DHCPv6 prefix delegation advertisements/replies from
-            a IPv6 delegation server. <code>ovn-controller</code> will
+            an IPv6 delegation server and manage the prefix delegation state
+            machine. <code>ovn-controller</code> will
             add an entry <code>ipv6_ra_pd_list</code> in the
             <ref table="Port_Binding" column="options"/> table for each
             prefix received from the delegation server
           </p>
         </dd>
 
+        <dt><code>handle_bfd_msg();</code></dt>
+        <dd>
+          <p>
+            This action sends BFD packets to
+            <code>ovn-controller</code> for processing.
+            <code>ovn-controller</code> handles BFD protocol messages
+            received on tunnel or logical ports.
+          </p>
+        </dd>
+
+        <dt><code>flood_remote;</code></dt>
+        <dd>
+          <p>
+            This action floods the packet to all remote ports, i.e.,
+            ports that reside on other chassis.
+          </p>
+        </dd>
+
+        <dt><code><var>R</var> = ct_proto();</code></dt>
+        <dd>
+          <p>
+            <b>Result</b>: stored to an 8-bit subfield <var>R</var>.
+          </p>
+
+          <p>
+            This action returns the IP protocol of the conntrack
+            original-direction tuple.
+          </p>
+
+          <p><b>Example:</b> <code>reg1[16..23] = ct_proto();</code></p>
+        </dd>
+
         <dt><code><var>R</var> = select(<var>N1</var>[=<var>W1</var>], <var>N2</var>[=<var>W2</var>], ...);</code></dt>
+        <dt><code><var>R</var> = select(values=(<var>N1</var>[=<var>W1</var>], <var>N2</var>[=<var>W2</var>], ...); hash_fields="<var>field1</var>,<var>field2</var>,...");</code></dt>
         <dd>
           <p>
             <b>Parameters</b>: Integer <var>N1</var>, <var>N2</var>..., with
@@ -2569,6 +2784,14 @@ tcp.flags = RST;
           </p>
 
           <p>
+            By default, <code>dp_hash</code> is used as the OpenFlow group
+            selection method, but if <code>values</code> and
+            <code>hash_fields</code> are specified, <code>hash</code> is used
+            as the selection method, and the fields listed are used as the
+            hash fields.
+          </p>
+
+          <p>
             Processing automatically moves on to the next table, as if
             <code>next;</code> were specified.  The <code>select</code> action
             must be put as the last action of the logical flow when there are
@@ -2578,14 +2801,7 @@ tcp.flags = RST;
 
           <p>
             <b>Example:</b> <code>reg8[16..31] = select(1=20, 2=30, 3=50);</code>
-          </p>
-        </dd>
-
-        <dt><code>handle_dhcpv6_reply;</code></dt>
-        <dd>
-          <p>
-            This action is used to parse DHCPv6 replies from IPv6
-            Delegation Router and managed IPv6 Prefix delegation state machine
+            <b>Example:</b> <code>reg8[16..31] = select(values=(1=20, 2=30, 3=50); hash_fields="ip_proto,src_ip,dst_ip");</code>
           </p>
         </dd>
 
@@ -2609,7 +2825,7 @@ tcp.flags = RST;
           </p>
         </dd>
 
-        <dt><code><var>R</var> = ct_snat_to_vip;</code></dt>
+        <dt><code>ct_snat_to_vip;</code></dt>
         <dd>
           <p>
             This action sends the packet through the SNAT zone to change the
@@ -2633,7 +2849,7 @@ tcp.flags = RST;
             inport port security checks.  If the packet fails the port security
             checks, then <code>1</code> is stored in the destination register
             <var>R</var>.  Else 0 is stored.  The port security values to check
-            are retrieved from the the <code>inport</code> logical port.
+            are retrieved from the <code>inport</code> logical port.
           </p>
 
           <p>
@@ -2641,7 +2857,7 @@ tcp.flags = RST;
 
           </p>
           <p>
-            <b>Example:</b> <code>reg8[0..7] = check_in_port_sec();</code>
+            <b>Example:</b> <code>reg0[15] = check_in_port_sec();</code>
           </p>
         </dd>
 
@@ -2652,7 +2868,7 @@ tcp.flags = RST;
             outport port security checks.  If the packet fails the port
             security checks, then <code>1</code> is stored in the destination
             register <var>R</var>.  Else 0 is stored.  The port security
-            values to check are retrieved from the the <code>outport</code>
+            values to check are retrieved from the <code>outport</code>
             logical port.
           </p>
 
@@ -2661,58 +2877,7 @@ tcp.flags = RST;
 
           </p>
           <p>
-            <b>Example:</b> <code>reg8[0..7] = check_out_port_sec();</code>
-          </p>
-        </dd>
-
-        <dt><code>commit_ecmp_nh(<var>ipv6</var>);</code></dt>
-        <dd>
-          <p>
-              <b>Parameters</b>: IPv4/IPv6 traffic.
-          </p>
-
-          <p>
-            This action translates to an openflow "learn" action that inserts
-            two new flows in tables 76 and 77.
-          </p>
-
-          <ul>
-            <li>
-              Match on the the 5-tuple and the expected next-hop mac address
-              in table 76: <code>nw_src=ip0</code>, <code>nw_dst=ip1</code>,
-              <code>ip_proto</code>,<code>tp_src=l4_port0</code>,
-              <code>tp_dst=l4_port1</code>,<code>dl_src=ethaddr</code> and
-              set <code>reg9[5]</code>.
-            </li>
-            <li>
-              Match on the 5-tuple in table 77: <code>nw_src=ip1</code>,
-              <code>nw_dst=ip0</code>, <code>ip_proto</code>,
-              <code>tp_src=l4_port1</code>, <code>tp_dst=l4_port0</code>
-              and set <code>reg9[5]</code> to 1
-            </li>
-          </ul>
-
-          <p>
-            This action is applied if the packet arrives via ECMP route or
-            if it is routed via an ECMP route
-          </p>
-        </dd>
-
-        <dt><code><var>R</var> = check_ecmp_nh_mac();</code></dt>
-        <dd>
-          <p>
-            This action checks if the packet under consideration matches
-            any flow in table 76. If it is so, then the 1-bit destination
-            register <var>R</var> is set to 1.
-          </p>
-        </dd>
-
-        <dt><code><var>R</var> = check_ecmp_nh();</code></dt>
-        <dd>
-          <p>
-            This action checks if the packet under consideration matches
-            the any flow in table 77. If it is so, then the 1-bit destination
-            register <var>R</var> is set to 1.
+            <b>Example:</b> <code>reg0[15] = check_out_port_sec();</code>
           </p>
         </dd>
 
@@ -2731,23 +2896,23 @@ tcp.flags = RST;
 
           <p>
             This action translates to an openflow "learn" action that inserts
-            a new flow in table 78.
+            a new flow in table 102.
           </p>
 
           <ul>
             <li>
-              Match on the 4-tuple in table 78: <code>nw_src=ip client</code>,
-              <code>nw_dst=vip ip</code>, <code>ip_proto</code>,
-              <code>tp_dst=vip port</code> and set <code>reg9[6]</code> to 1,
-              <code>reg4</code> and <code>reg8</code> to backend ip and port
-              respectively. For IPv6 register <code>xxreg1</code> is used to
-              store the backend ip.
+              Match on the 4-tuple in table 102:
+              <code>nw_src=ip client</code>, <code>nw_dst=vip ip</code>,
+              <code>ip_proto</code>, <code>tp_dst=vip port</code> and set
+              <code>reg9[6]</code> to 1, <code>reg4</code> and
+              <code>reg8</code> to backend ip and port respectively. For IPv6
+              register <code>xxreg1</code> is used to store the backend ip.
             </li>
           </ul>
 
           <p>
             This action is applied for new connections received by a specific
-            load-balacer with affinity timeout configured.
+            load-balancer with affinity timeout configured.
           </p>
         </dd>
 
@@ -2755,8 +2920,43 @@ tcp.flags = RST;
         <dd>
           <p>
             This action checks if the packet under consideration matches any
-            flow in table 78. If it is so, then the 1-bit destination
+            flow in table 102. If it is so, then the 1-bit destination
             register <var>R</var> is set to 1.
+          </p>
+        </dd>
+
+        <dt><code><var>R</var> = ct_nw_dst();</code></dt>
+        <dd>
+          <p>
+            This action checks if the packet is tracked and stores the
+            conntrack original destination IPv4 address in the register
+            <var>R</var> of 32-bit size.
+          </p>
+        </dd>
+
+        <dt><code><var>R</var> = ct_ip6_dst();</code></dt>
+        <dd>
+          <p>
+            This action checks if the packet is tracked and stores the
+            conntrack original destination IPv6 address in the register
+            <var>R</var> of 128-bit size.
+          </p>
+        </dd>
+
+        <dt><code><var>R</var> = ct_tp_dst();</code></dt>
+        <dd>
+          <p>
+            This action checks if the packet is tracked and stores the
+            conntrack original L4 destination port in the register
+            <var>R</var> of 16-bit size.
+          </p>
+        </dd>
+
+        <dt><code><var>R</var> = ct_state_save();</code></dt>
+        <dd>
+          <p>
+            This action checks if the packet is tracked and stores the
+            conntrack original state in the 8-bit register <var>R</var>.
           </p>
         </dd>
 
@@ -2805,7 +3005,7 @@ tcp.flags = RST;
             <dt><code>obs_point=</code><var>id</var></dt>
             <dd>
               An unsigned 32-bit integer to be used as
-              <code>ObsservationPointID</code> or the string
+              <code>ObservationPointID</code> or the string
               <code>@cookie</code> to indicate that the first 32 bits of the
               <code>Logical_Flow</code>'s UUID shall be used instead.
             </dd>
@@ -2881,6 +3081,20 @@ tcp.flags = RST;
           </p>
         </dd>
 
+      <dt><code>mirror(<var>P</var>);</code></dt>
+        <dd>
+          <p>
+            <b>Parameters</b>: logical port string field <var>P</var>
+            of type <code>mirror</code>.
+          </p>
+
+          <p>
+           When using an lport mirror, it clones the packet and outputs it
+           to the local/remote chassis through the mirrored port <var>P</var>
+           to the target port.
+          </p>
+        </dd>
+
       </dl>
     </column>
 
@@ -2913,14 +3127,18 @@ tcp.flags = RST;
       <code>ovn-controller</code>.
     </column>
 
+    <column name="flow_desc">
+      Human-readable explanation of the flow, this is optional and used
+      to provide context for the given flow.
+    </column>
+
     <column name="external_ids" key="stage-name">
       Human-readable name for this flow's stage in the pipeline.
     </column>
 
     <column name="external_ids" key="stage-hint" type='{"type": "uuid"}'>
-      UUID of a <ref db="OVN_Northbound"/> record that caused this logical flow
-      to be created.  Currently used only for attribute of logical flows to
-      northbound <ref db="OVN_Northbound" table="ACL"/> records.
+      UUID of an <ref db="OVN_Northbound"/> record that caused this logical
+      flow to be created.
     </column>
 
     <column name="external_ids" key="source">
@@ -3037,7 +3255,7 @@ tcp.flags = RST;
     <column name="type">
       <p>
         The value of this field specifies the mirror type - <code>gre</code>,
-        <code>erspan</code> or <code>local</code>.
+        <code>erspan</code>, <code>local</code> or <code>lport</code>.
       </p>
     </column>
 
@@ -3076,7 +3294,7 @@ tcp.flags = RST;
     <column name="unit">
       <p>
         The unit for <ref column="rate" table="Meter_Band"/> and
-        <ref column="burst_rate" table="Meter_Band"/> parameters in
+        <ref column="burst_size" table="Meter_Band"/> parameters in
         the <ref column="bands"/> entry.  <code>kbps</code> specifies
         kilobits per second, and <code>pktps</code> specifies packets
         per second.
@@ -3111,7 +3329,7 @@ tcp.flags = RST;
 
     <column name="rate">
       <p>
-        The rate limit for this band, in kilobits per second or bits per
+        The rate limit for this band, in kilobits per second or packets per
         second, depending on whether the parent <ref table="Meter"/>
         entry's <ref column="unit" table="Meter"/> column specified
         <code>kbps</code> or <code>pktps</code>.
@@ -3139,8 +3357,8 @@ tcp.flags = RST;
     </p>
 
     <p>
-      The main purpose of a row in this table is provide a physical binding for
-      a logical datapath.  A logical datapath does not have a physical
+      The main purpose of a row in this table is to provide a physical binding
+      for a logical datapath.  A logical datapath does not have a physical
       location, so its physical binding information is limited: just <ref
       column="tunnel_key"/>.  The rest of the data in this table does not
       affect packet forwarding.
@@ -3167,18 +3385,19 @@ tcp.flags = RST;
         db="OVN_Northbound"/> database.
       </p>
 
-      <column name="external_ids" key="logical-switch" type='{"type": "uuid"}'>
-        For a logical datapath that represents a logical switch,
-        <code>ovn-northd</code> stores in this key the UUID of the
-        corresponding <ref table="Logical_Switch" db="OVN_Northbound"/> row in
-        the <ref db="OVN_Northbound"/> database.
+      <column name="type" type='{"type": "string"}'>
+        This represents the type of the northbound logical datapath that is
+        represented by this southbound <code>Datapath_Binding</code>. The
+        possible values for this are:
+        <ul>
+          <li><code>logical-switch</code></li>
+          <li><code>logical-router</code></li>
+        </ul>
       </column>
 
-      <column name="external_ids" key="logical-router" type='{"type": "uuid"}'>
-        For a logical datapath that represents a logical router,
-        <code>ovn-northd</code> stores in this key the UUID of the
-        corresponding <ref table="Logical_Router" db="OVN_Northbound"/> row in
-        the <ref db="OVN_Northbound"/> database.
+      <column name="nb_uuid" type='{"type": "uuid"}'>
+        This is the UUID of the corresponding northbound logical datapath
+        represented by this southbound <code>Datapath_Binding</code>.
       </column>
 
       <column name="external_ids" key="interconn-ts" type='{"type": "string"}'>
@@ -3284,7 +3503,7 @@ tcp.flags = RST;
         db="OVN_Northbound"/> table.  For a logical router port, this is taken
         from <ref table="Logical_Router_Port" column="name"
         db="OVN_Northbound"/> in the OVN_Northbound database's <ref
-        table="Logical_Router_port" db="OVN_Northbound"/> table.  (This means
+        table="Logical_Router_Port" db="OVN_Northbound"/> table.  (This means
         that logical switch ports and router port names must not share names in
         an OVN deployment.) OVN does not prescribe a particular format for the
         logical port ID.
@@ -3292,14 +3511,14 @@ tcp.flags = RST;
 
       <column name="encap">
         Points to preferred encapsulation configuration to transmit
-        logical dataplane packets to this chassis. The entry is reference to
+        logical dataplane packets to this chassis. The entry is a reference to
         a <ref table="Encap"/> record.
       </column>
 
       <column name="additional_encap">
         Points to preferred encapsulation configuration to transmit
         logical dataplane packets to this additional chassis. The entry is
-        reference to a <ref table="Encap"/> record.
+        a reference to a <ref table="Encap"/> record.
 
         See also <ref column="additional_chassis"/>.
       </column>
@@ -3349,6 +3568,40 @@ tcp.flags = RST;
             This is populated by <code>ovn-controller</code> based on the value
             of the <code>options:l2gateway-chassis</code> column in this table.
           </dd>
+
+          <dt>external</dt>
+            <dd>
+              A logical port representing an externally connected entity.
+              An <code>external</code> port requires a
+              <ref column="ha_chassis_group"/> and a
+              <code>localnet</code> port on the same logical switch to be
+              functional. <code>ovn-northd</code> syncs the HA chassis group
+              from the corresponding
+              <ref table="Logical_Switch_Port" db="OVN_Northbound"/>
+              and generates logical flows that direct traffic through the
+              <code>localnet</code> port on the bound chassis. Without a
+              <ref column="ha_chassis_group"/>, no logical flows are
+              generated for the port.
+            </dd>
+
+            <dt>remote</dt>
+            <dd>
+              A logical router port whose peer resides on a remote chassis
+              (one whose <ref column="other_config"
+              table="Chassis"/>:<code>is-remote</code> is
+              <code>true</code>).  This type is set instead of
+              <code>patch</code> when <code>ovn-northd</code> determines
+              that the requested chassis is remote.
+            </dd>
+
+            <dt>mirror</dt>
+            <dd>
+              A synthetic port binding created for lport-level mirroring.
+              It acts similarly to a container port (without VLAN tagging)
+              and has its <ref column="mirror_port"
+              table="Port_Binding"/> column set to point to the mirror
+              target port.
+            </dd>
         </dl>
 
       </column>
@@ -3374,11 +3627,20 @@ tcp.flags = RST;
 
       <column name="ha_chassis_group">
         <p>
-          This should only be populated for ports with
-          <ref column="type"/> set to <code>chassisredirect</code>.
-          This column defines the HA chassis group with a list of
-          HA chassis used as gateways where traffic will be redirected
-          through.
+          A list of HA chassis for this port binding. It is populated
+          for ports with <ref column="type"/> set to
+          <code>chassisredirect</code> or <code>external</code>.
+        </p>
+
+        <p>
+          For <code>chassisredirect</code> ports, the HA chassis are used
+          as gateways where traffic will be redirected through.
+        </p>
+
+        <p>
+          For <code>external</code> ports, the HA chassis group determines
+          which chassis binds the port and handles its traffic through a
+          <code>localnet</code> port on the same logical switch.
         </p>
       </column>
 
@@ -3392,8 +3654,8 @@ tcp.flags = RST;
 
       <column name="tunnel_key">
         <p>
-          A number that represents the logical port in the key (e.g. STT key or
-          Geneve TLV) field carried within tunnel protocol packets.
+          A number that represents the logical port in the key (e.g. Geneve
+          TLV) field carried within tunnel protocol packets.
         </p>
 
         <p>
@@ -3421,6 +3683,10 @@ tcp.flags = RST;
           <code>Logical_Switch_Port</code> table in the Northbound database. It
           follows the same format as that column.
         </p>
+      </column>
+
+      <column name="mirror_port">
+       Points to mirror target port fot lport mirror type.
       </column>
 
       <column name="type">
@@ -3744,19 +4010,31 @@ tcp.flags = RST;
         </p>
       </column>
 
+      <column name="options" key="requested-encap-ip">
+        If set, <code>ovn-northd</code> resolves and sets
+        <ref column="encap"/> for this port based on the requested tunnel
+        endpoint IP. If absent, <code>ovn-controller</code> may manage
+        <ref column="encap"/> from local interface
+        <code>external_ids:encap-ip</code>.
+      </column>
+
       <column name="options" key="activation-strategy">
-        If used with multiple chassis set in <ref column="requested-chassis"/>,
-        specifies an activation strategy for all additional chassis. By
-        default, no activation strategy is used, meaning additional port
-        locations are immediately available for use. When set to "rarp", the
-        port is blocked for ingress and egress communication until a RARP
-        packet is sent from a new location. The "rarp" strategy is useful
-        in live migration scenarios for virtual machines.
+        If used with multiple chassis set in
+        <ref column="options" key="requested-chassis"/>, specifies an
+        activation strategy for all additional chassis. By default, no
+        activation strategy is used, meaning additional port locations are
+        immediately available for use. The option supports a comma separated
+        list where you can combine 3 protocols, "rarp", "garp" and "na". When
+        any of the protocols is set, the port is blocked for ingress and
+        egress communication until a specified protocol packet is sent from a
+        new location. The activation strategy is useful in live migration
+        scenarios for virtual machines.
       </column>
 
       <column name="options" key="additional-chassis-activated">
-        When <ref column="activation-strategy"/> is set, this option indicates
-        that the port was activated using the strategy specified.
+        When <ref column="options" key="activation-strategy"/> is set, this
+        option indicates that the port was activated using the strategy
+        specified.
       </column>
 
       <column name="options" key="iface-id-ver">
@@ -3793,12 +4071,22 @@ tcp.flags = RST;
         <code>queue_id</code> used in OpenFlow in <code>struct
         ofp_action_enqueue</code>.
       </column>
+
+      <column name="options" key="dynamic-routing-advertise">
+        If the CMS sets <ref column="other_config"
+        key="dynamic-routing-redistribute" table="Logical_Switch"
+        db="OVN_Northbound"/> to <code>fdb</code> and/or <code>ip</code>, this
+        parameter is used by the CMS to enable/disable the advertisement of
+        LSP IPs/MAC binding.
+        Default: <code>true</code>.
+      </column>
+
     </group>
 
     <group title="Distributed Gateway Port Options">
       <p>
         These options apply to the distributed parent ports of logical ports
-        with <ref column="type"/> of <code>chasssisredirect</code>.
+        with <ref column="type"/> of <code>chassisredirect</code>.
       </p>
 
       <column name="options" key="chassis-redirect-port">
@@ -3830,6 +4118,102 @@ tcp.flags = RST;
         A boolean option that is set to true if the distributed parent of this
         chassis redirect port does not need distributed processing.
       </column>
+    </group>
+
+    <group title="Dynamic Routing">
+      <column name="options" key="dynamic-routing"
+              type='{"type": "boolean"}'>
+        Set to <code>true</code> by <code>ovn-northd</code> on
+        <code>chassisredirect</code> and <code>l3gateway</code>
+        port bindings when the parent logical router has dynamic
+        routing enabled.  This enables <code>ovn-controller</code>
+        to advertise and learn routes for this port.
+      </column>
+
+      <column name="options" key="dynamic-routing-maintain-vrf"
+              type='{"type": "boolean"}'>
+        <p>
+          Only relevant if <ref column="options" key="dynamic-routing"/>
+          is set to <code>true</code>.
+        </p>
+
+        <p>
+          When set to <code>true</code>, <code>ovn-controller</code>
+          creates and maintains a VRF for this port's routing protocol
+          session.  Copied from the
+          <ref table="Logical_Router_Port" db="OVN_Northbound"/>
+          <code>options:dynamic-routing-maintain-vrf</code> option.
+        </p>
+
+        <p>
+          On a <code>chassisredirect</code> port the VRF is created by every
+          <code>ovn-controller</code> whose chassis is a member of the port's
+          <ref column="ha_chassis_group"/>, so that it is in place before the
+          port fails over. Every one of those chassis also advertises the
+          port's routes in it; the ones the port is not resident on do so in a
+          strictly higher priority band, so that the fabric holds a backup
+          path without ever preferring it over the resident chassis.
+        </p>
+      </column>
+
+      <column name="options" key="dynamic-routing-vrf-name">
+        <p>
+          Only relevant if <ref column="options" key="dynamic-routing"/>
+          is set to <code>true</code>.
+        </p>
+
+        <p>
+          The VRF name to use for this port's routing protocol session.
+          Copied from the
+          <ref table="Logical_Router" db="OVN_Northbound"/>
+          <code>options:dynamic-routing-vrf-name</code> option.
+        </p>
+      </column>
+
+      <column name="options" key="dynamic-routing-port-name">
+        <p>
+          Only relevant if <ref column="options" key="dynamic-routing"/>
+          is set to <code>true</code>.
+        </p>
+
+        <p>
+          The port name within the VRF for this port's routing protocol
+          session.  Copied from the
+          <ref table="Logical_Router_Port" db="OVN_Northbound"/>
+          <code>options:dynamic-routing-port-name</code> option.
+        </p>
+      </column>
+
+      <column name="options"
+          key="dynamic-routing-redistribute-local-only"
+          type='{"type": "boolean"}'>
+        <p>
+          Only relevant if <ref column="options" key="dynamic-routing"/>
+          is set to <code>true</code>.
+        </p>
+
+        <p>
+          This controls whether <code>ovn-controller</code> will advertise
+          <ref table="Advertised_Route" db="OVN_Southbound"/> records
+          only on the chassis where their <code>tracked_port</code> is
+          bound.  Default: <code>false</code>.
+        </p>
+      </column>
+
+      <column name="options" key="dynamic-routing-no-learning"
+              type='{"type": "boolean"}'>
+        <p>
+          Only relevant if <ref column="options" key="dynamic-routing"/>
+          is set to <code>true</code>.
+        </p>
+
+        <p>
+          This option disables adding routes to
+          <ref table="Learned_Route" db="OVN_Southbound"/> and will also
+          remove learned routes.
+        </p>
+      </column>
+
     </group>
 
     <group title="Nested Containers">
@@ -3894,7 +4278,7 @@ tcp.flags = RST;
         </p>
 
         <p>
-          For a logical switch port, <code>ovn-northd</code> does not currently
+          For a logical router port, <code>ovn-northd</code> does not currently
           set this key.
         </p>
       </column>
@@ -3909,8 +4293,8 @@ tcp.flags = RST;
         <p>
           The <code>ovn-northd</code> program populates this column with
           all entries into the <ref column="external_ids"/> column of the
-          <ref table="Logical_Switch_Port"/> and
-          <ref table="Logical_Router_Port"/> tables of the
+          <ref table="Logical_Switch_Port" db="OVN_Northbound"/> and
+          <ref table="Logical_Router_Port" db="OVN_Northbound"/> tables of the
           <ref db="OVN_Northbound"/> database.
         </p>
       </column>
@@ -3984,6 +4368,14 @@ tcp.flags = RST;
         directly to the bound Ethernet address.
       </li>
     </ol>
+
+    <p>
+      In EVPN deployments, <code>ovn-controller</code> also writes rows to
+      this table for MAC bindings learned through EVPN Type-2 routes (via
+      FRR and the kernel neighbor table).  These entries are keyed by the
+      router port connected to the EVPN logical switch and behave identically
+      to ARP/ND-learned bindings for consumption and aging purposes.
+    </p>
 
     <column name="logical_port">
       The logical port on which the binding was discovered.
@@ -4263,7 +4655,24 @@ tcp.flags = RST;
           </p>
 
           <p>
-            put_dhcpv6_opts(..., server_id = 01:02:03:04L05:06,...)
+            put_dhcpv6_opts(..., server_id = 01:02:03:04:05:06,...)
+          </p>
+        </dd>
+
+        <dt><code>value: domain</code></dt>
+        <dd>
+          <p>
+            This indicates that the value of the DHCPv6 option is a
+            domain name encoded in DNS wire format (RFC 1035), where
+            each label is preceded by its length.
+          </p>
+
+          <p>
+            Example. "name=fqdn", "code=39", "type=domain".
+          </p>
+
+          <p>
+            put_dhcpv6_opts(..., fqdn = host.example.com,...)
           </p>
         </dd>
       </dl>
@@ -4296,18 +4705,19 @@ tcp.flags = RST;
           <dt><code>ssl:<var>host</var></code>[<code>:<var>port</var></code>]</dt>
           <dd>
             <p>
-              The specified SSL <var>port</var> on the given <var>host</var>,
-              which can either be a DNS name (if built with unbound library) or
-              an IP address.  A valid SSL configuration must be provided when
-              this form is used, this configuration can be specified via
-              command-line options or the <ref table="SSL"/> table.
+              The specified SSL/TLS <var>port</var> on the given
+              <var>host</var>, which can either be a DNS name (if built with
+              unbound library) or an IP address.  A valid SSL configuration
+              must be provided when this form is used, this configuration can
+              be specified via command-line options or the <ref table="SSL"/>
+              table.
             </p>
             <p>
               If <var>port</var> is not specified, it defaults to 6640.
             </p>
             <p>
-              SSL support is an optional feature that is not always
-              built as part of Open vSwitch.
+              SSL/TLS support is an optional feature that is not always
+              built as part of OVN or Open vSwitch.
             </p>
           </dd>
 
@@ -4326,7 +4736,8 @@ tcp.flags = RST;
           <dt><code>pssl:</code>[<var>port</var>][<code>:<var>host</var></code>]</dt>
           <dd>
             <p>
-              Listens for SSL connections on the specified TCP <var>port</var>.
+              Listens for SSL/TLS connections on the specified TCP
+              <var>port</var>.
               Specify 0 for <var>port</var> to have the kernel automatically
               choose an available port.  If <var>host</var>, which can either
               be a DNS name (if built with unbound library) or an IP address,
@@ -4335,16 +4746,16 @@ tcp.flags = RST;
               <var>host</var> is an IPv6 address, wrap in square brackets,
               e.g. <code>pssl:6640:[::1]</code>.  If <var>host</var> is not
               specified then it listens only on IPv4 (but not IPv6) addresses.
-              A valid SSL configuration must be provided when this form is used,
-              this can be specified either via command-line options or the
-              <ref table="SSL"/> table.
+              A valid SSL/TLS configuration must be provided when this form is
+              used, this can be specified either via command-line options or
+              the <ref table="SSL"/> table.
             </p>
             <p>
               If <var>port</var> is not specified, it defaults to 6640.
             </p>
             <p>
-              SSL support is an optional feature that is not always built as
-              part of Open vSwitch.
+              SSL/TLS support is an optional feature that is not always built
+              as part of OVN or Open vSwitch.
             </p>
           </dd>
           <dt><code>ptcp:</code>[<var>port</var>][<code>:<var>host</var></code>]</dt>
@@ -4406,8 +4817,8 @@ tcp.flags = RST;
       <p>
         When <ref column="target"/> specifies a connection method that
         listens for inbound connections (e.g. <code>ptcp:</code> or
-        <code>punix:</code>), both <ref column="n_connections"/> and
-        <ref column="is_connected"/> may also be updated while the
+        <code>punix:</code>), both <ref column="status" key="n_connections"/>
+        and <ref column="is_connected"/> may also be updated while the
         remaining key-value pairs are omitted.
       </p>
 
@@ -4514,11 +4925,11 @@ tcp.flags = RST;
     </group>
   </table>
   <table name="SSL">
-    SSL configuration for ovn-sb database access.
+    SSL/TLS configuration for ovn-sb database access.
 
     <column name="private_key">
       Name of a PEM file containing the private key used as the switch's
-      identity for SSL connections to the controller.
+      identity for SSL/TLS connections to the controller.
     </column>
 
     <column name="certificate">
@@ -4535,24 +4946,49 @@ tcp.flags = RST;
 
     <column name="bootstrap_ca_cert">
       If set to <code>true</code>, then Open vSwitch will attempt to
-      obtain the CA certificate from the controller on its first SSL
+      obtain the CA certificate from the controller on its first SSL/TLS
       connection and save it to the named PEM file. If it is successful,
       it will immediately drop the connection and reconnect, and from then
-      on all SSL connections must be authenticated by a certificate signed
+      on all SSL/TLS connections must be authenticated by a certificate signed
       by the CA certificate thus obtained.  <em>This option exposes the
-      SSL connection to a man-in-the-middle attack obtaining the initial
+      SSL/TLS connection to a man-in-the-middle attack obtaining the initial
       CA certificate.</em>  It may still be useful for bootstrapping.
     </column>
 
     <column name="ssl_protocols">
-      List of SSL protocols to be enabled for SSL connections. The default
-      when this option is omitted is <code>TLSv1,TLSv1.1,TLSv1.2</code>.
+      <p>
+        Range or a comma- or space-delimited list of the SSL/TLS protocols to
+        enable for SSL/TLS connections.
+      </p>
+      <p>
+        Supported protocols include <code>TLSv1.2</code> and
+        <code>TLSv1.3</code>.  Ranges can be provided in a form of two protocol
+        names separated with a dash (<code>TLSv1.2-TLSv1.3</code>), or as a
+        single protocol name with a plus sign (<code>TLSv1.2+</code>).  The
+        value can be a list of protocols or exactly one range.  The range is a
+        preferred way of specifying protocols and the configuration always
+        behaves as if the range between the minimum and the maximum specified
+        version is provided, i.e., if the value is set to
+        <code>TLSv1.X,TLSv1.(X+2)</code>, the <code>TLSv1.(X+1)</code> will
+        also be enabled as if it was a range.
+        Regardless of order, the highest protocol supported by both sides will
+        be chosen when making the connection.
+      </p>
+      <p>
+        The default when this option is omitted is <code>TLSv1.2+</code>.
+      </p>
     </column>
 
     <column name="ssl_ciphers">
       List of ciphers (in OpenSSL cipher string format) to be supported
-      for SSL connections. The default when this option is omitted is
-      <code>HIGH:!aNULL:!MD5</code>.
+      for SSL/TLS connections with TLSv1.2.  The default when this option
+      is omitted is <code>DEFAULT:@SECLEVEL=2</code>.
+    </column>
+
+    <column name="ssl_ciphersuites">
+      List of ciphersuites (in OpenSSL ciphersuites string format) to be
+      supported for SSL/TLS connections with TLSv1.3 and later.  Default value
+      from OpenSSL will be used when this option is omitted.
     </column>
 
     <group title="Common Columns">
@@ -4589,6 +5025,15 @@ tcp.flags = RST;
       will be answered locally by either an IP address or
       <code>DNS rejection</code>.
 </column>
+
+    <column name="options" key="ttl">
+      The time-to-live (in seconds) set in the TTL field of DNS replies for
+      the records in this row.  This is synced automatically by ovn-northd
+      from the corresponding
+      <ref table="DNS" column="options" key="ttl" db="OVN_Northbound"/>
+      option and should not be set directly.
+    </column>
+
     <group title="Common Columns">
       <column name="external_ids">
         See <em>External IDs</em> at the beginning of this document.
@@ -4682,7 +5127,7 @@ tcp.flags = RST;
     <column name="priority">
       <p>
         Priority of the HA chassis. Chassis with highest priority will be
-        the master in the HA chassis group.
+        the active chassis in the HA chassis group.
       </p>
     </column>
 
@@ -4698,13 +5143,13 @@ tcp.flags = RST;
       Table representing a group of chassis which can provide High availability
       services. Each chassis in the group is represented by the table
       <ref table="HA_Chassis"/>. The HA chassis with highest priority will
-      be the master of this group. If the master chassis failover is detected,
-      the HA chassis with the next higher priority takes over the
+      be the active chassis of this group. If the active chassis failover is
+      detected, the HA chassis with the next higher priority takes over the
       responsibility of providing the HA. If <ref db="OVN_Southbound"
       table="Port_Binding" column="ha_chassis_group"/> column of the table
       <ref db="OVN_Southbound" table="Port_Binding"/> references this table,
       then this HA chassis group provides the gateway functionality and
-      redirects the gateway traffic to the master of this group.
+      redirects the gateway traffic to the active chassis of this group.
     </p>
     <column name="name">
       Name of the <ref table="HA_Chassis_Group"/>. Name should be unique.
@@ -4864,6 +5309,10 @@ tcp.flags = RST;
       The service can be an IPv4 TCP or UDP
       service. <code>ovn-controller</code> periodically sends out service
       monitor packets and updates the status of the service.
+      If the service monitor is not local, then ovn-ic creates a record about
+      it in the SBDB database, after which another OVN deployment creates a
+      record about the Service Monitor in its SBDB and the status is
+      propagated back to the initial record in the original availability zone.
     </p>
 
     <p>
@@ -4877,22 +5326,52 @@ tcp.flags = RST;
         service monitor.
       </p>
 
+      <column name="type">
+        The type of the service. Supported values are "load-balancer",
+        "network-function", and "logical-switch-port".
+      </column>
+
       <column name="ip">
-        IP of the service to be monitored. Only IPv4 is supported.
+        Destination IP used in monitor packets. For load-balancer service this
+        is the IP of the service to be monitored. For network-function service
+        this IP is used to send probe packets through the associated
+        Network Function port pair.
+      </column>
+
+      <column name="mac">
+        Destination MAC address used in monitor packets. This is applicable
+        only for network-function services.
       </column>
 
       <column name="protocol">
         The protocol of the service.
+        For <code>type</code> load-balancer, supported protocols are tcp and
+        udp. For <code>type</code> "network-function", supported protocol is
+        icmp, and the health probe is done by injecting an icmp echo request
+        packet into the <code>inport</code> of the Network_Function and then
+        monitoring the same packet coming out of the <code>outport</code>.
+        For <code>type</code> "logical-switch-port", supported protocols are
+        <code>tcp</code>, <code>udp</code> and <code>icmp</code>.
       </column>
 
       <column name="port">
         The TCP or UDP port of the service.
       </column>
 
+      <column name="logical_input_port">
+        This is applicable only for network-function type. The VIF of the
+        logical port on which monitor packets have to be sent. The
+        <code>ovn-controller</code> that binds this <code>logical_port</code>
+        monitors the service by sending periodic monitor packets.
+      </column>
+
       <column name="logical_port">
         The VIF of the logical port on which the service is running. The
         <code>ovn-controller</code> that binds this <code>logical_port</code>
-        monitors the service by sending periodic monitor packets.
+        monitors the service by sending periodic monitor packets. For
+        load-balancer this is the port to which monitor packets are sent and
+        from which response packets are received. For network-function this
+        is the port from which the forwarded monitor packets are received.
       </column>
 
       <column name="src_mac">
@@ -4905,6 +5384,15 @@ tcp.flags = RST;
 
       <column name="chassis_name">
         The name of the chassis where the logical port is bound.
+      </column>
+
+      <column name="remote">
+        Set to true if backend is located on a remote ovn deployment.
+      </column>
+
+      <column name="ic_learned">
+        Set to true if the service monitor was propagated from another
+        OVN deployment via ovn-ic management.
       </column>
 
       <column name="options" key="interval" type='{"type": "integer"}'>
@@ -4946,6 +5434,20 @@ tcp.flags = RST;
           the service and doesn't expect any reply.  If it receives an ICMP
           reply, then it considers the service to be <code>offline</code>.
         </p>
+
+        <p>
+          For ICMP service, <code>ovn-controller</code> sends an ICMP
+          Echo Request and expects an ICMP Echo Reply to consider service
+          to be <code>online</code>. If no reply is received or if an ICMP
+          error message is received, the service is considered
+          <code>offline</code>.
+       </p>
+
+        <p>
+          The value <code>error</code> is also valid but is not
+          currently set by <code>ovn-controller</code>.
+        </p>
+
       </column>
     </group>
 
@@ -4964,7 +5466,7 @@ tcp.flags = RST;
     <column name="name">
       A name for the load balancer.  This name has no special meaning or
       purpose other than to provide convenience for human interaction with
-      the ovn-nb database.
+      the ovn-sb database.
     </column>
 
     <column name="vips">
@@ -5010,12 +5512,6 @@ tcp.flags = RST;
       IP to be used as source IP for packets that have been hair-pinned after
       load balancing.  This value is automatically populated by
       <code>ovn-northd</code>.
-    </column>
-    <column name="options" key="hairpin_orig_tuple" type='{"type": "boolean"}'>
-      This value is automatically set to <code>true</code> by
-      <code>ovn-northd</code> when original destination IP and transport port
-      of the load balanced packets are stored in registers
-      <code>reg1, reg2, xxreg1</code>.
     </column>
     </group>
 
@@ -5117,7 +5613,7 @@ tcp.flags = RST;
       and 'unknown' address set.  If port security is disabled on a
       <code>Logical_Switch_Port</code> record, OVN should allow traffic
       with any source mac from the VIF.  This table will be used to deliver
-      a packet to the VIF, If a packet's <code>eth.dst</code> is learnt.
+      a packet to the VIF, if a packet's <code>eth.dst</code> is learnt.
     </p>
 
     <column name="mac">
@@ -5177,6 +5673,204 @@ tcp.flags = RST;
     </column>
     <column name="variables">
       The set of variable values for a given chassis.
+    </column>
+  </table>
+
+  <table name="Advertised_Route">
+    <p>
+      Each record represents a route that should be exported from ovn to the
+      outside network fabric.
+      It is populated by <code>ovn-northd</code> based on the addresses,
+      routes and NAT Entries of a
+      <code>OVN_Northbound.Logical_Router_Port</code>.
+    </p>
+
+    <column name="datapath">
+      The datapath belonging to the
+      <code>OVN_Northbound.Logical_Router</code> that this route is valid
+      for.
+    </column>
+
+    <column name="logical_port">
+      This is the <ref table="Port_Binding"/> that the router will send packets
+      out that are received for the below prefix.
+    </column>
+
+    <column name="ip_prefix">
+      IP prefix of this route (e.g. 192.168.100.0/24).
+    </column>
+
+    <column name="tracked_port">
+      In combination with a host <code>ip_prefix</code> this tracks the port
+      OVN will forward the packets for this destination to.
+      If set the <ref table="Advertised_Route" column="ip_prefix"/> will always
+      contain a /32 (for ipv4) or /128 (for ipv6) prefix.
+
+      An announcing chassis can use this information to check if this
+      destination is local and adjust the route priorities based on that.
+    </column>
+
+    <column name="external_ids">
+      See <em>External IDs</em> at the beginning of this document.
+
+      <p>
+        The following keys control distributed Load_Balancer routes:
+      </p>
+
+      <dl>
+        <dt><code>source</code></dt>
+        <dd>
+          <code>ovn-northd</code> sets this to <code>lb</code> on routes
+          derived from Load_Balancer VIPs.  It is absent on other routes.
+          The controller applies LB-specific handling when this key and
+          <code>distributed-lb=true</code> are both present.
+        </dd>
+
+        <dt><code>distributed-lb</code></dt>
+        <dd>
+          Set to <code>true</code> by <code>ovn-northd</code> when the route
+          belongs to a Load Balancer whose
+          <ref table="Load_Balancer" column="options"
+          key="distributed" db="OVN_Northbound"/> option is enabled.
+          The health gate, administrative enable flag and status table apply
+          only to routes carrying this key.
+        </dd>
+
+        <dt><code>health-checks</code></dt>
+        <dd>
+          For a health-checked distributed Load_Balancer route,
+          <code>ovn-northd</code> records each relevant backend as
+          <code>protocol,IP,port</code>.  When more than one backend
+          is relevant the tuples are separated by semicolons.
+          <code>ovn-controller</code> looks up matching
+          <ref table="Service_Monitor"/> rows.  When a shared
+          route (same VIP IP and backend LSP) has at least one
+          contributor without a health check, the key is absent so
+          the controller does not gate the route.
+        </dd>
+
+        <dt><code>enabled</code></dt>
+        <dd>
+          Administrative enable flag for routes carrying
+          <code>distributed-lb=true</code>.  A value of <code>false</code>
+          withdraws the route regardless of Service_Monitor health.  An
+          absent key is treated as enabled.  A privileged administrative
+          writer can use this key to withdraw a route.
+        </dd>
+
+      </dl>
+    </column>
+  </table>
+  <table name="Learned_Route">
+    <p>
+      Each record represents a route that was learned by ovn using some
+      dynamic routing logic outside of ovn.
+      It is populated by <code>ovn-controller</code> with routes it learns
+      locally.
+    </p>
+
+    <column name="datapath">
+      The datapath belonging to the
+      <code>OVN_Northbound.Logical_Router</code> that this route is valid
+      for.
+    </column>
+
+    <column name="logical_port">
+      This is the <ref table="Port_Binding"/> that the route was learned on.
+    </column>
+
+    <column name="ip_prefix">
+      IP prefix of this route (e.g. 192.168.100.0/24).
+    </column>
+
+    <column name="nexthop">
+      This is the nexthop ip we learned from outside of OVN.
+    </column>
+
+    <column name="external_ids">
+      See <em>External IDs</em> at the beginning of this document.
+    </column>
+  </table>
+
+  <table name="ECMP_Nexthop">
+    <p>
+      Each record in this table represents an active next-hop for ECMP
+      routes created with <code>--ecmp-symmetric-reply</code> option
+      that are committed by <code>ovn-northd</code> to <code>ovs</code>
+      connection tracker. The <code>ECMP_Nexthop</code> table is used by
+      <code>ovn-controller</code> to track active ct entries and to flush
+      stale ones.
+    </p>
+    <column name="nexthop">
+      <p>
+        Nexthop IP address for this ECMP route. Nexthop IP address should
+        be the IP address of a connected router port or the IP address of
+        an external device used as nexthop for the given destination.
+      </p>
+    </column>
+    <column name="port">
+      <p>
+        The reference to <ref table="Port_Binding"/> table for the port used
+        to connect to the configured next-hop.
+      </p>
+    </column>
+    <column name="datapath">
+      <p>
+        The reference to <ref table="Datapath_Binding"/> table for the datapath
+        where the port used to connect to the configured next-hop is running.
+      </p>
+    </column>
+    <column name="mac">
+      <p>
+        Nexthop mac address.
+      </p>
+    </column>
+    <column name="external_ids">
+      See <em>External IDs</em> at the beginning of this document.
+    </column>
+  </table>
+
+  <table name="ACL_ID">
+    <p>
+      Each record represents an identifier that <code>ovn-northd</code> needs
+      to synchronize with instances of <code>ovn-controller</code>. The UUID
+      of each record corresponds directly with an
+      <ref table="ACL" db="OVN_Northbound"/> record in the northbound
+      database.
+    </p>
+    <column name="id">
+      An identifier corresponding to a northbound
+      <code>allow-established</code> ACL.
+    </column>
+  </table>
+
+  <table name="Advertised_MAC_Binding">
+    <p>
+      Each record represents an ip/mac binding the
+      <code>OVN_Northbound.Logical_Switch</code> is announcing outside
+      the network fabric if <code>EVPN</code> is enabled on the datapath.
+    </p>
+
+    <column name="datapath">
+      The datapath corresponding to the
+      <code>OVN_Northbound.Logical_Switch</code> this ip/mac binding
+      belongs to.
+    </column>
+
+    <column name="logical_port">
+      This is the <ref table="Port_Binding"/> this ip/mac binding belongs to.
+    </column>
+
+    <column name="ip">
+      Announced IP (e.g. 192.168.100.1).
+    </column>
+
+    <column name="mac">
+      Announced mac address.
+    </column>
+
+    <column name="external_ids">
+      See <em>External IDs</em> at the beginning of this document.
     </column>
   </table>
 </database>

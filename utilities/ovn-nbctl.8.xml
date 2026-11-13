@@ -306,7 +306,7 @@
 
     <h2>PKI Options</h2>
     <p>
-      PKI configuration is required to use SSL for the connection to the
+      PKI configuration is required to use SSL/TLS for the connection to the
       database.
     </p>
     <xi:include href="lib/ssl.xml" xmlns:xi="http://www.w3.org/2003/XInclude"/>
@@ -399,7 +399,7 @@
       must be either <code>switch</code> or <code>port-group</code>.
     </p>
     <dl>
-        <dt>[<code>--type=</code>{<code>switch</code> | <code>port-group</code>}] [<code>--log</code>] [<code>--meter=</code><var>meter</var>] [<code>--severity=</code><var>severity</var>] [<code>--name=</code><var>name</var>] [<code>--label=</code><var>label</var>] [<code>--may-exist</code>] [<code>--apply-after-lb</code>] [<code>--tier</code>] <code>acl-add</code> <var>entity</var> <var>direction</var> <var>priority</var> <var>match</var> <var>verdict</var></dt>
+        <dt>[<code>--type=</code>{<code>switch</code> | <code>port-group</code>}] [<code>--log</code>] [<code>--meter=</code><var>meter</var>] [<code>--severity=</code><var>severity</var>] [<code>--name=</code><var>name</var>] [<code>--label=</code><var>label</var>] [<code>--sample-new=</code><var>sample</var>] [<code>--sample-est=</code><var>sample</var>] [<code>--may-exist</code>] [<code>--apply-after-lb</code>] [<code>--tier</code>] <code>acl-add</code> <var>entity</var> <var>direction</var> <var>priority</var> <var>match</var> <var>verdict</var> [<var>network-function-group</var>]</dt>
       <dd>
         <p>
           Adds the specified ACL to <var>entity</var>.  <var>direction</var>
@@ -422,6 +422,12 @@
           <code>info</code>.  The <code>--meter=<var>meter</var></code> option
           is used to rate-limit packet logging.  The <var>meter</var> argument
           names a meter configured by <code>meter-add</code>.
+        </p>
+
+        <p>
+          The <code>--sample-new</code> (and optionally
+          <code>--sample-est</code>) enable ACL sampling. A valid uuid of a
+          row of the <ref table="Sample"/> table must be provided.
         </p>
 
         <p>
@@ -455,9 +461,148 @@
         </p>
       </dd>
 
-      <dt>[<code>--type=</code>{<code>switch</code> | <code>port-group</code>}] <code>acl-list</code> <var>entity</var> </dt>
+      <dt>[<code>--type=</code>{<code>switch</code> | <code>port-group</code>}] [<code>--all</code>] <code>acl-list</code> <var>entity</var> </dt>
       <dd>
         Lists the ACLs on <var>entity</var>.
+        <p>
+          The <code>--all</code> option will also list the port group ACLs
+          associated with each logical switch port, when a logical switch
+          is provided as an argument.
+        </p>
+      </dd>
+    </dl>
+
+    <h2>Network Function Commands</h2>
+
+    <dl>
+      <dt>[<code>--may-exist</code>] <code>nf-add</code> <var>nf</var> <var>id</var> <var>inport</var> [<var>outport</var>]</dt>
+      <dd>
+        <p>
+          Creates a new network function named <var>nf</var> with the specified
+          <var>id</var> (an integer between 1 and 255) and logical switch ports
+          <var>inport</var> and (optionally) <var>outport</var>. The ports must
+          be on the same logical switch and must be already created.
+        </p>
+
+        <p>
+          When the network function is used in an
+          <code>inline</code>-mode network function group, both
+          <var>inport</var> and <var>outport</var> must be specified.
+          Traffic matching the ACL is redirected to the <var>inport</var> for
+          from-lport ACLs and to the <var>outport</var> for to-lport ACLs.
+          The response packets are sent through the same ports in reverse
+          order.
+        </p>
+
+        <p>
+          When the network function is used in a <code>vtap</code>-mode
+          network function group, only <var>inport</var> is used; traffic
+          matching the ACL is mirrored (cloned) to <var>inport</var> in both
+          directions while the original packet continues to its destination.
+          <var>outport</var> must not be specified for vtap network functions.
+        </p>
+
+        <p>
+          Without any options, this command regards it as an error if
+          <var>nf</var> is a duplicate name.  With <code>--may-exist</code>,
+          adding network function with duplicate name overwrites the existing
+          config.
+        </p>
+      </dd>
+
+      <dt>[<code>--if-exists</code>] <code>nf-del</code> <var>nf</var></dt>
+      <dd>
+        <p>
+          Deletes <var>nf</var> specified as name or uuid. It is an error if
+          <var>nf</var> does not exist, unless <code>--if-exists</code> is
+          specified.
+      </p>
+      </dd>
+
+      <dt><code>nf-list</code></dt>
+      <dd>
+        <p>
+          Lists all network functions.
+        </p>
+      </dd>
+
+      <dt>[<code>--may-exist</code>] <code>nfg-add</code> <var>nfg</var> <var>id</var> <var>mode</var> [<var>nf</var>]...</dt>
+      <dd>
+        <p>
+          Creates a new network function group named <var>nfg</var> with
+          optionally one of more <code>nf</code> added to the group. The nfs
+          must be already created. Traffic redirection/mirroring is performed
+          towards one of the active network functions, based on health
+          monitoring (inline) or port binding status (vtap). If all are down,
+          the configured fallback behavior applies.
+        </p>
+
+        <p>
+          Each network function group must have a unique <var>id</var> between
+          <code>1</code> and <code>255</code>. The supported values for
+          <var>mode</var> are:
+        </p>
+
+        <ul>
+          <li>
+            <code>inline</code>: traffic matching the ACL is redirected
+            through the active network function. Both <code>inport</code> and
+            <code>outport</code> must be set on every member network function.
+          </li>
+          <li>
+            <code>vtap</code>: traffic matching the ACL is mirrored (cloned)
+            to the active network function while the original packet
+            continues to its destination. Only <code>inport</code> is used on
+            member network functions.
+          </li>
+        </ul>
+
+        <p>
+          Without any options, this command regards it as an error if
+          <var>nfg</var> is a duplicate name.  With <code>--may-exist</code>,
+          adding network function group with duplicate name overwrites the
+          existing config.
+        </p>
+      </dd>
+
+      <dt>[<code>--if-exists</code>] <code>nfg-del</code> <var>nfg</var></dt>
+      <dd>
+        <p>
+          Deletes <var>nfg</var> specified as name or uuid. It is an error if
+          <var>nfg</var> does not exist, unless <code>--if-exists</code> is
+          specified.
+      </p>
+      </dd>
+
+      <dt><code>nfg-list</code> [<var>nfg</var>]</dt>
+      <dd>
+        <p>
+          Lists all network function groups.  If a specific network
+          function group <var>nfg</var> is given, only that group is
+          listed.
+        </p>
+      </dd>
+
+      <dt>[<code>--may-exist</code>] <code>nfg-add-nf</code> <var>nfg</var> <var>nf</var></dt>
+      <dd>
+        <p>
+          Add a network function named <var>nf</var> to a network function
+          group named <var>nfg</var>. It is an error if <var>nfg</var> or
+          <var>nf</var> does not exist. Unless <code>--may-exist</code> is
+          specified, it is an error if the <var>nf</var> being added is
+          already a part of the <var>nfg</var>.
+        </p>
+      </dd>
+
+      <dt><code>nfg-del-nf</code> <var>nfg</var> <var>nf</var></dt>
+      <dd>
+        <p>
+          Delete a network function named <var>nf</var> from a network function
+          group named <var>nfg</var>. It is an error if <var>nfg</var> or
+          <var>nf</var> does not exist. It is an error if <var>nf</var> is not
+          a part of the <var>nfg</var>, unless <code>--if-exists</code> is
+          specified.
+        </p>
       </dd>
     </dl>
 
@@ -520,7 +665,7 @@
 
     <h2>Meter Commands</h2>
     <dl>
-        <dt><code>meter-add</code> <var>name</var> <var>action</var> <var>rate</var> <var>unit</var> [<var>burst</var>]</dt>
+        <dt>[<code>--fair</code>] [<code>--may-exist</code>] <code>meter-add</code> <var>name</var> <var>action</var> <var>rate</var> <var>unit</var> [<var>burst</var>]</dt>
       <dd>
         <p>
           Adds the specified meter.  <var>name</var> must be a unique
@@ -551,6 +696,18 @@
           Names that start with "__" (two underscores) are reserved for
           internal use by OVN, so <code>ovn-nbctl</code> does not allow
           adding them.
+        </p>
+
+        <p>
+          If <code>--fair</code> is specified, the meter's
+          <code>fair</code> column is set to <code>true</code>, enabling
+          fair bandwidth sharing among rows that reference this meter.
+        </p>
+
+        <p>
+          If <code>--may-exist</code> is specified, adding a meter with
+          a name that already exists will update the existing meter
+          instead of reporting an error.
         </p>
       </dd>
 
@@ -732,7 +889,8 @@
         or <code>disabled</code>.
       </dd>
 
-      <dt><code>lsp-set-type</code> <var>port</var> <var>type</var></dt>
+      <dt><code>lsp-set-type</code> <var>port</var> <var>type</var>
+          [<code>peer=</code><var>peer</var>]</dt>
       <dd>
         <p>
           Set the type for the logical port.  The type must be one of the following:
@@ -747,6 +905,31 @@
           <dt><code>router</code></dt>
           <dd>
             A connection to a logical router.
+          </dd>
+
+          <dt><code>switch</code></dt>
+          <dd>
+            <p>
+              A connection to another logical switch.  The optional argument
+              <code>peer</code> identifies a logical switch port that connects
+              to this one.
+            </p>
+            <p>
+              All logical switch ports of that type have implicit 'unknown'
+              addresses and FDB learning enabled.
+              This comes with all the positive and negative sides of the
+              'unknown' address.  Static addresses-to-port mappings don't need
+              to be maintained on each node and only the actually used mappings
+              are learned, but at a cost of broadcasting packets for which the
+              destination address is not learned yet.
+            <p>
+            </p>
+              FDB learning will also cause not learned yet packets to be sent
+              to controller from each switch-switch connection they traverse.
+              This should be taken into consideration while planning to have
+              many directly connected switches within a single availability
+              zone.
+            </p>
           </dd>
 
           <dt><code>localnet</code></dt>
@@ -833,6 +1016,40 @@
       <dt><code>lsp-detach-mirror</code> <var>port</var> <var>m</var></dt>
       <dd>
         Detaches the mirror <var>m</var> from the logical port <var>port</var>.
+      </dd>
+
+      <dt>[<code>--may-exist</code>] <code>lsp-add-router-port</code>
+          <var>switch</var> <var>port</var> <var>lrp_peer</var></dt>
+      <dd>
+        <p>
+          Creates a new logical switch port named <var>port</var> on
+          <var>switch</var> with type <code>router</code>, sets the
+          <code>router-port</code> option to <var>lrp_peer</var>, and
+          sets addresses to <code>router</code>.
+        </p>
+
+        <p>
+          With <code>--may-exist</code>, it is not an error if the port
+          already exists, as long as it is in the same switch, has the
+          same type, and has the same <code>router-port</code> option.
+        </p>
+      </dd>
+
+      <dt>[<code>--may-exist</code>] <code>lsp-add-localnet-port</code>
+          <var>switch</var> <var>port</var> <var>network</var></dt>
+      <dd>
+        <p>
+          Creates a new logical switch port named <var>port</var> on
+          <var>switch</var> with type <code>localnet</code>, sets the
+          <code>network_name</code> option to <var>network</var>, and
+          sets addresses to <code>unknown</code>.
+        </p>
+
+        <p>
+          With <code>--may-exist</code>, it is not an error if the port
+          already exists, as long as it is in the same switch, has the
+          same type, and has the same <code>network_name</code> option.
+        </p>
       </dd>
     </dl>
 
@@ -923,12 +1140,12 @@
     <h2>Logical Router Port Commands</h2>
 
     <dl>
-      <dt>[<code>--may-exist</code>] <code>lrp-add</code> <var>router</var> <var>port</var> <var>mac</var> <var>network</var>... [<code>peer=</code><var>peer</var>]</dt>
+      <dt>[<code>--may-exist</code>] <code>lrp-add</code> <var>router</var> <var>port</var> <var>mac</var> [<var>network</var>]... [<code>peer=</code><var>peer</var>]</dt>
       <dd>
         <p>
           Creates on <var>router</var> a new logical router port named
-          <var>port</var> with Ethernet address <var>mac</var> and one
-          or more IP address/netmask for each <var>network</var>.
+          <var>port</var> with Ethernet address <var>mac</var> and IP
+          address/netmask for each <var>network</var>.
         </p>
 
         <p>
@@ -1004,7 +1221,9 @@
 
     <dl>
       <dt>[<code>--may-exist</code>] [<code>--policy</code>=<var>POLICY</var>]
+        [<code>--route-table</code>=<var>ROUTE_TABLE</var>]
         [<code>--ecmp</code>] [<code>--ecmp-symmetric-reply</code>]
+        [<code>--override-connected</code>]
         [<code>--bfd[=<var>UUID</var></code>]]
         <code>lr-route-add</code> <var>router</var>
         <var>prefix</var> <var>nexthop</var> [<var>port</var>]</dt>
@@ -1021,6 +1240,16 @@
           <var>port</var> is omitted, OVN infers the output port based
           on <var>nexthop</var>. Nexthop can be set to <var>discard</var>
           for dropping packets which match the given route.
+        </p>
+
+        <p>
+          The <code>--route-table</code> option can be used to assign the
+          given route to a separate routing table <var>ROUTE_TABLE</var>
+          instead of the default <code>&lt;main&gt;</code> table.  For a
+          detailed explanation of the route lookup behavior, see the
+          description of the field
+          <code>Logical_Router_Static_Route:route_table</code> in the
+          <code>ovn-nb</code>(5) manpage.
         </p>
 
         <p>
@@ -1041,6 +1270,11 @@
           sent out over that same route. Setting
           <code>--ecmp-symmetric-reply</code> implies <code>--ecmp</code> so
           it is not necessary to set both.
+        </p>
+
+        <p>
+          The <code>--override-connected</code> option makes it so that
+          route's priority to be highest among routes with same prefix.
         </p>
 
         <p>
@@ -1069,6 +1303,7 @@
       </dd>
 
       <dt>[<code>--if-exists</code>] [<code>--policy</code>=<var>POLICY</var>]
+        [<code>--route-table</code>=<var>ROUTE_TABLE</var>]
         <code>lr-route-del</code> <var>router</var> [<var>prefix</var>
         [<var>nexthop</var> [<var>port</var>]]]</dt>
       <dd>
@@ -1078,6 +1313,12 @@
           <var>POLICY</var>, <var>prefix</var>, <var>nexthop</var> and/or
           <var>port</var> are also specified, then all the routes that match
           the conditions will be deleted from the logical router.
+        </p>
+
+        <p>
+          The <code>--route-table</code> option can be used to delete the
+          given route from the route table <var>ROUTE_TABLE</var> instead
+          of the default <code>&lt;main&gt;</code> table.
         </p>
 
         <p>
@@ -1095,23 +1336,28 @@
     <h2>Logical Router Policy Commands</h2>
 
     <dl>
-      <dt>[<code>--may-exist</code>]<code>lr-policy-add</code>
+      <dt>[<code>--may-exist</code>] [<code>--bfd</code>]
+          [<code>--chain</code>=<var>CHAIN</var>]
+          [<code>--output-port</code>=<var>OUTPUT_PORT</var>]
+          <code>lr-policy-add</code>
           <var>router</var> <var>priority</var> <var>match</var>
           <var>action</var> [<var>nexthop</var>[,<var>nexthop</var>,...]]
           [<var>options key=value]</var>] </dt>
       <dd>
         <p>
           Add Policy to <var>router</var> which provides a way to configure
-          permit/deny and reroute policies on the router. Permit/deny policies
-          are similar to OVN ACLs, but exist on the logical-router. Reroute
-          policies are needed for service-insertion and service-chaining.
-          <var>nexthop</var> is an optional parameter. It needs to be provided
-          only when <var>action</var> is <var>reroute</var>. Multiple
-          <code>nexthops</code> can be specified for ECMP routing.
-          A policy is uniquely identified by <var>priority</var> and
-          <var>match</var>. Multiple policies can have the same
-          <var>priority</var>. <var>options</var> sets the router policy
-          options as key-value pair.
+          allow, drop, jump, and reroute policies on the router.  Allow and
+          drop policies are similar to OVN ACLs, but exist on the
+          logical-router.  Reroute policies are needed for service-insertion
+          and service-chaining.  The <var>action</var> must be one of
+          <code>allow</code>, <code>drop</code>, <code>jump</code>, or
+          <code>reroute</code>.  <var>nexthop</var> is an optional
+          parameter.  It needs to be provided only when <var>action</var>
+          is <code>reroute</code>.  Multiple <code>nexthops</code> can be
+          specified for ECMP routing.  A policy is uniquely identified by
+          <var>priority</var> and <var>match</var>.  Multiple policies can
+          have the same <var>priority</var>.  <var>options</var> sets the
+          router policy options as key-value pair.
           The supported option is : <code>pkt_mark</code>.
         </p>
 
@@ -1120,6 +1366,17 @@
           routing policy with the same priority and match string is not
           really created. Without <code>--may-exist</code>, adding a
           duplicated routing policy results in error.
+        </p>
+
+        <p>
+          The <code>--chain</code> option specifies the policy chain name.
+          This is used when the <var>action</var> is <code>jump</code>.
+        </p>
+
+        <p>
+          The <code>--output-port</code> option specifies the output
+          logical router port.  This is only valid when the
+          <var>action</var> is <code>reroute</code>.
         </p>
 
         <p>
@@ -1147,7 +1404,9 @@
           </p>
       </dd>
 
-      <dt>[<code>--if-exists</code>] <code>lr-policy-del</code>
+      <dt>[<code>--if-exists</code>]
+          [<code>--chain</code>=<var>CHAIN</var>]
+          <code>lr-policy-del</code>
           <var>router</var> [<var>{priority | uuid} [match]</var>]</dt>
       <dd>
         <p>
@@ -1164,6 +1423,11 @@
           <var>uuid</var> does not exist, unless <code>--if-exists</code>
           is specified.
         </p>
+
+        <p>
+          If <code>--chain</code> is specified, only policies in the
+          specified chain are considered for deletion.
+        </p>
       </dd>
 
       <dt><code>lr-policy-list</code> <var>router</var></dt>
@@ -1175,7 +1439,7 @@
     <h2>NAT Commands</h2>
 
     <dl>
-      <dt>[<code>--may-exist</code>] [<code>--stateless</code>] [<code>--gateway-port</code>=<var>GATEWAY_PORT</var>] [--portrange] <code>lr-nat-add</code> <var>router</var> <var>type</var> <var>external_ip</var> <var>logical_ip</var> [<var>logical_port</var> <var>external_mac</var>] [<var>external_port_range</var>]</dt>
+      <dt>[<code>--may-exist</code>] [<code>--stateless</code>] [<code>--gateway-port</code>=<var>GATEWAY_PORT</var>] [--portrange] [<code>--match</code>=<var>MATCH</var>] [<code>--priority</code>=<var>PRIORITY</var>] <code>lr-nat-add</code> <var>router</var> <var>type</var> <var>external_ip</var> <var>logical_ip</var> [<var>logical_port</var> <var>external_mac</var>] [<var>external_port_range</var>]</dt>
       <dd>
         <p>
           Adds the specified NAT to <var>router</var>.
@@ -1222,6 +1486,18 @@
           the packet is NATted, a random port from the range will be selected
           as the source port. The range for the
           <code>external_port_range</code> is <code>1-65535</code>.
+        </p>
+
+        <p>
+          The <code>--match</code> allows to specify the extra match condition.
+          The extra match is for more fine-grained control over the NAT rule.
+        </p>
+
+        <p>
+          The <code>--priority</code> option allows to specify order of NAT
+          rule evaluation. Priority must be between <code>0</code> and
+          <code>32767</code>, inclusive and can be only specified together
+          with <code>--match</code>.
         </p>
 
         <p>
@@ -1296,11 +1572,36 @@
       <dd>
         Lists the NATs on <var>router</var>.
       </dd>
+
+      <dt>[<code>--is-exempted</code>] <code>lr-nat-update-ext-ip</code>
+          <var>router</var> <var>type</var> <var>ip</var>
+          <var>address_set</var></dt>
+      <dd>
+        <p>
+          Updates the external IP address set for an existing NAT rule on
+          <var>router</var>.  <var>type</var> must be one of
+          <code>dnat</code>, <code>snat</code>, or
+          <code>dnat_and_snat</code>.  The command finds the matching
+          NAT rule by <var>type</var> and <var>ip</var>, then sets the
+          <code>allowed_ext_ips</code> column of the NAT rule to
+          <var>address_set</var>.
+        </p>
+
+        <p>
+          If <code>--is-exempted</code> is specified, sets
+          <code>exempted_ext_ips</code> instead of
+          <code>allowed_ext_ips</code>.
+        </p>
+
+        <p>
+          It is an error if no matching NAT rule is found.
+        </p>
+      </dd>
     </dl>
 
     <h2>Load Balancer Commands</h2>
     <dl>
-        <dt>[<code>--may-exist</code> | <code>--add-duplicate</code> | <code>--reject</code> | <code>--event</code>] <code>lb-add</code> <var>lb</var> <var>vip</var> <var>ips</var> [<var>protocol</var>]</dt>
+        <dt>[<code>--may-exist</code> | <code>--add-duplicate</code> | <code>--reject</code> | <code>--event</code> | <code>--template</code> | <code>--add-route</code>] <code>lb-add</code> <var>lb</var> <var>vip</var> <var>ips</var> [<var>protocol</var>] [<var>address_family</var>]</dt>
       <dd>
         <p>
          Creates a new load balancer named <var>lb</var> with the provided
@@ -1321,7 +1622,7 @@
          The optional argument <var>protocol</var> must be either
          <code>tcp</code>,  <code>udp</code> or <code>sctp</code>. This argument
          is useful when a port number is provided as part of the <var>vip</var>.
-         If the <var>protocol</var> is unspecified and a port number is provided 
+         If the <var>protocol</var> is unspecified and a port number is provided
          as part of the <var>vip</var>, OVN assumes the <var>protocol</var> to
          be <code>tcp</code>.
         </p>
@@ -1348,6 +1649,26 @@
          is reported in the Controller_Event table in the SB db.
          Please note <code>--event</code> option can't be specified with
          <code>--reject</code> one.
+        </p>
+
+        <p>
+         If the load balancer is created with <code>--template</code> option,
+         local template variables may be used as arguments. These variables
+         are stored in Chassis_Template_Var. To see the supported variable
+         formats, see <code>ovn-nb</code>(5). The following example adds a
+         templated load balancer: <code>ovn-nbctl --template lb-add lb1
+         ^vip:^vport ^backend udp ipv4</code>.
+        </p>
+
+        <p>
+         If <code>--add-route</code> is specified, a route is automatically
+         added for the load balancer's VIP subnet.
+        </p>
+
+        <p>
+         The optional <var>address_family</var> argument specifies the
+         address family (<code>ipv4</code> or <code>ipv6</code>).  This
+         is primarily used with template load balancers.
         </p>
 
         <p>
@@ -1467,6 +1788,12 @@
         is an error if <code>group</code> does not exist.
       </dd>
 
+      <dt><code>pg-get-ports</code> <var>group</var></dt>
+      <dd>
+        Gets <code>ports</code> on the port group named <code>group</code>. It
+        is an error if <code>group</code> does not exist.
+      </dd>
+
       <dt><code>pg-del</code> <var>group</var></dt>
       <dd>
         Deletes port group <code>group</code>. It is an error if
@@ -1514,6 +1841,18 @@
         Removes the HA chassis <code>chassis</code> from the HA chassis
         group <code>group</code>. It is an error if <code>chassis</code> does
         not exist.
+      </dd>
+
+      <dt><code>ha-chassis-group-set-chassis-prio</code> <var>group</var>
+      <var>chassis</var> <var>priority</var></dt>
+      <dd>
+        <p>
+          Sets the priority of an existing HA chassis <var>chassis</var>
+          within the HA chassis group <var>group</var>.
+          <var>priority</var> must be between <code>0</code> and
+          <code>32767</code>, inclusive.  It is an error if
+          <var>chassis</var> does not exist in <var>group</var>.
+        </p>
       </dd>
     </dl>
 
@@ -1628,6 +1967,83 @@
       <dd>
         Lists the mirrors.
       </dd>
+
+      <dt><code>mirror-rule-add</code> <var>mirror_name</var>
+      <var>priority</var> <var>match</var> <var>action</var></dt>
+      <dd>
+        <p>
+          Adds a mirror rule to the mirror named <var>mirror_name</var>.
+          <var>priority</var> is an integer between <code>0</code> and
+          <code>32767</code>, inclusive.  <var>match</var> is a match
+          expression for selecting traffic.  <var>action</var> must be
+          <code>mirror</code> or <code>skip</code>.  It is an error if
+          a duplicate rule already exists on the mirror.
+        </p>
+      </dd>
+
+      <dt><code>mirror-rule-del</code> <var>mirror_name</var>
+      [<var>priority</var> <var>match</var>]</dt>
+      <dd>
+        <p>
+          Deletes mirror rules from the mirror named
+          <var>mirror_name</var>.  If only <var>mirror_name</var> is
+          given, all mirror rules are deleted from that mirror.  If
+          <var>priority</var> and <var>match</var> are also given, only
+          the rule matching both is deleted.
+        </p>
+      </dd>
+    </dl>
+
+    <h2>Health Check commands</h2>
+    <dl>
+      <dt><code>lsp-hc-add</code> <var>PORT</var> <var>PROTOCOL</var>
+      <var>SOURCE_IP</var> [<var>DST_PORT</var>] <var>ADDRESS</var></dt>
+      <dd>
+        <p>
+          Creates a new health check configuration for the logical switch port
+          <code>PORT</code> with the below mandatory arguments.
+        </p>
+
+        <p>
+          <var>PROTOCOL</var> specifies the health check protocol -
+          <code>tcp</code>, <code>udp</code>, or <code>icmp</code>.
+        </p>
+
+        <p>
+          <var>SOURCE_IP</var> specifies the source IP address used when
+          sending health check probes.
+        </p>
+
+        <p>
+          <var>DST_PORT</var> specifies the destination port number for
+          <code>tcp</code> and <code>udp</code> health checks. This parameter
+          is ignored for <code>icmp</code> protocol.
+        </p>
+
+        <p>
+          <var>ADDRESS</var> specifies the IP address to monitor.
+        </p>
+
+        <p>
+          Additional health check options such as interval, timeout,
+          success count, and failure count can be configured separately.
+        </p>
+      </dd>
+
+      <dt><code>lsp-hc-del</code> <var>PORT</var> [<var>HC_UUID</var>]</dt>
+      <dd>
+        <p>
+          Deletes health check configuration for the logical switch port
+          <code>PORT</code>.
+        </p>
+      </dd>
+
+    <dt><code>lsp-hc-list</code> <var>PORT</var></dt>
+    <dd>
+      Lists all health check configurations for the logical switch port
+      <code>PORT</code>, including protocol, source IP, destination port,
+      monitored addresses, and current status.
+    </dd>
     </dl>
 
     <h2>Synchronization Commands</h2>
@@ -1674,23 +2090,24 @@
       </dd>
     </dl>
 
-    <h2>SSL Configuration Commands</h2>
+    <h2>SSL/TLS Configuration Commands</h2>
     <dl>
       <dt><code>get-ssl</code></dt>
       <dd>
-      Prints the SSL configuration.
+      Prints the SSL/TLS configuration.
       </dd>
 
       <dt><code>del-ssl</code></dt>
       <dd>
-      Deletes the current SSL configuration.
+      Deletes the current SSL/TLS configuration.
       </dd>
 
       <dt>[<code>--bootstrap</code>] <code>set-ssl</code>
          <var>private-key</var> <var>certificate</var> <var>ca-cert</var>
-         [<var>ssl-protocol-list</var> [<var>ssl-cipher-list</var>]]</dt>
+         [<var>ssl-protocol-list</var> [<var>ssl-cipher-list</var>
+         [<var>ssl-ciphersuites</var>]]]</dt>
       <dd>
-      Sets the SSL configuration.
+      Sets the SSL/TLS configuration.
       </dd>
     </dl>
 

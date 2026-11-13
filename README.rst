@@ -11,10 +11,14 @@ OVN
     :target: https://github.com/ovn-org/ovn/actions/workflows/ovn-kubernetes.yml
 .. image:: https://github.com/ovn-org/ovn/actions/workflows/ovn-fake-multinode-tests.yml/badge.svg
     :target: https://github.com/ovn-org/ovn/actions/workflows/ovn-fake-multinode-tests.yml
-.. image:: https://api.cirrus-ci.com/github/ovn-org/ovn.svg
-    :target: https://cirrus-ci.com/github/ovn-org/ovn
+.. image:: https://github.com/ovn-org/ovn/actions/workflows/ovn-upgrade-tests.yml/badge.svg
+    :target: https://github.com/ovn-org/ovn/actions/workflows/ovn-upgrade-tests.yml
+.. image:: https://github.com/ovn-org/ovn/actions/workflows/test-arm.yml/badge.svg
+    :target: https://github.com/ovn-org/ovn/actions/workflows/test-arm.yml
 .. image:: https://readthedocs.org/projects/ovn/badge/?version=latest
     :target: https://docs.ovn.org/en/latest/
+.. image:: https://scan.coverity.com/projects/30371/badge.svg
+    :target: https://scan.coverity.com/projects/open-virtual-network
 
 What is OVN?
 ---------------------
@@ -88,8 +92,6 @@ The following is a summary of the licensing of files in this distribution.
 As mentioned, OVN is licensed under the open source Apache 2 license. Some
 files may be marked specifically with a different license, in which case that
 license applies to the file in question.
-
-File build-aux/cccl is licensed under the GNU General Public License, version 2.
 
 Contact
 -------

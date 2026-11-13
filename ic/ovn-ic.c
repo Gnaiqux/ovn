@@ -45,6 +45,9 @@
 #include "util.h"
 #include "uuid.h"
 #include "openvswitch/vlog.h"
+#include "vec.h"
+#include "inc-proc-ic.h"
+#include "ovn-ic.h"
 
 VLOG_DEFINE_THIS_MODULE(ovn_ic);
 
@@ -54,41 +57,13 @@ static unixctl_cb_func ovn_ic_resume;
 static unixctl_cb_func ovn_ic_is_paused;
 static unixctl_cb_func ovn_ic_status;
 
-struct ic_context {
-    struct ovsdb_idl *ovnnb_idl;
-    struct ovsdb_idl *ovnsb_idl;
-    struct ovsdb_idl *ovninb_idl;
-    struct ovsdb_idl *ovnisb_idl;
-    struct ovsdb_idl_txn *ovnnb_txn;
-    struct ovsdb_idl_txn *ovnsb_txn;
-    struct ovsdb_idl_txn *ovninb_txn;
-    struct ovsdb_idl_txn *ovnisb_txn;
-    struct ovsdb_idl_index *nbrec_ls_by_name;
-    struct ovsdb_idl_index *nbrec_lrp_by_name;
-    struct ovsdb_idl_index *nbrec_port_by_name;
-    struct ovsdb_idl_index *sbrec_chassis_by_name;
-    struct ovsdb_idl_index *sbrec_port_binding_by_name;
-    struct ovsdb_idl_index *icnbrec_transit_switch_by_name;
-    struct ovsdb_idl_index *icsbrec_port_binding_by_az;
-    struct ovsdb_idl_index *icsbrec_port_binding_by_ts;
-    struct ovsdb_idl_index *icsbrec_port_binding_by_ts_az;
-    struct ovsdb_idl_index *icsbrec_route_by_az;
-    struct ovsdb_idl_index *icsbrec_route_by_ts;
-    struct ovsdb_idl_index *icsbrec_route_by_ts_az;
-};
-
-struct ic_state {
-    bool had_lock;
-    bool paused;
-};
-
 static const char *ovnnb_db;
 static const char *ovnsb_db;
 static const char *ovn_ic_nb_db;
 static const char *ovn_ic_sb_db;
 static const char *unixctl_path;
 
-/* SSL options */
+/* SSL/TLS options. */
 static const char *ssl_private_key_file;
 static const char *ssl_certificate_file;
 static const char *ssl_ca_cert_file;
@@ -121,313 +96,388 @@ Options:\n\
     stream_usage("database", true, true, false);
 }
 
-static const struct icsbrec_availability_zone *
-az_run(struct ic_context *ctx)
+uint32_t
+allocate_dp_key(struct hmap *dp_tnlids, bool vxlan_mode, const char *name)
 {
-    const struct nbrec_nb_global *nb_global =
-        nbrec_nb_global_first(ctx->ovnnb_idl);
-
-    if (!nb_global) {
-        VLOG_INFO("NB Global not exist.");
-        return NULL;
-    }
-
-    /* Update old AZ if name changes.  Note: if name changed when ovn-ic
-     * is not running, one has to manually delete/update the old AZ with:
-     * "ovn-ic-sbctl destroy avail <az>". */
-    static char *az_name;
-    const struct icsbrec_availability_zone *az;
-    if (az_name && strcmp(az_name, nb_global->name)) {
-        ICSBREC_AVAILABILITY_ZONE_FOR_EACH (az, ctx->ovnisb_idl) {
-            /* AZ name update locally need to update az in ISB. */
-            if (nb_global->name[0] && !strcmp(az->name, az_name)) {
-                icsbrec_availability_zone_set_name(az, nb_global->name);
-                break;
-            } else if (!nb_global->name[0] && !strcmp(az->name, az_name)) {
-                icsbrec_availability_zone_delete(az);
-                break;
-            }
-        }
-        free(az_name);
-        az_name = NULL;
-    }
-
-    if (!nb_global->name[0]) {
-        return NULL;
-    }
-
-    if (!az_name) {
-        az_name = xstrdup(nb_global->name);
-    }
-
-    if (ctx->ovnisb_txn) {
-        ovsdb_idl_txn_add_comment(ctx->ovnisb_txn, "AZ %s", az_name);
-    }
-
-    ICSBREC_AVAILABILITY_ZONE_FOR_EACH (az, ctx->ovnisb_idl) {
-        if (!strcmp(az->name, az_name)) {
-            return az;
-        }
-    }
-
-    /* Create AZ in ISB */
-    if (ctx->ovnisb_txn) {
-        VLOG_INFO("Register AZ %s to interconnection DB.", az_name);
-        az = icsbrec_availability_zone_insert(ctx->ovnisb_txn);
-        icsbrec_availability_zone_set_name(az, az_name);
-        return az;
-    }
-    return NULL;
+    uint32_t hint = vxlan_mode ? OVN_MIN_DP_VXLAN_KEY_GLOBAL
+                               : OVN_MIN_DP_KEY_GLOBAL;
+    return ovn_allocate_tnlid(dp_tnlids, name, hint,
+            vxlan_mode ? OVN_MAX_DP_VXLAN_KEY_GLOBAL : OVN_MAX_DP_KEY_GLOBAL,
+            &hint);
 }
 
-static uint32_t
-allocate_ts_dp_key(struct hmap *dp_tnlids)
+enum ic_datapath_type
+ic_dp_get_type(const struct icsbrec_datapath_binding *isb_dp)
 {
-    static uint32_t hint = OVN_MIN_DP_KEY_GLOBAL;
-    return ovn_allocate_tnlid(dp_tnlids, "transit switch datapath",
-                              OVN_MIN_DP_KEY_GLOBAL, OVN_MAX_DP_KEY_GLOBAL,
-                              &hint);
+    if (isb_dp->type && !strcmp(isb_dp->type, "transit-router")) {
+        return IC_ROUTER;
+    }
+
+    return IC_SWITCH;
 }
 
-static void
-ts_run(struct ic_context *ctx)
+enum ic_port_binding_type
+ic_pb_get_type(const struct icsbrec_port_binding *isb_pb)
 {
-    const struct icnbrec_transit_switch *ts;
-
-    struct hmap dp_tnlids = HMAP_INITIALIZER(&dp_tnlids);
-    struct shash isb_dps = SHASH_INITIALIZER(&isb_dps);
-    const struct icsbrec_datapath_binding *isb_dp;
-    ICSBREC_DATAPATH_BINDING_FOR_EACH (isb_dp, ctx->ovnisb_idl) {
-        shash_add(&isb_dps, isb_dp->transit_switch, isb_dp);
-        ovn_add_tnlid(&dp_tnlids, isb_dp->tunnel_key);
+    if (isb_pb->type && !strcmp(isb_pb->type, "transit-router-port")) {
+        return IC_ROUTER_PORT;
     }
 
-    /* Sync INB TS to AZ NB */
-    if (ctx->ovnnb_txn) {
-        struct shash nb_tses = SHASH_INITIALIZER(&nb_tses);
-        const struct nbrec_logical_switch *ls;
-
-        /* Get current NB Logical_Switch with other_config:interconn-ts */
-        NBREC_LOGICAL_SWITCH_FOR_EACH (ls, ctx->ovnnb_idl) {
-            const char *ts_name = smap_get(&ls->other_config, "interconn-ts");
-            if (ts_name) {
-                shash_add(&nb_tses, ts_name, ls);
-            }
-        }
-
-        /* Create/update NB Logical_Switch for each TS */
-        ICNBREC_TRANSIT_SWITCH_FOR_EACH (ts, ctx->ovninb_idl) {
-            ls = shash_find_and_delete(&nb_tses, ts->name);
-            if (!ls) {
-                ls = nbrec_logical_switch_insert(ctx->ovnnb_txn);
-                nbrec_logical_switch_set_name(ls, ts->name);
-                nbrec_logical_switch_update_other_config_setkey(ls,
-                                                                "interconn-ts",
-                                                                ts->name);
-            }
-            isb_dp = shash_find_data(&isb_dps, ts->name);
-            if (isb_dp) {
-                int64_t nb_tnl_key = smap_get_int(&ls->other_config,
-                                                  "requested-tnl-key",
-                                                  0);
-                if (nb_tnl_key != isb_dp->tunnel_key) {
-                    VLOG_DBG("Set other_config:requested-tnl-key %"PRId64
-                             " for transit switch %s in NB.",
-                             isb_dp->tunnel_key, ts->name);
-                    char *tnl_key_str = xasprintf("%"PRId64,
-                                                  isb_dp->tunnel_key);
-                    nbrec_logical_switch_update_other_config_setkey(
-                        ls, "requested-tnl-key", tnl_key_str);
-                    free(tnl_key_str);
-                }
-            }
-        }
-
-        /* Delete extra NB Logical_Switch with other_config:interconn-ts */
-        struct shash_node *node;
-        SHASH_FOR_EACH (node, &nb_tses) {
-            nbrec_logical_switch_delete(node->data);
-        }
-        shash_destroy(&nb_tses);
-    }
-
-    /* Sync TS between INB and ISB.  This is performed after syncing with AZ
-     * SB, to avoid uncommitted ISB datapath tunnel key to be synced back to
-     * AZ. */
-    if (ctx->ovnisb_txn) {
-        /* Create ISB Datapath_Binding */
-        ICNBREC_TRANSIT_SWITCH_FOR_EACH (ts, ctx->ovninb_idl) {
-            isb_dp = shash_find_and_delete(&isb_dps, ts->name);
-            if (!isb_dp) {
-                /* Allocate tunnel key */
-                int64_t dp_key = allocate_ts_dp_key(&dp_tnlids);
-                if (!dp_key) {
-                    continue;
-                }
-
-                isb_dp = icsbrec_datapath_binding_insert(ctx->ovnisb_txn);
-                icsbrec_datapath_binding_set_transit_switch(isb_dp, ts->name);
-                icsbrec_datapath_binding_set_tunnel_key(isb_dp, dp_key);
-            }
-        }
-
-        /* Delete extra ISB Datapath_Binding */
-        struct shash_node *node;
-        SHASH_FOR_EACH (node, &isb_dps) {
-            icsbrec_datapath_binding_delete(node->data);
-        }
-    }
-    ovn_destroy_tnlids(&dp_tnlids);
-    shash_destroy(&isb_dps);
+    return IC_SWITCH_PORT;
 }
 
-/* Returns true if any information in gw and chassis is different. */
-static bool
-is_gateway_data_changed(const struct icsbrec_gateway *gw,
-                   const struct sbrec_chassis *chassis)
+/*
+ * Check if the AZ is the leader by checking the lock.
+ */
+bool
+is_az_leader(struct ovsdb_idl_txn *txn)
 {
-    if (strcmp(gw->hostname, chassis->hostname)) {
-        return true;
-    }
+    struct ovsdb_idl *idl = ovsdb_idl_txn_get_idl(txn);
+    return idl && ovsdb_idl_has_lock(idl);
+}
 
-    if (gw->n_encaps != chassis->n_encaps) {
-        return true;
-    }
+/* Returns true if transit-switch datapaths must use the VXLAN tunnel-key
+ * range: IC-NB requests vxlan_mode and the IC-SB actually has a VXLAN encap.
+ *
+ * Warning: ovnisb_unlocked should not be used to insert data on IC_SB which
+ * can cause a constraint violation, as an example, inserting data to IC-SB
+ * datapath_binding. */
+bool
+ic_ts_compute_vxlan_mode(struct ic_context *ctx)
+{
+    const struct icnbrec_ic_nb_global *ic_nb =
+        icnbrec_ic_nb_global_first(ctx->ovninb_idl);
 
-    for (int g = 0; g < gw->n_encaps; g++) {
-
-        bool found = false;
-        const struct icsbrec_encap *gw_encap = gw->encaps[g];
-        for (int s = 0; s < chassis->n_encaps; s++) {
-            const struct sbrec_encap *chassis_encap = chassis->encaps[s];
-            if (!strcmp(gw_encap->type, chassis_encap->type) &&
-                !strcmp(gw_encap->ip, chassis_encap->ip)) {
-                found = true;
-                if (!smap_equal(&gw_encap->options, &chassis_encap->options)) {
-                    return true;
-                }
-                break;
+    if (ic_nb && smap_get_bool(&ic_nb->options, "vxlan_mode", false)) {
+        const struct icsbrec_encap *encap;
+        ICSBREC_ENCAP_FOR_EACH (encap, ctx->ovnisb_unlocked_idl) {
+            if (!strcmp(encap->type, "vxlan")) {
+                return true;
             }
         }
-        if (!found) {
-            return true;
-        }
     }
-
     return false;
 }
 
+/* Keep other_config:ic-vxlan_mode on the transit switch's NB Logical_Switch
+ * mirror in sync with the IC VXLAN mode.  northd reads the boolean value with
+ * smap_get_bool() (northd/en-global-config.c), so writing "false" is correct
+ * and does not affect the datapath tunnel-id range.  Only write when the value
+ * actually differs to avoid needless transaction churn. */
 static void
-sync_isb_gw_to_sb(struct ic_context *ctx,
-                  const struct icsbrec_gateway *gw,
-                  const struct sbrec_chassis *chassis)
+ts_set_ic_vxlan_mode(const struct nbrec_logical_switch *ls, bool vxlan_mode)
 {
-    sbrec_chassis_set_hostname(chassis, gw->hostname);
-    sbrec_chassis_update_other_config_setkey(chassis, "is-remote", "true");
-
-    /* Sync encaps used by this gateway. */
-    ovs_assert(gw->n_encaps);
-    struct sbrec_encap *sb_encap;
-    struct sbrec_encap **sb_encaps =
-        xmalloc(gw->n_encaps * sizeof *sb_encaps);
-    for (int i = 0; i < gw->n_encaps; i++) {
-        sb_encap = sbrec_encap_insert(ctx->ovnsb_txn);
-        sbrec_encap_set_chassis_name(sb_encap, gw->name);
-        sbrec_encap_set_ip(sb_encap, gw->encaps[i]->ip);
-        sbrec_encap_set_type(sb_encap, gw->encaps[i]->type);
-        sbrec_encap_set_options(sb_encap, &gw->encaps[i]->options);
-        sb_encaps[i] = sb_encap;
+    const char *want = vxlan_mode ? "true" : "false";
+    const char *cur = smap_get(&ls->other_config, "ic-vxlan_mode");
+    if (!cur || strcmp(cur, want)) {
+        nbrec_logical_switch_update_other_config_setkey(ls, "ic-vxlan_mode",
+                                                        want);
     }
-    sbrec_chassis_set_encaps(chassis, sb_encaps, gw->n_encaps);
-    free(sb_encaps);
 }
 
+/* Reconciles a single transit switch 'ts's AZ NB Logical_Switch mirror:
+ * creates it if missing, keeps other_config:ic-vxlan_mode in sync, and copies
+ * the committed IC-SB Datapath_Binding tunnel key into
+ * other_config:requested-tnl-key.  IC-SB Datapath_Binding creation/keying is
+ * owned by en_tunnel_key.
+ *
+ * 'nb_gc' (keyed by transit-switch name) doubles as a garbage-collection set:
+ * this function removes the mirror it claims, so whatever remains after every
+ * in-scope switch has been reconciled is stale and deleted by the caller.
+ * 'isb_gc' (the IC-SB Datapath_Binding map keyed by transit-switch name) is
+ * read-only here. */
 static void
-sync_sb_gw_to_isb(struct ic_context *ctx,
-                  const struct sbrec_chassis *chassis,
-                  const struct icsbrec_gateway *gw)
+ts_sync_one(struct ic_context *ctx, const struct icnbrec_transit_switch *ts,
+            struct shash *isb_gc, struct shash *nb_gc, bool vxlan_mode)
 {
-    icsbrec_gateway_set_hostname(gw, chassis->hostname);
-
-    /* Sync encaps used by this chassis. */
-    ovs_assert(chassis->n_encaps);
-    struct icsbrec_encap *isb_encap;
-    struct icsbrec_encap **isb_encaps =
-        xmalloc(chassis->n_encaps * sizeof *isb_encaps);
-    for (int i = 0; i < chassis->n_encaps; i++) {
-        isb_encap = icsbrec_encap_insert(ctx->ovnisb_txn);
-        icsbrec_encap_set_gateway_name(isb_encap,
-                                      chassis->name);
-        icsbrec_encap_set_ip(isb_encap, chassis->encaps[i]->ip);
-        icsbrec_encap_set_type(isb_encap,
-                              chassis->encaps[i]->type);
-        icsbrec_encap_set_options(isb_encap,
-                                 &chassis->encaps[i]->options);
-        isb_encaps[i] = isb_encap;
-    }
-    icsbrec_gateway_set_encaps(gw, isb_encaps,
-                              chassis->n_encaps);
-    free(isb_encaps);
-}
-
-static void
-gateway_run(struct ic_context *ctx, const struct icsbrec_availability_zone *az)
-{
-    if (!ctx->ovnisb_txn || !ctx->ovnsb_txn) {
+    if (!nb_gc) {
         return;
     }
 
-    struct shash local_gws = SHASH_INITIALIZER(&local_gws);
-    struct shash remote_gws = SHASH_INITIALIZER(&remote_gws);
-    const struct icsbrec_gateway *gw;
-    ICSBREC_GATEWAY_FOR_EACH (gw, ctx->ovnisb_idl) {
-        if (gw->availability_zone == az) {
-            shash_add(&local_gws, gw->name, gw);
-        } else {
-            shash_add(&remote_gws, gw->name, gw);
+    const struct nbrec_logical_switch *ls =
+        shash_find_and_delete(nb_gc, ts->name);
+    if (!ls) {
+        ls = nbrec_logical_switch_insert(ctx->ovnnb_txn);
+        nbrec_logical_switch_set_name(ls, ts->name);
+
+        /* Write other_config as a whole column rather than with per-key
+         * partial map updates.  A partial update is only queued as a map
+         * operation and is not reflected in 'ls->other_config' until the
+         * transaction commits, so en_tunnel_key would not recognize this
+         * brand-new row as a transit switch mirror and could not publish the
+         * freshly allocated tunnel key to it in this same iteration.  northd
+         * would then pick its own datapath tunnel key and flap it once
+         * requested-tnl-key finally showed up. */
+        struct smap other_config = SMAP_INITIALIZER(&other_config);
+        smap_add(&other_config, "interconn-ts", ts->name);
+        smap_add(&other_config, "ic-vxlan_mode",
+                 vxlan_mode ? "true" : "false");
+        nbrec_logical_switch_set_other_config(ls, &other_config);
+        smap_destroy(&other_config);
+    } else {
+        ts_set_ic_vxlan_mode(ls, vxlan_mode);
+    }
+
+    const struct icsbrec_datapath_binding *isb_dp =
+        shash_find_data(isb_gc, ts->name);
+    if (isb_dp) {
+        int64_t nb_tnl_key = smap_get_int(&ls->other_config,
+                                          "requested-tnl-key", 0);
+        if (nb_tnl_key != isb_dp->tunnel_key) {
+            VLOG_DBG("Set other_config:requested-tnl-key %"PRId64
+                     " for transit switch %s in NB.",
+                     isb_dp->tunnel_key, ts->name);
+            char *tnl_key_str = xasprintf("%"PRId64, isb_dp->tunnel_key);
+            nbrec_logical_switch_update_other_config_setkey(
+                ls, "requested-tnl-key", tnl_key_str);
+            free(tnl_key_str);
         }
     }
-
-    const struct sbrec_chassis *chassis;
-    SBREC_CHASSIS_FOR_EACH (chassis, ctx->ovnsb_idl) {
-        if (smap_get_bool(&chassis->other_config, "is-interconn", false)) {
-            gw = shash_find_and_delete(&local_gws, chassis->name);
-            if (!gw) {
-                gw = icsbrec_gateway_insert(ctx->ovnisb_txn);
-                icsbrec_gateway_set_availability_zone(gw, az);
-                icsbrec_gateway_set_name(gw, chassis->name);
-                sync_sb_gw_to_isb(ctx, chassis, gw);
-            } else if (is_gateway_data_changed(gw, chassis)) {
-                sync_sb_gw_to_isb(ctx, chassis, gw);
-            }
-        } else if (smap_get_bool(&chassis->other_config, "is-remote", false)) {
-            gw = shash_find_and_delete(&remote_gws, chassis->name);
-            if (!gw) {
-                sbrec_chassis_delete(chassis);
-            } else if (is_gateway_data_changed(gw, chassis)) {
-                sync_isb_gw_to_sb(ctx, gw, chassis);
-            }
-        }
-    }
-
-    /* Delete extra gateways from ISB for the local AZ */
-    struct shash_node *node;
-    SHASH_FOR_EACH (node, &local_gws) {
-        icsbrec_gateway_delete(node->data);
-    }
-    shash_destroy(&local_gws);
-
-    /* Create SB chassis for remote gateways in ISB */
-    SHASH_FOR_EACH (node, &remote_gws) {
-        gw = node->data;
-        chassis = sbrec_chassis_insert(ctx->ovnsb_txn);
-        sbrec_chassis_set_name(chassis, gw->name);
-        sync_isb_gw_to_sb(ctx, gw, chassis);
-    }
-    shash_destroy(&remote_gws);
 }
 
-static const struct nbrec_logical_switch *
+/* Synchronizes transit switches to their AZ NB Logical_Switch mirrors.  When
+ * 'ts_scope' is NULL every transit switch is reconciled (full recompute);
+ * otherwise only the switches named in 'ts_scope' are.  A name still in scope
+ * but no longer present in IC-NB (a deleted switch) is honoured: its mirror
+ * ends up as a garbage-collection leftover and is deleted, matching
+ * full-recompute behaviour.
+ *
+ * 'isb_ts_dps' (the IC-SB Datapath_Binding map keyed by transit-switch name)
+ * is read only, to copy each committed tunnel key into the mirror's
+ * requested-tnl-key.  IC-SB Datapath_Binding creation/keying/GC is owned by
+ * en_tunnel_key, so this function neither allocates keys nor mutates
+ * 'isb_ts_dps'. */
+void
+ts_sync_scope(struct ic_context *ctx, struct shash *isb_ts_dps,
+              const struct sset *ts_scope)
+{
+    bool full = !ts_scope;
+    bool vxlan_mode = ic_ts_compute_vxlan_mode(ctx);
+
+    /* Build the NB Logical_Switch mirror GC set, keyed by transit-switch
+     * name.  Only needed when an NB transaction is available. */
+    struct shash nb_ts_mirrors = SHASH_INITIALIZER(&nb_ts_mirrors);
+    struct shash *nb_gc = NULL;
+    if (ctx->ovnnb_txn) {
+        nb_gc = &nb_ts_mirrors;
+        if (full) {
+            const struct nbrec_logical_switch *ls;
+            NBREC_LOGICAL_SWITCH_FOR_EACH (ls, ctx->ovnnb_idl) {
+                const char *ts_name = smap_get(&ls->other_config,
+                                               "interconn-ts");
+                if (ts_name) {
+                    shash_add(nb_gc, ts_name, ls);
+                }
+            }
+        } else {
+            const char *name;
+            SSET_FOR_EACH (name, ts_scope) {
+                const struct nbrec_logical_switch *ls =
+                    find_ts_in_nb(ctx, CONST_CAST(char *, name));
+                if (ls && !shash_find(nb_gc, name)) {
+                    shash_add(nb_gc, name, ls);
+                }
+            }
+        }
+    }
+
+    const struct icnbrec_transit_switch *ts;
+    ICNBREC_TRANSIT_SWITCH_FOR_EACH (ts, ctx->ovninb_idl) {
+        if (full || sset_contains(ts_scope, ts->name)) {
+            ts_sync_one(ctx, ts, isb_ts_dps, nb_gc, vxlan_mode);
+        }
+    }
+
+    /* Delete extra NB Logical_Switch with other_config:interconn-ts. */
+    if (nb_gc) {
+        struct shash_node *node;
+        SHASH_FOR_EACH (node, nb_gc) {
+            nbrec_logical_switch_delete(node->data);
+        }
+    }
+
+    shash_destroy(&nb_ts_mirrors);
+}
+
+static void
+nb_addr_set_apply_diff(const void *arg, const char *item, bool add)
+{
+    const struct nbrec_address_set *as = arg;
+    if (add) {
+        nbrec_address_set_update_addresses_addvalue(as, item);
+    } else {
+        nbrec_address_set_update_addresses_delvalue(as, item);
+    }
+}
+
+static void
+update_nb_addr_set(struct sset *addrs,
+                   const struct nbrec_address_set *nb_as)
+{
+    struct sorted_array nb_addrs =
+        sorted_array_from_dbrec(nb_as, addresses);
+    struct sorted_array new_addrs = sorted_array_from_sset(addrs);
+    sorted_array_apply_diff(&new_addrs, &nb_addrs,
+                            nb_addr_set_apply_diff, nb_as);
+    sorted_array_destroy(&new_addrs);
+    sorted_array_destroy(&nb_addrs);
+}
+
+static void
+icsb_addr_set_apply_diff(const void *arg, const char *item, bool add)
+{
+    const struct icsbrec_address_set *as = arg;
+    if (add) {
+        icsbrec_address_set_update_addresses_addvalue(as, item);
+    } else {
+        icsbrec_address_set_update_addresses_delvalue(as, item);
+    }
+}
+
+static void
+update_icsb_addr_set(struct sorted_array *nb_addrs,
+                     const struct icsbrec_address_set *icsb_as)
+{
+    struct sorted_array icsb_addrs =
+        sorted_array_from_dbrec(icsb_as, addresses);
+    sorted_array_apply_diff(nb_addrs, &icsb_addrs,
+                            icsb_addr_set_apply_diff, icsb_as);
+    sorted_array_destroy(&icsb_addrs);
+}
+
+static void
+sync_addr_set_to_icsb(struct ovsdb_idl_txn *ovnisb_txn,
+                      const struct sbrec_address_set *sb_as,
+                      const struct icsbrec_address_set *icsb_as,
+                      const struct icsbrec_availability_zone *az)
+{
+    struct sorted_array addrs =
+        sorted_array_from_dbrec(sb_as, addresses);
+    if (!icsb_as) {
+        icsb_as = icsbrec_address_set_insert(ovnisb_txn);
+        icsbrec_address_set_set_name(icsb_as, sb_as->name);
+        icsbrec_address_set_set_availability_zone(icsb_as, az);
+        icsbrec_address_set_set_addresses(icsb_as, addrs.arr, addrs.n);
+    } else {
+        update_icsb_addr_set(&addrs, icsb_as);
+    }
+    sorted_array_destroy(&addrs);
+}
+
+static void
+sync_addr_set_from_icsb(struct ovsdb_idl_txn *ovnnb_txn,
+                        const char *name, struct sset *addrs)
+{
+    struct sorted_array sorted_addrs = sorted_array_from_sset(addrs);
+    struct nbrec_address_set *nb_as = nbrec_address_set_insert(ovnnb_txn);
+    nbrec_address_set_set_name(nb_as, name);
+    nbrec_address_set_update_external_ids_setkey(nb_as, "ic-learnt", "true");
+    nbrec_address_set_set_addresses(nb_as, sorted_addrs.arr, sorted_addrs.n);
+    sorted_array_destroy(&sorted_addrs);
+}
+
+void
+address_set_run(struct ic_context *ctx,
+                const struct icsbrec_availability_zone *runned_az)
+{
+    if (!ctx->ovnisb_unlocked_txn || !ctx->ovnnb_txn || !ctx->ovnsb_txn) {
+        return;
+    }
+
+    struct shash ic_local_as = SHASH_INITIALIZER(&ic_local_as);
+    struct shash ic_remote_as = SHASH_INITIALIZER(&ic_remote_as);
+    const struct icsbrec_address_set *ic_as;
+    ICSBREC_ADDRESS_SET_FOR_EACH (ic_as, ctx->ovnisb_unlocked_idl) {
+        if (ic_as->availability_zone == runned_az) {
+            shash_add(&ic_local_as, ic_as->name, ic_as);
+        } else {
+            /* Merge addresses from all remote AZs that share the same
+             * address-set name into a single sset so that duplicate names
+             * across AZs are aggregated rather than colliding in the shash.
+             */
+            struct sset *addrs = shash_find_data(&ic_remote_as, ic_as->name);
+            if (!addrs) {
+                addrs = xmalloc(sizeof *addrs);
+                sset_init(addrs);
+                shash_add(&ic_remote_as, ic_as->name, addrs);
+            }
+            sset_add_array(addrs, ic_as->addresses, ic_as->n_addresses);
+        }
+    }
+
+    const struct nbrec_nb_global *nb_global =
+        nbrec_nb_global_first(ctx->ovnnb_idl);
+    ovs_assert(nb_global);
+    bool global_learn = smap_get_bool(&nb_global->options, "ic-as-learn",
+                                      false);
+    bool global_adv = smap_get_bool(&nb_global->options, "ic-as-adv", false);
+
+    /* Advertise address set - from SB to IC-SB:
+     * - Each SB address set that needs to be advertised (ic-adv option set),
+     *   check if it is already present in IC-SB. If not, create new entry in
+     *   IC-SB. Otherwise sync addresses from local address set to IC-SB entry.
+     * - Delete extra address sets in IC-SB that were earlier learnt from this
+     *   AZ, but is no longer present, or not enabled for advertisement.
+     */
+    if (global_adv) {
+        const struct sbrec_address_set *sb_as;
+        SBREC_ADDRESS_SET_FOR_EACH (sb_as, ctx->ovnsb_idl) {
+            if (smap_get_bool(&sb_as->options, "ic-adv", false)) {
+                const struct icsbrec_address_set *icsb_as;
+                icsb_as = shash_find_and_delete(&ic_local_as, sb_as->name);
+                sync_addr_set_to_icsb(ctx->ovnisb_unlocked_txn, sb_as, icsb_as,
+                                      runned_az);
+            }
+        }
+    }
+    struct shash_node *node;
+    SHASH_FOR_EACH (node, &ic_local_as) {
+        icsbrec_address_set_delete(node->data);
+    }
+    shash_destroy(&ic_local_as);
+
+    /* Learn address set - from IC-SB to NB:
+     * - For each NB Address set entries that were earlier learnt from IC-SB
+     *   (external-id "ic-learnt" set to true), check if it is still present
+     *   in IC-SB. If not, delete local entry in NB. If yes, sync addresses
+     *   from IC-SB to NB.
+     * - Any remote address sets in IC-SB (AZ not same as local AZ) that is not
+     *   present in local AZ, create local entry in NB with external-id
+     *   "ic-learnt" set to true.
+     */
+    const struct nbrec_address_set *nb_as;
+    NBREC_ADDRESS_SET_FOR_EACH_SAFE (nb_as, ctx->ovnnb_idl) {
+        struct sset *addrs = shash_find_and_delete(&ic_remote_as, nb_as->name);
+        if (smap_get_bool(&nb_as->external_ids, "ic-learnt", false)) {
+            if (!addrs || !global_learn) {
+                nbrec_address_set_delete(nb_as);
+            } else {
+                update_nb_addr_set(addrs, nb_as);
+            }
+        }
+        if (addrs) {
+            sset_destroy(addrs);
+            free(addrs);
+        }
+    }
+
+    if (global_learn) {
+        SHASH_FOR_EACH (node, &ic_remote_as) {
+            /* In case local address-set with same name exists, we
+             * will not overwrite it because such address sets are already
+             * removed from ic_remote_as in the loop above.
+             */
+            sync_addr_set_from_icsb(ctx->ovnnb_txn, node->name, node->data);
+        }
+    }
+    SHASH_FOR_EACH (node, &ic_remote_as) {
+        sset_destroy(node->data);
+        free(node->data);
+    }
+    shash_destroy(&ic_remote_as);
+}
+
+const struct nbrec_logical_switch *
 find_ts_in_nb(struct ic_context *ctx, char *ts_name)
 {
     const struct nbrec_logical_switch *key =
@@ -451,7 +501,7 @@ find_ts_in_nb(struct ic_context *ctx, char *ts_name)
     return NULL;
 }
 
-static const struct sbrec_port_binding *
+const struct sbrec_port_binding *
 find_sb_pb_by_name(struct ovsdb_idl_index *sbrec_port_binding_by_name,
                    const char *name)
 {
@@ -466,56 +516,20 @@ find_sb_pb_by_name(struct ovsdb_idl_index *sbrec_port_binding_by_name,
     return pb;
 }
 
-static const struct sbrec_port_binding *
-find_peer_port(struct ic_context *ctx,
-               const struct sbrec_port_binding *sb_pb)
+const struct nbrec_logical_switch_port *
+get_lsp_by_ts_port_name(struct ic_context *ctx, const char *ts_port_name)
 {
-    const char *peer_name = smap_get(&sb_pb->options, "peer");
-    if (!peer_name) {
-        return NULL;
-    }
+    const struct nbrec_logical_switch_port *lsp, *key;
 
-    return find_sb_pb_by_name(ctx->sbrec_port_binding_by_name, peer_name);
+    key = nbrec_logical_switch_port_index_init_row(ctx->nbrec_port_by_name);
+    nbrec_logical_switch_port_index_set_name(key, ts_port_name);
+    lsp = nbrec_logical_switch_port_index_find(ctx->nbrec_port_by_name, key);
+    nbrec_logical_switch_port_index_destroy_row(key);
+
+    return lsp;
 }
 
-static const struct sbrec_port_binding *
-find_crp_from_lrp(struct ic_context *ctx,
-                  const struct sbrec_port_binding *lrp_pb)
-{
-    char *crp_name = ovn_chassis_redirect_name(lrp_pb->logical_port);
-
-    const struct sbrec_port_binding *pb =
-        find_sb_pb_by_name(ctx->sbrec_port_binding_by_name, crp_name);
-
-    free(crp_name);
-    return pb;
-}
-
-static const struct sbrec_port_binding *
-find_crp_for_sb_pb(struct ic_context *ctx,
-                   const struct sbrec_port_binding *sb_pb)
-{
-    const struct sbrec_port_binding *peer = find_peer_port(ctx, sb_pb);
-    if (!peer) {
-        return NULL;
-    }
-
-    return find_crp_from_lrp(ctx, peer);
-}
-
-static const char *
-get_lrp_address_for_sb_pb(struct ic_context *ctx,
-                          const struct sbrec_port_binding *sb_pb)
-{
-    const struct sbrec_port_binding *peer = find_peer_port(ctx, sb_pb);
-    if (!peer) {
-        return NULL;
-    }
-
-    return peer->n_mac ? *peer->mac : NULL;
-}
-
-static const struct sbrec_chassis *
+const struct sbrec_chassis *
 find_sb_chassis(struct ic_context *ctx, const char *name)
 {
     const struct sbrec_chassis *key =
@@ -529,1264 +543,56 @@ find_sb_chassis(struct ic_context *ctx, const char *name)
     return chassis;
 }
 
-static void
-sync_lsp_tnl_key(const struct nbrec_logical_switch_port *lsp,
-                 int64_t isb_tnl_key)
-{
-    int64_t tnl_key = smap_get_int(&lsp->options, "requested-tnl-key", 0);
-    if (tnl_key != isb_tnl_key) {
-        VLOG_DBG("Set options:requested-tnl-key %"PRId64
-                 " for lsp %s in NB.", isb_tnl_key, lsp->name);
-        char *tnl_key_str = xasprintf("%"PRId64, isb_tnl_key);
-        nbrec_logical_switch_port_update_options_setkey(lsp,
-                                                        "requested-tnl-key",
-                                                        tnl_key_str);
-        free(tnl_key_str);
-    }
-
-}
-
-static bool
-get_router_uuid_by_sb_pb(struct ic_context *ctx,
-                         const struct sbrec_port_binding *sb_pb,
-                         struct uuid *router_uuid)
-{
-    const struct sbrec_port_binding *router_pb = find_peer_port(ctx, sb_pb);
-    if (!router_pb || !router_pb->datapath) {
-        return NULL;
-    }
-
-    return smap_get_uuid(&router_pb->datapath->external_ids, "logical-router",
-                         router_uuid);
-}
-
-static void
-update_isb_pb_external_ids(struct ic_context *ctx,
-                           const struct sbrec_port_binding *sb_pb,
-                           const struct icsbrec_port_binding *isb_pb)
-{
-    struct uuid lr_uuid;
-    if (!get_router_uuid_by_sb_pb(ctx, sb_pb, &lr_uuid)) {
-        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-        VLOG_WARN_RL(&rl, "Can't get router uuid for transit switch port %s.",
-                     isb_pb->logical_port);
-        return;
-    }
-
-    struct uuid current_lr_uuid;
-    if (smap_get_uuid(&isb_pb->external_ids, "router-id", &current_lr_uuid) &&
-        uuid_equals(&lr_uuid, &current_lr_uuid)) {
-        return;
-    }
-
-    char *uuid_s = xasprintf(UUID_FMT, UUID_ARGS(&lr_uuid));
-    icsbrec_port_binding_update_external_ids_setkey(isb_pb, "router-id",
-                                                    uuid_s);
-    free(uuid_s);
-}
-
-/* For each local port:
- *   - Sync from NB to ISB.
- *   - Sync gateway from SB to ISB.
- *   - Sync tunnel key from ISB to NB.
- */
-static void
-sync_local_port(struct ic_context *ctx,
-                const struct icsbrec_port_binding *isb_pb,
-                const struct sbrec_port_binding *sb_pb,
-                const struct nbrec_logical_switch_port *lsp)
-{
-    /* Sync address from NB to ISB */
-    const char *address = get_lrp_address_for_sb_pb(ctx, sb_pb);
-    if (!address) {
-        VLOG_DBG("Can't get logical router port address for logical"
-                 " switch port %s", sb_pb->logical_port);
-        if (isb_pb->address[0]) {
-            icsbrec_port_binding_set_address(isb_pb, "");
-        }
-    } else {
-        if (strcmp(address, isb_pb->address)) {
-            icsbrec_port_binding_set_address(isb_pb, address);
-        }
-    }
-
-    /* Sync gateway from SB to ISB */
-    const struct sbrec_port_binding *crp = find_crp_for_sb_pb(ctx, sb_pb);
-    if (crp && crp->chassis) {
-        if (strcmp(crp->chassis->name, isb_pb->gateway)) {
-            icsbrec_port_binding_set_gateway(isb_pb, crp->chassis->name);
-        }
-    } else {
-        if (isb_pb->gateway[0]) {
-            icsbrec_port_binding_set_gateway(isb_pb, "");
-        }
-    }
-
-    /* Sync external_ids:router-id to ISB */
-    update_isb_pb_external_ids(ctx, sb_pb, isb_pb);
-
-    /* Sync back tunnel key from ISB to NB */
-    sync_lsp_tnl_key(lsp, isb_pb->tunnel_key);
-}
-
-/* For each remote port:
- *   - Sync from ISB to NB
- *   - Sync gateway from ISB to SB
- */
-static void
-sync_remote_port(struct ic_context *ctx,
-                 const struct icsbrec_port_binding *isb_pb,
-                 const struct nbrec_logical_switch_port *lsp,
-                 const struct sbrec_port_binding *sb_pb)
-{
-    /* Sync address from ISB to NB */
-    if (isb_pb->address[0]) {
-        if (lsp->n_addresses != 1 ||
-            strcmp(isb_pb->address, lsp->addresses[0])) {
-            nbrec_logical_switch_port_set_addresses(
-                lsp, (const char **)&isb_pb->address, 1);
-        }
-    } else {
-        if (lsp->n_addresses != 0) {
-            nbrec_logical_switch_port_set_addresses(lsp, NULL, 0);
-        }
-    }
-
-    /* Sync tunnel key from ISB to NB */
-    sync_lsp_tnl_key(lsp, isb_pb->tunnel_key);
-
-    /* Skip port binding if it is already requested by the CMS. */
-    if (smap_get(&lsp->options, "requested-chassis")) {
-        return;
-    }
-
-    /* Sync gateway from ISB to SB */
-    if (isb_pb->gateway[0]) {
-        if (!sb_pb->chassis || strcmp(sb_pb->chassis->name, isb_pb->gateway)) {
-            const struct sbrec_chassis *chassis =
-                find_sb_chassis(ctx, isb_pb->gateway);
-            if (!chassis) {
-                VLOG_DBG("Chassis %s is not found in SB, syncing from ISB "
-                         "to SB skipped for logical port %s.",
-                         isb_pb->gateway, lsp->name);
-                return;
-            }
-            sbrec_port_binding_set_chassis(sb_pb, chassis);
-        }
-    } else {
-        if (sb_pb->chassis) {
-            sbrec_port_binding_set_chassis(sb_pb, NULL);
-        }
-    }
-}
-
-static void
-create_nb_lsp(struct ic_context *ctx,
-              const struct icsbrec_port_binding *isb_pb,
-              const struct nbrec_logical_switch *ls)
-{
-    const struct nbrec_logical_switch_port *lsp =
-        nbrec_logical_switch_port_insert(ctx->ovnnb_txn);
-    nbrec_logical_switch_port_set_name(lsp, isb_pb->logical_port);
-    nbrec_logical_switch_port_set_type(lsp, "remote");
-
-    bool up = true;
-    nbrec_logical_switch_port_set_up(lsp, &up, 1);
-
-    if (isb_pb->address[0]) {
-        nbrec_logical_switch_port_set_addresses(
-            lsp, (const char **)&isb_pb->address, 1);
-    }
-    sync_lsp_tnl_key(lsp, isb_pb->tunnel_key);
-    nbrec_logical_switch_update_ports_addvalue(ls, lsp);
-}
-
-static void
-create_isb_pb(struct ic_context *ctx,
-              const struct sbrec_port_binding *sb_pb,
-              const struct icsbrec_availability_zone *az,
-              const char *ts_name,
-              uint32_t pb_tnl_key)
-{
-    const struct icsbrec_port_binding *isb_pb =
-        icsbrec_port_binding_insert(ctx->ovnisb_txn);
-    icsbrec_port_binding_set_availability_zone(isb_pb, az);
-    icsbrec_port_binding_set_transit_switch(isb_pb, ts_name);
-    icsbrec_port_binding_set_logical_port(isb_pb, sb_pb->logical_port);
-    icsbrec_port_binding_set_tunnel_key(isb_pb, pb_tnl_key);
-
-    const char *address = get_lrp_address_for_sb_pb(ctx, sb_pb);
-    if (address) {
-        icsbrec_port_binding_set_address(isb_pb, address);
-    }
-
-    const struct sbrec_port_binding *crp = find_crp_for_sb_pb(ctx, sb_pb);
-    if (crp && crp->chassis) {
-        icsbrec_port_binding_set_gateway(isb_pb, crp->chassis->name);
-    }
-
-    update_isb_pb_external_ids(ctx, sb_pb, isb_pb);
-
-    /* XXX: Sync encap so that multiple encaps can be used for the same
-     * gateway.  However, it is not needed for now, since we don't yet
-     * support specifying encap type/ip for gateway chassis or ha-chassis
-     * for logical router port in NB DB, and now encap should always be
-     * empty.  The sync can be added if we add such support for gateway
-     * chassis/ha-chassis in NB DB. */
-}
-
-static const struct sbrec_port_binding *
-find_lsp_in_sb(struct ic_context *ctx,
-               const struct nbrec_logical_switch_port *lsp)
-{
-    return find_sb_pb_by_name(ctx->sbrec_port_binding_by_name, lsp->name);
-}
-
-static uint32_t
-allocate_port_key(struct hmap *pb_tnlids)
-{
-    static uint32_t hint;
-    return ovn_allocate_tnlid(pb_tnlids, "transit port",
-                              1, (1u << 15) - 1, &hint);
-}
-
-static void
-port_binding_run(struct ic_context *ctx,
-                 const struct icsbrec_availability_zone *az)
-{
-    if (!ctx->ovnisb_txn || !ctx->ovnnb_txn || !ctx->ovnsb_txn) {
-        return;
-    }
-
-    struct shash isb_all_local_pbs = SHASH_INITIALIZER(&isb_all_local_pbs);
-    struct shash_node *node;
-
-    const struct icsbrec_port_binding *isb_pb;
-    const struct icsbrec_port_binding *isb_pb_key =
-        icsbrec_port_binding_index_init_row(ctx->icsbrec_port_binding_by_az);
-    icsbrec_port_binding_index_set_availability_zone(isb_pb_key, az);
-
-    ICSBREC_PORT_BINDING_FOR_EACH_EQUAL (isb_pb, isb_pb_key,
-                                         ctx->icsbrec_port_binding_by_az) {
-        shash_add(&isb_all_local_pbs, isb_pb->logical_port, isb_pb);
-    }
-    icsbrec_port_binding_index_destroy_row(isb_pb_key);
-
-    const struct sbrec_port_binding *sb_pb;
-    const struct icnbrec_transit_switch *ts;
-    ICNBREC_TRANSIT_SWITCH_FOR_EACH (ts, ctx->ovninb_idl) {
-        const struct nbrec_logical_switch *ls = find_ts_in_nb(ctx, ts->name);
-        if (!ls) {
-            VLOG_DBG("Transit switch %s not found in NB.", ts->name);
-            continue;
-        }
-        struct shash local_pbs = SHASH_INITIALIZER(&local_pbs);
-        struct shash remote_pbs = SHASH_INITIALIZER(&remote_pbs);
-        struct hmap pb_tnlids = HMAP_INITIALIZER(&pb_tnlids);
-        isb_pb_key = icsbrec_port_binding_index_init_row(
-            ctx->icsbrec_port_binding_by_ts);
-        icsbrec_port_binding_index_set_transit_switch(isb_pb_key, ts->name);
-
-        ICSBREC_PORT_BINDING_FOR_EACH_EQUAL (isb_pb, isb_pb_key,
-                                             ctx->icsbrec_port_binding_by_ts) {
-            if (isb_pb->availability_zone == az) {
-                shash_add(&local_pbs, isb_pb->logical_port, isb_pb);
-                shash_find_and_delete(&isb_all_local_pbs,
-                                      isb_pb->logical_port);
-            } else {
-                shash_add(&remote_pbs, isb_pb->logical_port, isb_pb);
-            }
-            ovn_add_tnlid(&pb_tnlids, isb_pb->tunnel_key);
-        }
-        icsbrec_port_binding_index_destroy_row(isb_pb_key);
-
-        const struct nbrec_logical_switch_port *lsp;
-        for (int i = 0; i < ls->n_ports; i++) {
-            lsp = ls->ports[i];
-
-            if (!strcmp(lsp->type, "router")) {
-                /* The port is local. */
-                sb_pb = find_lsp_in_sb(ctx, lsp);
-                if (!sb_pb) {
-                    continue;
-                }
-                isb_pb = shash_find_and_delete(&local_pbs, lsp->name);
-                if (!isb_pb) {
-                    uint32_t pb_tnl_key = allocate_port_key(&pb_tnlids);
-                    create_isb_pb(ctx, sb_pb, az, ts->name, pb_tnl_key);
-                } else {
-                    sync_local_port(ctx, isb_pb, sb_pb, lsp);
-                }
-            } else if (!strcmp(lsp->type, "remote")) {
-                /* The port is remote. */
-                isb_pb = shash_find_and_delete(&remote_pbs, lsp->name);
-                if (!isb_pb) {
-                    nbrec_logical_switch_update_ports_delvalue(ls, lsp);
-                } else {
-                    sb_pb = find_lsp_in_sb(ctx, lsp);
-                    if (!sb_pb) {
-                        continue;
-                    }
-                    sync_remote_port(ctx, isb_pb, lsp, sb_pb);
-                }
-            } else {
-                VLOG_DBG("Ignore lsp %s on ts %s with type %s.",
-                         lsp->name, ts->name, lsp->type);
-            }
-        }
-
-        /* Delete extra port-binding from ISB */
-        SHASH_FOR_EACH (node, &local_pbs) {
-            icsbrec_port_binding_delete(node->data);
-        }
-
-        /* Create lsp in NB for remote ports */
-        SHASH_FOR_EACH (node, &remote_pbs) {
-            create_nb_lsp(ctx, node->data, ls);
-        }
-
-        shash_destroy(&local_pbs);
-        shash_destroy(&remote_pbs);
-        ovn_destroy_tnlids(&pb_tnlids);
-    }
-
-    SHASH_FOR_EACH (node, &isb_all_local_pbs) {
-        icsbrec_port_binding_delete(node->data);
-    }
-
-    shash_destroy(&isb_all_local_pbs);
-}
-
-struct ic_router_info {
-    struct hmap_node node;
-    const struct nbrec_logical_router *lr; /* key of hmap */
-    const struct icsbrec_port_binding **isb_pbs;
-    size_t n_isb_pbs;
-    size_t n_allocated_isb_pbs;
-    struct hmap routes_learned;
-};
-
-/* Represents an interconnection route entry. */
-struct ic_route_info {
-    struct hmap_node node;
-    struct in6_addr prefix;
-    unsigned int plen;
-    struct in6_addr nexthop;
-    const char *origin;
-    const char *route_table;
-
-    const struct nbrec_logical_router *nb_lr;
-
-    /* Either nb_route or nb_lrp is set and the other one must be NULL.
-     * - For a route that is learned from IC-SB, or a static route that is
-     *   generated from a route that is configured in NB, the "nb_route"
-     *   is set.
-     * - For a route that is generated from a direct-connect subnet of
-     *   a logical router port, the "nb_lrp" is set. */
-    const struct nbrec_logical_router_static_route *nb_route;
-    const struct nbrec_logical_router_port *nb_lrp;
-};
-
-static uint32_t
-ic_route_hash(const struct in6_addr *prefix, unsigned int plen,
-              const struct in6_addr *nexthop, const char *origin,
-              const char *route_table)
-{
-    uint32_t basis = hash_bytes(prefix, sizeof *prefix, (uint32_t)plen);
-    basis = hash_string(origin, basis);
-    basis = hash_string(route_table, basis);
-    return hash_bytes(nexthop, sizeof *nexthop, basis);
-}
-
-static struct ic_route_info *
-ic_route_find(struct hmap *routes, const struct in6_addr *prefix,
-              unsigned int plen, const struct in6_addr *nexthop,
-              const char *origin, const char *route_table, uint32_t hash)
-{
-    struct ic_route_info *r;
-    if (!hash) {
-        hash = ic_route_hash(prefix, plen, nexthop, origin, route_table);
-    }
-    HMAP_FOR_EACH_WITH_HASH (r, node, hash, routes) {
-        if (ipv6_addr_equals(&r->prefix, prefix) &&
-            r->plen == plen &&
-            ipv6_addr_equals(&r->nexthop, nexthop) &&
-            !strcmp(r->origin, origin) &&
-            !strcmp(r->route_table ? r->route_table : "", route_table)) {
-            return r;
-        }
-    }
-    return NULL;
-}
-
-static struct ic_router_info *
-ic_router_find(struct hmap *ic_lrs, const struct nbrec_logical_router *lr)
-{
-    struct ic_router_info *ic_lr;
-    HMAP_FOR_EACH_WITH_HASH (ic_lr, node, uuid_hash(&lr->header_.uuid),
-                             ic_lrs) {
-        if (ic_lr->lr == lr) {
-           return ic_lr;
-        }
-    }
-    return NULL;
-}
-
-static bool
-parse_route(const char *s_prefix, const char *s_nexthop,
-            struct in6_addr *prefix, unsigned int *plen,
-            struct in6_addr *nexthop)
-{
-    if (!ip46_parse_cidr(s_prefix, prefix, plen)) {
-        return false;
-    }
-
-    unsigned int nlen;
-    if (!ip46_parse_cidr(s_nexthop, nexthop, &nlen)) {
-        return false;
-    }
-
-    /* Do not learn routes with link-local next hop. */
-    return !in6_is_lla(nexthop);
-}
-
-/* Return false if can't be added due to bad format. */
-static bool
-add_to_routes_learned(struct hmap *routes_learned,
-                      const struct nbrec_logical_router_static_route *nb_route,
-                      const struct nbrec_logical_router *nb_lr)
-{
-    struct in6_addr prefix, nexthop;
-    unsigned int plen;
-    if (!parse_route(nb_route->ip_prefix, nb_route->nexthop,
-                     &prefix, &plen, &nexthop)) {
-        return false;
-    }
-    const char *origin = smap_get_def(&nb_route->options, "origin", "");
-    if (ic_route_find(routes_learned, &prefix, plen, &nexthop, origin,
-                      nb_route->route_table, 0)) {
-        /* Route was added to learned on previous iteration. */
-        return true;
-    }
-
-    struct ic_route_info *ic_route = xzalloc(sizeof *ic_route);
-    ic_route->prefix = prefix;
-    ic_route->plen = plen;
-    ic_route->nexthop = nexthop;
-    ic_route->nb_route = nb_route;
-    ic_route->origin = origin;
-    ic_route->route_table = nb_route->route_table;
-    ic_route->nb_lr = nb_lr;
-    hmap_insert(routes_learned, &ic_route->node,
-                ic_route_hash(&prefix, plen, &nexthop, origin,
-                              nb_route->route_table));
-    return true;
-}
-
-static bool
-get_nexthop_from_lport_addresses(bool is_v4,
-                                 const struct lport_addresses *laddr,
-                                 struct in6_addr *nexthop)
-{
-    if (is_v4) {
-        if (!laddr->n_ipv4_addrs) {
-            return false;
-        }
-        in6_addr_set_mapped_ipv4(nexthop, laddr->ipv4_addrs[0].addr);
-        return true;
-    }
-
-    /* ipv6 */
-    if (laddr->n_ipv6_addrs) {
-        *nexthop = laddr->ipv6_addrs[0].addr;
-        return true;
-    }
-
-    /* ipv6 link local */
-    in6_generate_lla(laddr->ea, nexthop);
-    return true;
-}
-
-static bool
-prefix_is_link_local(struct in6_addr *prefix, unsigned int plen)
-{
-    if (IN6_IS_ADDR_V4MAPPED(prefix)) {
-        /* Link local range is "169.254.0.0/16". */
-        if (plen < 16) {
-            return false;
-        }
-        ovs_be32 lla;
-        inet_pton(AF_INET, "169.254.0.0", &lla);
-        return ((in6_addr_get_mapped_ipv4(prefix) & htonl(0xffff0000)) == lla);
-    }
-
-    /* ipv6, link local range is "fe80::/10". */
-    if (plen < 10) {
-        return false;
-    }
-    return (((prefix->s6_addr[0] & 0xff) == 0xfe) &&
-            ((prefix->s6_addr[1] & 0xc0) == 0x80));
-}
-
-static bool
-prefix_is_black_listed(const struct smap *nb_options,
-                       struct in6_addr *prefix,
-                       unsigned int plen)
-{
-    const char *blacklist = smap_get(nb_options, "ic-route-blacklist");
-    if (!blacklist || !blacklist[0]) {
-        return false;
-    }
-    struct in6_addr bl_prefix;
-    unsigned int bl_plen;
-    char *cur, *next, *start;
-    next = start = xstrdup(blacklist);
-    bool matched = false;
-    while ((cur = strsep(&next, ",")) && *cur) {
-        if (!ip46_parse_cidr(cur, &bl_prefix, &bl_plen)) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-            VLOG_WARN_RL(&rl, "Bad format in nb_global options:"
-                         "ic-route-blacklist: %s. CIDR expected.", cur);
-            continue;
-        }
-
-        if (IN6_IS_ADDR_V4MAPPED(&bl_prefix) != IN6_IS_ADDR_V4MAPPED(prefix)) {
-            continue;
-        }
-
-        /* 192.168.0.0/16 does not belong to 192.168.0.0/17 */
-        if (plen < bl_plen) {
-            continue;
-        }
-
-        if (IN6_IS_ADDR_V4MAPPED(prefix)) {
-            ovs_be32 bl_prefix_v4 = in6_addr_get_mapped_ipv4(&bl_prefix);
-            ovs_be32 prefix_v4 = in6_addr_get_mapped_ipv4(prefix);
-            ovs_be32 mask = be32_prefix_mask(bl_plen);
-
-            if ((prefix_v4 & mask) != (bl_prefix_v4 & mask)) {
-                continue;
-            }
-        } else {
-            struct in6_addr mask = ipv6_create_mask(plen);
-            /* First calculate the difference between bl_prefix and prefix, so
-             * use the bl mask to ensure prefixes are correctly validated.
-             * e.g.: 2005:1734:5678::/50 is a subnet of 2005:1234::/21 */
-            struct in6_addr m_prefixes = ipv6_addr_bitand(prefix, &bl_prefix);
-            struct in6_addr m_prefix = ipv6_addr_bitand(&m_prefixes, &mask);
-            struct in6_addr m_bl_prefix = ipv6_addr_bitand(&bl_prefix, &mask);
-            if (!ipv6_addr_equals(&m_prefix, &m_bl_prefix)) {
-                continue;
-            }
-        }
-        matched = true;
-        break;
-    }
-    free(start);
-    return matched;
-}
-
-static bool
-route_need_advertise(const char *policy,
-                     struct in6_addr *prefix,
-                     unsigned int plen,
-                     const struct smap *nb_options)
-{
-    if (!smap_get_bool(nb_options, "ic-route-adv", false)) {
-        return false;
-    }
-
-    if (plen == 0 &&
-        !smap_get_bool(nb_options, "ic-route-adv-default", false)) {
-        return false;
-    }
-
-    if (policy && !strcmp(policy, "src-ip")) {
-        return false;
-    }
-
-    if (prefix_is_link_local(prefix, plen)) {
-        return false;
-    }
-
-    if (prefix_is_black_listed(nb_options, prefix, plen)) {
-        return false;
-    }
-    return true;
-}
-
-static void
-add_to_routes_ad(struct hmap *routes_ad, const struct in6_addr prefix,
-                 unsigned int plen, const struct in6_addr nexthop,
-                 const char *origin, const char *route_table,
-                 const struct nbrec_logical_router_port *nb_lrp,
-                 const struct nbrec_logical_router_static_route *nb_route,
-                 const struct nbrec_logical_router *nb_lr)
-{
-    if (route_table == NULL) {
-        route_table = "";
-    }
-
-    uint hash = ic_route_hash(&prefix, plen, &nexthop, origin, route_table);
-
-    if (!ic_route_find(routes_ad, &prefix, plen, &nexthop, origin, route_table,
-                       hash)) {
-        struct ic_route_info *ic_route = xzalloc(sizeof *ic_route);
-        ic_route->prefix = prefix;
-        ic_route->plen = plen;
-        ic_route->nexthop = nexthop;
-        ic_route->nb_route = nb_route;
-        ic_route->origin = origin;
-        ic_route->route_table = route_table;
-        ic_route->nb_lrp = nb_lrp;
-        ic_route->nb_lr = nb_lr;
-        hmap_insert(routes_ad, &ic_route->node, hash);
-    } else {
-        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-        VLOG_WARN_RL(&rl, "Duplicate route advertisement was suppressed! NB "
-                     "route uuid: "UUID_FMT,
-                     UUID_ARGS(&nb_route->header_.uuid));
-    }
-}
-
-static void
-add_static_to_routes_ad(
-    struct hmap *routes_ad,
-    const struct nbrec_logical_router_static_route *nb_route,
-    const struct nbrec_logical_router *nb_lr,
-    const struct lport_addresses *nexthop_addresses,
-    const struct smap *nb_options)
-{
-    struct in6_addr prefix, nexthop;
-    unsigned int plen;
-    if (!parse_route(nb_route->ip_prefix, nb_route->nexthop,
-                     &prefix, &plen, &nexthop)) {
-        return;
-    }
-
-    if (!route_need_advertise(nb_route->policy, &prefix, plen, nb_options)) {
-        return;
-    }
-
-    if (!get_nexthop_from_lport_addresses(IN6_IS_ADDR_V4MAPPED(&prefix),
-                                          nexthop_addresses,
-                                          &nexthop)) {
-        return;
-    }
-
-    if (VLOG_IS_DBG_ENABLED()) {
-        struct ds msg = DS_EMPTY_INITIALIZER;
-
-        ds_put_format(&msg, "Advertising static route: %s -> %s, ic nexthop: ",
-                      nb_route->ip_prefix, nb_route->nexthop);
-
-        if (IN6_IS_ADDR_V4MAPPED(&nexthop)) {
-            ds_put_format(&msg, IP_FMT,
-                          IP_ARGS(in6_addr_get_mapped_ipv4(&nexthop)));
-        } else {
-            ipv6_format_addr(&nexthop, &msg);
-        }
-
-        ds_put_format(&msg, ", route_table: %s", nb_route->route_table[0]
-                                                 ? nb_route->route_table
-                                                 : "<main>");
-
-        VLOG_DBG("%s", ds_cstr(&msg));
-        ds_destroy(&msg);
-    }
-
-    add_to_routes_ad(routes_ad, prefix, plen, nexthop, ROUTE_ORIGIN_STATIC,
-                     nb_route->route_table, NULL, nb_route, nb_lr);
-}
-
-static void
-add_network_to_routes_ad(struct hmap *routes_ad, const char *network,
-                         const struct nbrec_logical_router_port *nb_lrp,
-                         const struct lport_addresses *nexthop_addresses,
-                         const struct smap *nb_options,
-                         const struct nbrec_logical_router *nb_lr)
-{
-    struct in6_addr prefix, nexthop;
-    unsigned int plen;
-    if (!ip46_parse_cidr(network, &prefix, &plen)) {
-        return;
-    }
-
-    if (!route_need_advertise(NULL, &prefix, plen, nb_options)) {
-        VLOG_DBG("Route ad: skip network %s of lrp %s.",
-                 network, nb_lrp->name);
-        return;
-    }
-
-    if (!get_nexthop_from_lport_addresses(IN6_IS_ADDR_V4MAPPED(&prefix),
-                                          nexthop_addresses,
-                                          &nexthop)) {
-        return;
-    }
-
-    if (VLOG_IS_DBG_ENABLED()) {
-        struct ds msg = DS_EMPTY_INITIALIZER;
-
-        ds_put_format(&msg, "Adding direct network route to <main> routing "
-                      "table: %s of lrp %s, nexthop ", network, nb_lrp->name);
-
-        if (IN6_IS_ADDR_V4MAPPED(&nexthop)) {
-            ds_put_format(&msg, IP_FMT,
-                          IP_ARGS(in6_addr_get_mapped_ipv4(&nexthop)));
-        } else {
-            ipv6_format_addr(&nexthop, &msg);
-        }
-
-        VLOG_DBG("%s", ds_cstr(&msg));
-        ds_destroy(&msg);
-    }
-
-    /* directly-connected routes go to <main> route table */
-    add_to_routes_ad(routes_ad, prefix, plen, nexthop, ROUTE_ORIGIN_CONNECTED,
-                     NULL, nb_lrp, NULL, nb_lr);
-}
-
-static bool
-route_has_local_gw(const struct nbrec_logical_router *lr,
-                   const char *route_table, const char *ip_prefix) {
-
-    const struct nbrec_logical_router_static_route *route;
-    for (int i = 0; i < lr->n_static_routes; i++) {
-        route = lr->static_routes[i];
-        if (!smap_get(&route->external_ids, "ic-learned-route") &&
-            !strcmp(route->route_table, route_table) &&
-            !strcmp(route->ip_prefix, ip_prefix)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool
-route_need_learn(const struct nbrec_logical_router *lr,
-                 const struct icsbrec_route *isb_route,
-                 struct in6_addr *prefix, unsigned int plen,
-                 const struct smap *nb_options)
-{
-    if (!smap_get_bool(nb_options, "ic-route-learn", false)) {
-        return false;
-    }
-
-    if (plen == 0 &&
-        !smap_get_bool(nb_options, "ic-route-learn-default", false)) {
-        return false;
-    }
-
-    if (prefix_is_link_local(prefix, plen)) {
-        return false;
-    }
-
-    if (prefix_is_black_listed(nb_options, prefix, plen)) {
-        return false;
-    }
-
-    if (route_has_local_gw(lr, isb_route->route_table, isb_route->ip_prefix)) {
-        VLOG_DBG("Skip learning %s (rtb:%s) route, as we've got one with "
-                 "local GW", isb_route->ip_prefix, isb_route->route_table);
-        return false;
-    }
-
-    return true;
-}
-
-static const char *
-get_lrp_name_by_ts_port_name(struct ic_context *ctx, const char *ts_port_name)
-{
-    const struct nbrec_logical_switch_port *nb_lsp;
-    const struct nbrec_logical_switch_port *nb_lsp_key =
-        nbrec_logical_switch_port_index_init_row(ctx->nbrec_port_by_name);
-    nbrec_logical_switch_port_index_set_name(nb_lsp_key, ts_port_name);
-    nb_lsp = nbrec_logical_switch_port_index_find(ctx->nbrec_port_by_name,
-                                                  nb_lsp_key);
-    nbrec_logical_switch_port_index_destroy_row(nb_lsp_key);
-
-    if (!nb_lsp) {
-        return NULL;
-    }
-
-    return smap_get(&nb_lsp->options, "router-port");
-}
-
-static const char *
-get_route_table_by_lrp_name(struct ic_context *ctx, const char *lrp_name)
+const struct nbrec_logical_router_port *
+get_lrp_by_lrp_name(struct ic_context *ctx, const char *lrp_name)
 {
     const struct nbrec_logical_router_port *lrp;
     const struct nbrec_logical_router_port *lrp_key =
         nbrec_logical_router_port_index_init_row(ctx->nbrec_lrp_by_name);
     nbrec_logical_router_port_index_set_name(lrp_key, lrp_name);
-    lrp = nbrec_logical_router_port_index_find(ctx->nbrec_lrp_by_name,
-                                               lrp_key);
+    lrp =
+        nbrec_logical_router_port_index_find(ctx->nbrec_lrp_by_name, lrp_key);
     nbrec_logical_router_port_index_destroy_row(lrp_key);
 
-    if (lrp) {
-        return smap_get_def(&lrp->options, "route_table", "");
-    }
-    return "";  /* <main> route table */
+    return lrp;
 }
 
-static bool
-lrp_is_ts_port(struct ic_context *ctx, struct ic_router_info *ic_lr,
-               const char *lrp_name)
+/* Build once per handler invocation, a map from every NB
+ * transit-switch-mirror port name to its transit switch name, by walking the
+ * logical switches directly.  This replaces the previous reverse lookup that
+ * scanned every transit switch (with a per-switch index lookup) for each
+ * changed port -- an O(changed-ports x transit-switches) cost that dominated
+ * the profile (json_string / skiplist / compare_3way) and blocked the main
+ * loop for minutes at large fan-out.  The values point into IDL-owned smaps
+ * and are valid for the lifetime of the map; destroy with shash_destroy(). */
+void
+port_binding_lsp_ts_map_init(struct ic_context *ctx, struct shash *map)
 {
-    const struct icsbrec_port_binding *isb_pb;
-    const char *ts_lrp_name;
-    for (int i = 0; i < ic_lr->n_isb_pbs; i++) {
-        isb_pb = ic_lr->isb_pbs[i];
-        ts_lrp_name = get_lrp_name_by_ts_port_name(ctx, isb_pb->logical_port);
-        if (!strcmp(ts_lrp_name, lrp_name)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static void
-sync_learned_routes(struct ic_context *ctx,
-                    struct ic_router_info *ic_lr)
-{
-    ovs_assert(ctx->ovnnb_txn);
-    const struct icsbrec_route *isb_route, *isb_route_key;
-
-    const struct nbrec_nb_global *nb_global =
-        nbrec_nb_global_first(ctx->ovnnb_idl);
-    ovs_assert(nb_global);
-
-    const char *lrp_name, *ts_route_table;
-    const struct icsbrec_port_binding *isb_pb;
-    for (int i = 0; i < ic_lr->n_isb_pbs; i++) {
-        isb_pb = ic_lr->isb_pbs[i];
-        lrp_name = get_lrp_name_by_ts_port_name(ctx, isb_pb->logical_port);
-        ts_route_table = get_route_table_by_lrp_name(ctx, lrp_name);
-
-        isb_route_key = icsbrec_route_index_init_row(ctx->icsbrec_route_by_ts);
-        icsbrec_route_index_set_transit_switch(isb_route_key,
-                                               isb_pb->transit_switch);
-
-        ICSBREC_ROUTE_FOR_EACH_EQUAL (isb_route, isb_route_key,
-                                      ctx->icsbrec_route_by_ts) {
-            const char *lr_id = smap_get(&isb_route->external_ids, "lr-id");
-            if (lr_id == NULL) {
-                continue;
-            }
-            struct uuid lr_uuid;
-            if (!uuid_from_string(&lr_uuid, lr_id)) {
-                continue;
-            }
-            if (uuid_equals(&ic_lr->lr->header_.uuid, &lr_uuid)) {
-                continue;
-            }
-
-            if (isb_route->route_table[0] &&
-                strcmp(isb_route->route_table, ts_route_table)) {
-                if (VLOG_IS_DBG_ENABLED()) {
-                    VLOG_DBG("Skip learning static route %s -> %s as either "
-                             "its route table %s != %s of TS port or ",
-                             isb_route->ip_prefix, isb_route->nexthop,
-                             isb_route->route_table, ts_route_table);
-                }
-                continue;
-            }
-
-            struct in6_addr prefix, nexthop;
-            unsigned int plen;
-            if (!parse_route(isb_route->ip_prefix, isb_route->nexthop,
-                             &prefix, &plen, &nexthop)) {
-                static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-                VLOG_WARN_RL(&rl, "Bad route format in IC-SB: %s -> %s. "
-                             "Ignored.", isb_route->ip_prefix,
-                             isb_route->nexthop);
-                continue;
-            }
-            if (!route_need_learn(ic_lr->lr, isb_route, &prefix, plen,
-                                  &nb_global->options)) {
-                continue;
-            }
-
-            struct ic_route_info *route_learned
-                = ic_route_find(&ic_lr->routes_learned, &prefix, plen,
-                                &nexthop, isb_route->origin,
-                                isb_route->route_table, 0);
-            if (route_learned) {
-                /* Sync external-ids */
-                struct uuid ext_id;
-                smap_get_uuid(&route_learned->nb_route->external_ids,
-                              "ic-learned-route", &ext_id);
-                if (!uuid_equals(&ext_id, &isb_route->header_.uuid)) {
-                    char *uuid_s =
-                        xasprintf(UUID_FMT,
-                                  UUID_ARGS(&isb_route->header_.uuid));
-                    nbrec_logical_router_static_route_update_external_ids_setkey(
-                        route_learned->nb_route, "ic-learned-route", uuid_s);
-                    free(uuid_s);
-                }
-                hmap_remove(&ic_lr->routes_learned, &route_learned->node);
-                free(route_learned);
-            } else {
-                /* Create the missing route in NB. */
-                const struct nbrec_logical_router_static_route *nb_route =
-                    nbrec_logical_router_static_route_insert(ctx->ovnnb_txn);
-                nbrec_logical_router_static_route_set_ip_prefix(nb_route,
-                    isb_route->ip_prefix);
-                nbrec_logical_router_static_route_set_nexthop(nb_route,
-                    isb_route->nexthop);
-                char *uuid_s = xasprintf(UUID_FMT,
-                                         UUID_ARGS(&isb_route->header_.uuid));
-                nbrec_logical_router_static_route_set_route_table(nb_route,
-                    isb_route->route_table);
-                nbrec_logical_router_static_route_update_external_ids_setkey(
-                    nb_route, "ic-learned-route", uuid_s);
-                nbrec_logical_router_static_route_update_options_setkey(
-                    nb_route, "origin", isb_route->origin);
-                free(uuid_s);
-                nbrec_logical_router_update_static_routes_addvalue(ic_lr->lr,
-                    nb_route);
-            }
-        }
-        icsbrec_route_index_destroy_row(isb_route_key);
-    }
-
-    /* Delete extra learned routes. */
-    struct ic_route_info *route_learned;
-    HMAP_FOR_EACH_SAFE (route_learned, node, &ic_lr->routes_learned) {
-        VLOG_DBG("Delete route %s -> %s that is not in IC-SB from NB.",
-                 route_learned->nb_route->ip_prefix,
-                 route_learned->nb_route->nexthop);
-        nbrec_logical_router_update_static_routes_delvalue(
-            ic_lr->lr, route_learned->nb_route);
-        hmap_remove(&ic_lr->routes_learned, &route_learned->node);
-        free(route_learned);
-    }
-}
-
-static void
-ad_route_sync_external_ids(const struct ic_route_info *route_adv,
-                           const struct icsbrec_route *isb_route)
-{
-    struct uuid isb_ext_id, nb_id, isb_ext_lr_id, lr_id;
-    smap_get_uuid(&isb_route->external_ids, "nb-id", &isb_ext_id);
-    smap_get_uuid(&isb_route->external_ids, "lr-id", &isb_ext_lr_id);
-    nb_id = route_adv->nb_route ? route_adv->nb_route->header_.uuid
-                               : route_adv->nb_lrp->header_.uuid;
-    lr_id = route_adv->nb_lr->header_.uuid;
-    if (!uuid_equals(&isb_ext_id, &nb_id)) {
-        char *uuid_s = xasprintf(UUID_FMT, UUID_ARGS(&nb_id));
-        icsbrec_route_update_external_ids_setkey(isb_route, "nb-id",
-                                                 uuid_s);
-        free(uuid_s);
-    }
-    if (!uuid_equals(&isb_ext_lr_id, &lr_id)) {
-        char *uuid_s = xasprintf(UUID_FMT, UUID_ARGS(&lr_id));
-        icsbrec_route_update_external_ids_setkey(isb_route, "lr-id",
-                                                 uuid_s);
-        free(uuid_s);
-    }
-}
-
-/* Sync routes from routes_ad to IC-SB. */
-static void
-advertise_routes(struct ic_context *ctx,
-                 const struct icsbrec_availability_zone *az,
-                 const char *ts_name,
-                 struct hmap *routes_ad)
-{
-    ovs_assert(ctx->ovnisb_txn);
-    const struct icsbrec_route *isb_route;
-    const struct icsbrec_route *isb_route_key =
-        icsbrec_route_index_init_row(ctx->icsbrec_route_by_ts_az);
-    icsbrec_route_index_set_transit_switch(isb_route_key, ts_name);
-    icsbrec_route_index_set_availability_zone(isb_route_key, az);
-
-    ICSBREC_ROUTE_FOR_EACH_EQUAL (isb_route, isb_route_key,
-                                  ctx->icsbrec_route_by_ts_az) {
-        struct in6_addr prefix, nexthop;
-        unsigned int plen;
-
-        if (!parse_route(isb_route->ip_prefix, isb_route->nexthop,
-                         &prefix, &plen, &nexthop)) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-            VLOG_WARN_RL(&rl, "Bad route format in IC-SB: %s -> %s. "
-                         "Delete it.",
-                         isb_route->ip_prefix, isb_route->nexthop);
-            icsbrec_route_delete(isb_route);
+    shash_init(map);
+    const struct nbrec_logical_switch *ls;
+    NBREC_LOGICAL_SWITCH_FOR_EACH (ls, ctx->ovnnb_idl) {
+        const char *ts_name = smap_get(&ls->other_config, "interconn-ts");
+        if (!ts_name) {
             continue;
         }
-        struct ic_route_info *route_adv =
-            ic_route_find(routes_ad, &prefix, plen, &nexthop,
-                          isb_route->origin, isb_route->route_table, 0);
-        if (!route_adv) {
-            /* Delete the extra route from IC-SB. */
-            VLOG_DBG("Delete route %s -> %s from IC-SB, which is not found"
-                     " in local routes to be advertised.",
-                     isb_route->ip_prefix, isb_route->nexthop);
-            icsbrec_route_delete(isb_route);
-        } else {
-            ad_route_sync_external_ids(route_adv, isb_route);
-
-            hmap_remove(routes_ad, &route_adv->node);
-            free(route_adv);
-        }
-    }
-    icsbrec_route_index_destroy_row(isb_route_key);
-
-    /* Create the missing routes in IC-SB */
-    struct ic_route_info *route_adv;
-    HMAP_FOR_EACH_SAFE (route_adv, node, routes_ad) {
-        isb_route = icsbrec_route_insert(ctx->ovnisb_txn);
-        icsbrec_route_set_transit_switch(isb_route, ts_name);
-        icsbrec_route_set_availability_zone(isb_route, az);
-
-        char *prefix_s, *nexthop_s;
-        if (IN6_IS_ADDR_V4MAPPED(&route_adv->prefix)) {
-            ovs_be32 ipv4 = in6_addr_get_mapped_ipv4(&route_adv->prefix);
-            ovs_be32 nh = in6_addr_get_mapped_ipv4(&route_adv->nexthop);
-            prefix_s = xasprintf(IP_FMT "/%d", IP_ARGS(ipv4), route_adv->plen);
-            nexthop_s = xasprintf(IP_FMT, IP_ARGS(nh));
-        } else {
-            char network_s[INET6_ADDRSTRLEN];
-            inet_ntop(AF_INET6, &route_adv->prefix, network_s,
-                      INET6_ADDRSTRLEN);
-            prefix_s = xasprintf("%s/%d", network_s, route_adv->plen);
-            inet_ntop(AF_INET6, &route_adv->nexthop, network_s,
-                      INET6_ADDRSTRLEN);
-            nexthop_s = xstrdup(network_s);
-        }
-        icsbrec_route_set_ip_prefix(isb_route, prefix_s);
-        icsbrec_route_set_nexthop(isb_route, nexthop_s);
-        icsbrec_route_set_origin(isb_route, route_adv->origin);
-        icsbrec_route_set_route_table(isb_route, route_adv->route_table
-                                                 ? route_adv->route_table
-                                                 : "");
-        free(prefix_s);
-        free(nexthop_s);
-
-        ad_route_sync_external_ids(route_adv, isb_route);
-
-        hmap_remove(routes_ad, &route_adv->node);
-        free(route_adv);
-    }
-}
-
-static void
-build_ts_routes_to_adv(struct ic_context *ctx,
-                       struct ic_router_info *ic_lr,
-                       struct hmap *routes_ad,
-                       struct lport_addresses *ts_port_addrs,
-                       const struct nbrec_nb_global *nb_global,
-                       const char *ts_route_table)
-{
-    const struct nbrec_logical_router *lr = ic_lr->lr;
-
-    /* Check static routes of the LR */
-    for (int i = 0; i < lr->n_static_routes; i++) {
-        const struct nbrec_logical_router_static_route *nb_route
-            = lr->static_routes[i];
-        struct uuid isb_uuid;
-        if (smap_get_uuid(&nb_route->external_ids, "ic-learned-route",
-                          &isb_uuid)) {
-            /* It is a learned route */
-            if (!add_to_routes_learned(&ic_lr->routes_learned, nb_route, lr)) {
-                static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-                VLOG_WARN_RL(&rl, "Bad format of learned route in NB: "
-                             "%s -> %s. Delete it.", nb_route->ip_prefix,
-                             nb_route->nexthop);
-                nbrec_logical_router_update_static_routes_delvalue(lr,
-                    nb_route);
-            }
-        } else if (!strcmp(ts_route_table, nb_route->route_table)) {
-            /* It may be a route to be advertised */
-            add_static_to_routes_ad(routes_ad, nb_route, lr, ts_port_addrs,
-                                    &nb_global->options);
-        }
-    }
-
-    /* Check directly-connected subnets of the LR */
-    for (int i = 0; i < lr->n_ports; i++) {
-        const struct nbrec_logical_router_port *lrp = lr->ports[i];
-        if (!lrp_is_ts_port(ctx, ic_lr, lrp->name)) {
-            for (int j = 0; j < lrp->n_networks; j++) {
-                add_network_to_routes_ad(routes_ad, lrp->networks[j], lrp,
-                                         ts_port_addrs,
-                                         &nb_global->options,
-                                         lr);
-            }
-        } else {
-            /* The router port of the TS port is ignored. */
-            VLOG_DBG("Skip advertising direct route of lrp %s (TS port)",
-                     lrp->name);
+        for (size_t i = 0; i < ls->n_ports; i++) {
+            shash_replace(map, ls->ports[i]->name, CONST_CAST(char *,
+                                                              ts_name));
         }
     }
 }
 
-static void
-collect_lr_routes(struct ic_context *ctx,
-                  struct ic_router_info *ic_lr,
-                  struct shash *routes_ad_by_ts)
+/* If 'lsp' is an interconnection port of a transit-switch mirror, adds that
+ * transit switch's name (looked up in 'lsp_ts_map') to 'ts_scope'. */
+void
+port_binding_collect_lsp_ts(const struct shash *lsp_ts_map,
+                            const struct nbrec_logical_switch_port *lsp,
+                            struct sset *ts_scope)
 {
-    const struct nbrec_nb_global *nb_global =
-        nbrec_nb_global_first(ctx->ovnnb_idl);
-    ovs_assert(nb_global);
-
-    const struct icsbrec_port_binding *isb_pb;
-    const char *lrp_name, *ts_name, *route_table;
-    struct lport_addresses ts_port_addrs;
-    const struct icnbrec_transit_switch *key;
-
-    struct hmap *routes_ad;
-    const struct icnbrec_transit_switch *t_sw;
-    for (int i = 0; i < ic_lr->n_isb_pbs; i++) {
-        isb_pb = ic_lr->isb_pbs[i];
-        key = icnbrec_transit_switch_index_init_row(
-            ctx->icnbrec_transit_switch_by_name);
-        icnbrec_transit_switch_index_set_name(key, isb_pb->transit_switch);
-        t_sw = icnbrec_transit_switch_index_find(
-             ctx->icnbrec_transit_switch_by_name, key);
-        icnbrec_transit_switch_index_destroy_row(key);
-        if (!t_sw) {
-            continue;
-        }
-        ts_name = t_sw->name;
-        routes_ad = shash_find_data(routes_ad_by_ts, ts_name);
-        if (!routes_ad) {
-            routes_ad = xzalloc(sizeof *routes_ad);
-            hmap_init(routes_ad);
-            shash_add(routes_ad_by_ts, ts_name, routes_ad);
-        }
-
-        if (!extract_lsp_addresses(isb_pb->address, &ts_port_addrs)) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-            VLOG_INFO_RL(&rl, "Route sync ignores port %s on ts %s for router"
-                         " %s because the addresses are invalid.",
-                         isb_pb->logical_port, isb_pb->transit_switch,
-                         ic_lr->lr->name);
-            continue;
-        }
-        lrp_name = get_lrp_name_by_ts_port_name(ctx, isb_pb->logical_port);
-        route_table = get_route_table_by_lrp_name(ctx, lrp_name);
-        build_ts_routes_to_adv(ctx, ic_lr, routes_ad, &ts_port_addrs,
-                               nb_global, route_table);
-        destroy_lport_addresses(&ts_port_addrs);
+    const char *ts_name = shash_find_data(lsp_ts_map, lsp->name);
+    if (ts_name) {
+        sset_add(ts_scope, ts_name);
     }
-}
-
-static void
-delete_orphan_ic_routes(struct ic_context *ctx,
-                         const struct icsbrec_availability_zone *az)
-{
-    const struct icsbrec_route *isb_route, *isb_route_key =
-        icsbrec_route_index_init_row(ctx->icsbrec_route_by_az);
-    icsbrec_route_index_set_availability_zone(isb_route_key, az);
-
-    const struct icnbrec_transit_switch *t_sw, *t_sw_key;
-
-    ICSBREC_ROUTE_FOR_EACH_EQUAL (isb_route, isb_route_key,
-                                  ctx->icsbrec_route_by_az)
-    {
-        t_sw_key = icnbrec_transit_switch_index_init_row(
-            ctx->icnbrec_transit_switch_by_name);
-        icnbrec_transit_switch_index_set_name(t_sw_key,
-            isb_route->transit_switch);
-        t_sw = icnbrec_transit_switch_index_find(
-            ctx->icnbrec_transit_switch_by_name, t_sw_key);
-        icnbrec_transit_switch_index_destroy_row(t_sw_key);
-
-        if (!t_sw) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-            VLOG_INFO_RL(&rl, "Deleting orphan ICDB:Route: %s->%s (%s, rtb:%s,"
-                         " transit switch: %s)", isb_route->ip_prefix,
-                         isb_route->nexthop, isb_route->origin,
-                         isb_route->route_table, isb_route->transit_switch);
-            icsbrec_route_delete(isb_route);
-        }
-    }
-    icsbrec_route_index_destroy_row(isb_route_key);
-}
-
-static void
-route_run(struct ic_context *ctx,
-          const struct icsbrec_availability_zone *az)
-{
-    if (!ctx->ovnisb_txn || !ctx->ovnnb_txn) {
-        return;
-    }
-
-    delete_orphan_ic_routes(ctx, az);
-
-    struct hmap ic_lrs = HMAP_INITIALIZER(&ic_lrs);
-    const struct icsbrec_port_binding *isb_pb;
-    const struct icsbrec_port_binding *isb_pb_key =
-        icsbrec_port_binding_index_init_row(ctx->icsbrec_port_binding_by_az);
-    icsbrec_port_binding_index_set_availability_zone(isb_pb_key, az);
-
-    /* Each port on TS maps to a logical router, which is stored in the
-     * external_ids:router-id of the IC SB port_binding record.
-     * Here we build info for interconnected Logical Router:
-     * collect IC Port Binding to process routes sync later on. */
-    ICSBREC_PORT_BINDING_FOR_EACH_EQUAL (isb_pb, isb_pb_key,
-                                         ctx->icsbrec_port_binding_by_az)
-    {
-        const char *ts_lrp_name =
-            get_lrp_name_by_ts_port_name(ctx, isb_pb->logical_port);
-        if (!ts_lrp_name) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-            VLOG_WARN_RL(&rl, "Route sync ignores port %s on ts %s because "
-                         "logical router port is not found in NB. Deleting it",
-                         isb_pb->logical_port, isb_pb->transit_switch);
-            icsbrec_port_binding_delete(isb_pb);
-            continue;
-        }
-
-        struct uuid lr_uuid;
-        if (!smap_get_uuid(&isb_pb->external_ids, "router-id", &lr_uuid)) {
-            VLOG_DBG("IC-SB Port_Binding %s doesn't have "
-                     "external_ids:router-id set.", isb_pb->logical_port);
-            continue;
-        }
-
-        const struct nbrec_logical_router *lr
-            = nbrec_logical_router_get_for_uuid(ctx->ovnnb_idl, &lr_uuid);
-        if (!lr) {
-            continue;
-        }
-
-        struct ic_router_info *ic_lr = ic_router_find(&ic_lrs, lr);
-        if (!ic_lr) {
-            ic_lr = xzalloc(sizeof *ic_lr);
-            ic_lr->lr = lr;
-            hmap_init(&ic_lr->routes_learned);
-            hmap_insert(&ic_lrs, &ic_lr->node, uuid_hash(&lr->header_.uuid));
-        }
-
-        if (ic_lr->n_isb_pbs == ic_lr->n_allocated_isb_pbs) {
-            ic_lr->isb_pbs = x2nrealloc(ic_lr->isb_pbs,
-                                        &ic_lr->n_allocated_isb_pbs,
-                                        sizeof *ic_lr->isb_pbs);
-        }
-        ic_lr->isb_pbs[ic_lr->n_isb_pbs++] = isb_pb;
-    }
-    icsbrec_port_binding_index_destroy_row(isb_pb_key);
-
-    struct ic_router_info *ic_lr;
-    struct shash routes_ad_by_ts = SHASH_INITIALIZER(&routes_ad_by_ts);
-    HMAP_FOR_EACH_SAFE (ic_lr, node, &ic_lrs) {
-        collect_lr_routes(ctx, ic_lr, &routes_ad_by_ts);
-        sync_learned_routes(ctx, ic_lr);
-        free(ic_lr->isb_pbs);
-        hmap_destroy(&ic_lr->routes_learned);
-        hmap_remove(&ic_lrs, &ic_lr->node);
-        free(ic_lr);
-    }
-    struct shash_node *node;
-    SHASH_FOR_EACH (node, &routes_ad_by_ts) {
-        advertise_routes(ctx, az, node->name, node->data);
-        hmap_destroy(node->data);
-    }
-    shash_destroy_free_data(&routes_ad_by_ts);
-    hmap_destroy(&ic_lrs);
 }
 
 /*
@@ -1822,11 +628,11 @@ route_run(struct ic_context *ctx,
  *    INB:nb_ic_cfg and INB:sb_ic_cfg to INB:nb_ic_cfg.
  */
 static void
-update_sequence_numbers(const struct icsbrec_availability_zone *az,
-                        struct ic_context *ctx,
+update_sequence_numbers(struct ic_context *ctx,
+                        const struct icsbrec_availability_zone *runned_az,
                         struct ovsdb_idl_loop *ic_sb_loop)
 {
-    if (!ctx->ovnisb_txn || !ctx->ovninb_txn) {
+    if (!ctx->ovnisb_unlocked_txn || !ctx->ovninb_txn) {
         return;
     }
 
@@ -1836,54 +642,68 @@ update_sequence_numbers(const struct icsbrec_availability_zone *az,
         ic_nb = icnbrec_ic_nb_global_insert(ctx->ovninb_txn);
     }
     const struct icsbrec_ic_sb_global *ic_sb = icsbrec_ic_sb_global_first(
-                                               ctx->ovnisb_idl);
+                                               ctx->ovnisb_unlocked_idl);
     if (!ic_sb) {
-        ic_sb = icsbrec_ic_sb_global_insert(ctx->ovnisb_txn);
+        ic_sb = icsbrec_ic_sb_global_insert(ctx->ovnisb_unlocked_txn);
     }
 
     if ((ic_nb->nb_ic_cfg != ic_sb->nb_ic_cfg) &&
-                          (ic_nb->nb_ic_cfg != az->nb_ic_cfg)) {
+                          (ic_nb->nb_ic_cfg != runned_az->nb_ic_cfg)) {
         /* Deal with potential overflows. */
-        if (az->nb_ic_cfg == LLONG_MAX) {
-            icsbrec_availability_zone_set_nb_ic_cfg(az, 0);
+        if (runned_az->nb_ic_cfg == INT64_MAX) {
+            icsbrec_availability_zone_set_nb_ic_cfg(runned_az, 0);
         }
         ic_sb_loop->next_cfg = ic_nb->nb_ic_cfg;
-        ovsdb_idl_txn_increment(ctx->ovnisb_txn, &az->header_,
-                           &icsbrec_availability_zone_col_nb_ic_cfg, true);
+        ovsdb_idl_txn_increment(ctx->ovnisb_unlocked_txn,
+                                &runned_az->header_,
+            &icsbrec_availability_zone_col_nb_ic_cfg, true);
         return;
     }
 
     /* handle cases where accidentally AZ:ic_nb_cfg exceeds
      * the INB:ic_nb_cfg.
      */
-    if (az->nb_ic_cfg != ic_sb_loop->cur_cfg) {
-        icsbrec_availability_zone_set_nb_ic_cfg(az, ic_sb_loop->cur_cfg);
+    if (runned_az->nb_ic_cfg != ic_sb_loop->cur_cfg) {
+        icsbrec_availability_zone_set_nb_ic_cfg(runned_az,
+                                                ic_sb_loop->cur_cfg);
         return;
     }
 
     const struct icsbrec_availability_zone *other_az;
-    ICSBREC_AVAILABILITY_ZONE_FOR_EACH (other_az, ctx->ovnisb_idl) {
-        if (other_az->nb_ic_cfg != az->nb_ic_cfg) {
+    ICSBREC_AVAILABILITY_ZONE_FOR_EACH (other_az, ctx->ovnisb_unlocked_idl) {
+        if (other_az->nb_ic_cfg != runned_az->nb_ic_cfg) {
             return;
         }
     }
     /* All the AZs are updated successfully, update SB/NB counter. */
     if (ic_nb->nb_ic_cfg != ic_sb->nb_ic_cfg) {
-        icsbrec_ic_sb_global_set_nb_ic_cfg(ic_sb, az->nb_ic_cfg);
-        icnbrec_ic_nb_global_set_sb_ic_cfg(ic_nb, az->nb_ic_cfg);
+        icsbrec_ic_sb_global_set_nb_ic_cfg(ic_sb, runned_az->nb_ic_cfg);
+        icnbrec_ic_nb_global_set_sb_ic_cfg(ic_nb, runned_az->nb_ic_cfg);
     }
 }
 
 static void
-ovn_db_run(struct ic_context *ctx,
-           const struct icsbrec_availability_zone *az)
+inc_proc_graph_dump(const char *end_node)
 {
-    ts_run(ctx);
-    gateway_run(ctx, az);
-    port_binding_run(ctx, az);
-    route_run(ctx, az);
+    struct ovsdb_idl_loop ovnnb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
+        ovsdb_idl_create_unconnected(&nbrec_idl_class, true));
+    struct ovsdb_idl_loop ovnsb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
+        ovsdb_idl_create_unconnected(&sbrec_idl_class, true));
+    struct ovsdb_idl_loop ovninb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
+        ovsdb_idl_create_unconnected(&icnbrec_idl_class, true));
+    struct ovsdb_idl_loop ovnisb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
+        ovsdb_idl_create_unconnected(&icsbrec_idl_class, true));
+
+    inc_proc_ic_init(&ovnnb_idl_loop, &ovnsb_idl_loop,
+                     &ovninb_idl_loop, &ovnisb_idl_loop);
+    engine_dump_graph(end_node);
+
+    ovsdb_idl_loop_destroy(&ovnnb_idl_loop);
+    ovsdb_idl_loop_destroy(&ovnsb_idl_loop);
+    ovsdb_idl_loop_destroy(&ovninb_idl_loop);
+    ovsdb_idl_loop_destroy(&ovnisb_idl_loop);
 }
-
+
 static void
 parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
 {
@@ -1891,6 +711,7 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
         OVN_DAEMON_OPTION_ENUMS,
         VLOG_OPTION_ENUMS,
         SSL_OPTION_ENUMS,
+        OPT_DUMP_INC_PROC_GRAPH,
     };
     static const struct option long_options[] = {
         {"ovnsb-db", required_argument, NULL, 'd'},
@@ -1901,6 +722,8 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
         {"help", no_argument, NULL, 'h'},
         {"options", no_argument, NULL, 'o'},
         {"version", no_argument, NULL, 'V'},
+        {"dump-inc-proc-graph", optional_argument, NULL,
+         OPT_DUMP_INC_PROC_GRAPH},
         OVN_DAEMON_LONG_OPTIONS,
         VLOG_LONG_OPTIONS,
         STREAM_SSL_LONG_OPTIONS,
@@ -1940,6 +763,14 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
             stream_ssl_set_ciphers(optarg);
             break;
 
+        case OPT_SSL_CIPHERSUITES:
+            stream_ssl_set_ciphersuites(optarg);
+            break;
+
+        case OPT_SSL_SERVER_NAME:
+            stream_ssl_set_server_name(optarg);
+            break;
+
         case 'd':
             ovnsb_db = optarg;
             break;
@@ -1970,6 +801,14 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
 
         case 'V':
             ovn_print_version(0, 0);
+            exit(EXIT_SUCCESS);
+
+        /* --dump-inc-proc-graph[=<i-p-node>]: Whether to dump the I-P engine
+         * graph representation in DOT format to stdout.  Optionally only up
+         * to <i-p-node>.
+         */
+        case OPT_DUMP_INC_PROC_GRAPH:
+            inc_proc_graph_dump(optarg);
             exit(EXIT_SUCCESS);
 
         default:
@@ -2020,6 +859,7 @@ static void
 update_idl_probe_interval(struct ovsdb_idl *ovn_sb_idl,
                           struct ovsdb_idl *ovn_nb_idl,
                           struct ovsdb_idl *ovn_icsb_idl,
+                          struct ovsdb_idl *ovn_icsb_unlocked_idl,
                           struct ovsdb_idl *ovn_icnb_idl)
 {
     const struct nbrec_nb_global *nb = nbrec_nb_global_first(ovn_nb_idl);
@@ -2038,6 +878,7 @@ update_idl_probe_interval(struct ovsdb_idl *ovn_sb_idl,
                                    ic_interval);
     }
     set_idl_probe_interval(ovn_icsb_idl, ovn_ic_sb_db, ic_interval);
+    set_idl_probe_interval(ovn_icsb_unlocked_idl, ovn_ic_sb_db, ic_interval);
     set_idl_probe_interval(ovn_icnb_idl, ovn_ic_nb_db, ic_interval);
 }
 
@@ -2053,7 +894,6 @@ main(int argc, char *argv[])
     fatal_ignore_sigpipe();
     ovs_cmdl_proctitle_init(argc, argv);
     ovn_set_program_name(argv[0]);
-    service_start(&argc, &argv);
     parse_options(argc, argv);
 
     daemonize_start(false, false);
@@ -2076,122 +916,236 @@ main(int argc, char *argv[])
     /* ovn-ic-nb db. */
     struct ovsdb_idl_loop ovninb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovn_ic_nb_db, &icnbrec_idl_class, true, true));
+    ovsdb_idl_track_add_all(ovninb_idl_loop.idl);
 
-    /* ovn-ic-sb db. */
+    /*
+     * Each ovn-ic instance maintains two connections to the IC-SB database:
+     * 1. Locked Connection: Competes for a global lock on IC-SB. Used for
+     * writes that must be performed by only one active instance
+     * (e.g., inserting a datapath_binding for a transit switch/router).
+     *
+     * 2. Unlocked Connection: Does not hold a lock. Used for writes that
+     * can be safely performed by multiple instances simultaneously
+     * (e.g., inserting a port_binding).
+     *
+     * This segregation prevents constraint violations and a full recompute
+     * when writing to IC-SB.
+     */
+    /* ovn-ic-sb db without lock. */
+    struct ovsdb_idl_loop ovnisb_unlocked_idl_loop =
+        OVSDB_IDL_LOOP_INITIALIZER(ovsdb_idl_create(ovn_ic_sb_db,
+                                                    &icsbrec_idl_class,
+                                                    true, true));
+    ovsdb_idl_track_add_all(ovnisb_unlocked_idl_loop.idl);
+
+    /* ovn-ic-sb db with lock. */
     struct ovsdb_idl_loop ovnisb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovn_ic_sb_db, &icsbrec_idl_class, true, true));
+    ovsdb_idl_track_add_all(ovnisb_idl_loop.idl);
 
     /* ovn-nb db. */
     struct ovsdb_idl_loop ovnnb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovnnb_db, &nbrec_idl_class, false, true));
 
     ovsdb_idl_add_table(ovnnb_idl_loop.idl, &nbrec_table_nb_global);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl, &nbrec_nb_global_col_name);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl, &nbrec_nb_global_col_options);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_nb_global_col_name);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_nb_global_col_options);
 
     ovsdb_idl_add_table(ovnnb_idl_loop.idl,
                         &nbrec_table_logical_router_static_route);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_static_route_col_route_table);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_static_route_col_ip_prefix);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_static_route_col_nexthop);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_static_route_col_external_ids);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_static_route_col_options);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_static_route_col_policy);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                    &nbrec_logical_router_static_route_col_route_table);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                    &nbrec_logical_router_static_route_col_ip_prefix);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                    &nbrec_logical_router_static_route_col_nexthop);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                    &nbrec_logical_router_static_route_col_external_ids);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                    &nbrec_logical_router_static_route_col_options);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                    &nbrec_logical_router_static_route_col_policy);
 
     ovsdb_idl_add_table(ovnnb_idl_loop.idl, &nbrec_table_logical_router);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_col_name);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_col_static_routes);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_col_ports);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_col_options);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_col_external_ids);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_router_col_name);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_router_col_static_routes);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_router_col_ports);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_router_col_options);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_router_col_external_ids);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_router_col_enabled);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_router_col_load_balancer);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_router_col_load_balancer_group);
 
     ovsdb_idl_add_table(ovnnb_idl_loop.idl, &nbrec_table_logical_router_port);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_port_col_name);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_port_col_networks);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_port_col_external_ids);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_router_port_col_options);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_router_port_col_mac);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_router_port_col_name);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_router_port_col_networks);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_router_port_col_external_ids);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_router_port_col_options);
 
     ovsdb_idl_add_table(ovnnb_idl_loop.idl, &nbrec_table_logical_switch);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_switch_col_name);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_switch_col_ports);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_switch_col_other_config);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_switch_col_external_ids);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_switch_col_name);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_switch_col_ports);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_switch_col_other_config);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_switch_col_external_ids);
 
     ovsdb_idl_add_table(ovnnb_idl_loop.idl, &nbrec_table_logical_switch_port);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_switch_port_col_name);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_switch_port_col_addresses);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_switch_port_col_options);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_switch_port_col_type);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_switch_port_col_up);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_switch_port_col_addresses);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_switch_port_col_enabled);
-    ovsdb_idl_add_column(ovnnb_idl_loop.idl,
-                         &nbrec_logical_switch_port_col_external_ids);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_switch_port_col_name);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_switch_port_col_addresses);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_switch_port_col_options);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_switch_port_col_type);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_switch_port_col_up);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_switch_port_col_addresses);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_switch_port_col_enabled);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_switch_port_col_external_ids);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_logical_switch_port_col_peer);
+
+    ovsdb_idl_add_table(ovnnb_idl_loop.idl, &nbrec_table_load_balancer);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_load_balancer_col_vips);
+
+    ovsdb_idl_add_table(ovnnb_idl_loop.idl, &nbrec_table_load_balancer_group);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_load_balancer_group_col_load_balancer);
+
+    ovsdb_idl_add_table(ovnnb_idl_loop.idl, &nbrec_table_address_set);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_address_set_col_name);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_address_set_col_addresses);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_address_set_col_options);
+    ovsdb_idl_track_add_column(ovnnb_idl_loop.idl,
+                               &nbrec_address_set_col_external_ids);
 
     /* ovn-sb db. */
     struct ovsdb_idl_loop ovnsb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovnsb_db, &sbrec_idl_class, false, true));
 
+    ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_sb_global);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_sb_global_col_options);
+
     ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_chassis);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_chassis_col_encaps);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_chassis_col_name);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_chassis_col_hostname);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_chassis_col_other_config);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_chassis_col_encaps);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_chassis_col_name);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_chassis_col_hostname);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_chassis_col_other_config);
 
     ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_encap);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_encap_col_chassis_name);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_encap_col_type);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_encap_col_ip);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_encap_col_options);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_encap_col_chassis_name);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_encap_col_type);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_encap_col_ip);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_encap_col_options);
 
     ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_datapath_binding);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl,
-                         &sbrec_datapath_binding_col_external_ids);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_datapath_binding_col_type);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_datapath_binding_col_external_ids);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_datapath_binding_col_nb_uuid);
 
     ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_port_binding);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl,
-                         &sbrec_port_binding_col_datapath);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl,
-                         &sbrec_port_binding_col_mac);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl,
-                         &sbrec_port_binding_col_options);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl,
-                         &sbrec_port_binding_col_logical_port);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl,
-                         &sbrec_port_binding_col_external_ids);
-    ovsdb_idl_add_column(ovnsb_idl_loop.idl,
-                         &sbrec_port_binding_col_chassis);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_port_binding_col_datapath);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_port_binding_col_mac);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_port_binding_col_options);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_port_binding_col_logical_port);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_port_binding_col_external_ids);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_port_binding_col_chassis);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_port_binding_col_up);
+
+    ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_service_monitor);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_service_monitor_col_chassis_name);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_service_monitor_col_external_ids);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_service_monitor_col_type);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_service_monitor_col_ip);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_service_monitor_col_logical_port);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_service_monitor_col_port);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_service_monitor_col_protocol);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_service_monitor_col_src_ip);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_service_monitor_col_src_mac);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_service_monitor_col_remote);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_service_monitor_col_ic_learned);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_service_monitor_col_status);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_service_monitor_col_options);
+
+    ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_learned_route);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_learned_route_col_ip_prefix);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_learned_route_col_datapath);
+
+    ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_address_set);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_address_set_col_name);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_address_set_col_addresses);
+    ovsdb_idl_track_add_column(ovnsb_idl_loop.idl,
+                               &sbrec_address_set_col_options);
 
     /* Create IDL indexes */
     struct ovsdb_idl_index *nbrec_ls_by_name
         = ovsdb_idl_index_create1(ovnnb_idl_loop.idl,
                                   &nbrec_logical_switch_col_name);
+    struct ovsdb_idl_index *nbrec_lr_by_name = ovsdb_idl_index_create1(
+        ovnnb_idl_loop.idl, &nbrec_logical_router_col_name);
     struct ovsdb_idl_index *nbrec_port_by_name
         = ovsdb_idl_index_create1(ovnnb_idl_loop.idl,
                                   &nbrec_logical_switch_port_col_name);
@@ -2201,39 +1155,76 @@ main(int argc, char *argv[])
     struct ovsdb_idl_index *sbrec_port_binding_by_name
         = ovsdb_idl_index_create1(ovnsb_idl_loop.idl,
                                   &sbrec_port_binding_col_logical_port);
+    struct ovsdb_idl_index *sbrec_datapath_binding_by_nb_uuid
+        = ovsdb_idl_index_create1(ovnsb_idl_loop.idl,
+                                  &sbrec_datapath_binding_col_nb_uuid);
     struct ovsdb_idl_index *sbrec_chassis_by_name
         = ovsdb_idl_index_create1(ovnsb_idl_loop.idl,
                                   &sbrec_chassis_col_name);
+
+    struct ovsdb_idl_index *sbrec_learned_route_by_datapath
+        = ovsdb_idl_index_create1(ovnsb_idl_loop.idl,
+                                  &sbrec_learned_route_col_datapath);
+
+    struct ovsdb_idl_index *sbrec_service_monitor_by_remote_type
+        = ovsdb_idl_index_create1(ovnsb_idl_loop.idl,
+                                  &sbrec_service_monitor_col_remote);
+
+    struct ovsdb_idl_index *sbrec_service_monitor_by_ic_learned
+        = ovsdb_idl_index_create1(ovnsb_idl_loop.idl,
+                                  &sbrec_service_monitor_col_ic_learned);
+
+    struct ovsdb_idl_index *sbrec_service_monitor_by_remote_type_logical_port
+        = ovsdb_idl_index_create2(ovnsb_idl_loop.idl,
+                                  &sbrec_service_monitor_col_remote,
+                                  &sbrec_service_monitor_col_logical_port);
 
     struct ovsdb_idl_index *icnbrec_transit_switch_by_name
         = ovsdb_idl_index_create1(ovninb_idl_loop.idl,
                                   &icnbrec_transit_switch_col_name);
 
+    struct ovsdb_idl_index *icnbrec_transit_router_by_name
+        = ovsdb_idl_index_create1(ovninb_idl_loop.idl,
+                                  &icnbrec_transit_router_col_name);
+
     struct ovsdb_idl_index *icsbrec_port_binding_by_az
-        = ovsdb_idl_index_create1(ovnisb_idl_loop.idl,
+        = ovsdb_idl_index_create1(ovnisb_unlocked_idl_loop.idl,
                                   &icsbrec_port_binding_col_availability_zone);
 
     struct ovsdb_idl_index *icsbrec_port_binding_by_ts
-        = ovsdb_idl_index_create1(ovnisb_idl_loop.idl,
+        = ovsdb_idl_index_create1(ovnisb_unlocked_idl_loop.idl,
                                   &icsbrec_port_binding_col_transit_switch);
 
     struct ovsdb_idl_index *icsbrec_port_binding_by_ts_az
-        = ovsdb_idl_index_create2(ovnisb_idl_loop.idl,
+        = ovsdb_idl_index_create2(ovnisb_unlocked_idl_loop.idl,
                                   &icsbrec_port_binding_col_transit_switch,
                                   &icsbrec_port_binding_col_availability_zone);
 
     struct ovsdb_idl_index *icsbrec_route_by_az
-        = ovsdb_idl_index_create1(ovnisb_idl_loop.idl,
+        = ovsdb_idl_index_create1(ovnisb_unlocked_idl_loop.idl,
                                   &icsbrec_route_col_availability_zone);
 
     struct ovsdb_idl_index *icsbrec_route_by_ts
-        = ovsdb_idl_index_create1(ovnisb_idl_loop.idl,
+        = ovsdb_idl_index_create1(ovnisb_unlocked_idl_loop.idl,
                                   &icsbrec_route_col_transit_switch);
 
     struct ovsdb_idl_index *icsbrec_route_by_ts_az
-        = ovsdb_idl_index_create2(ovnisb_idl_loop.idl,
+        = ovsdb_idl_index_create2(ovnisb_unlocked_idl_loop.idl,
                                   &icsbrec_route_col_transit_switch,
                                   &icsbrec_route_col_availability_zone);
+
+    struct ovsdb_idl_index *icsbrec_service_monitor_by_source_az
+        = ovsdb_idl_index_create1(ovnisb_unlocked_idl_loop.idl,
+            &icsbrec_service_monitor_col_source_availability_zone);
+
+    struct ovsdb_idl_index *icsbrec_service_monitor_by_target_az
+        = ovsdb_idl_index_create1(ovnisb_unlocked_idl_loop.idl,
+            &icsbrec_service_monitor_col_target_availability_zone);
+
+    struct ovsdb_idl_index *icsbrec_service_monitor_by_target_az_logical_port
+        = ovsdb_idl_index_create2(ovnisb_unlocked_idl_loop.idl,
+            &icsbrec_service_monitor_col_target_availability_zone,
+            &icsbrec_service_monitor_col_logical_port);
 
     unixctl_command_register("nb-connection-status", "", 0, 0,
                              ovn_conn_show, ovnnb_idl_loop.idl);
@@ -2244,14 +1235,41 @@ main(int argc, char *argv[])
     unixctl_command_register("ic-sb-connection-status", "", 0, 0,
                              ovn_conn_show, ovnisb_idl_loop.idl);
 
+    /* Initialize incremental processing engine for ovn-northd */
+    inc_proc_ic_init(&ovnnb_idl_loop, &ovnsb_idl_loop,
+                     &ovninb_idl_loop, &ovnisb_unlocked_idl_loop);
+
+    unsigned int ovnnb_cond_seqno = UINT_MAX;
+    unsigned int ovnsb_cond_seqno = UINT_MAX;
+    unsigned int ovninb_cond_seqno = UINT_MAX;
+    unsigned int ovnisb_cond_seqno = UINT_MAX;
+    unsigned int ovnisb_unlocked_cond_seqno = UINT_MAX;
+
     /* Main loop. */
+    struct ic_engine_context  eng_ctx = {0};
+
     exiting = false;
     state.had_lock = false;
+    state.had_isb_lock = false;
     state.paused = false;
+
     while (!exiting) {
         update_ssl_config();
         update_idl_probe_interval(ovnsb_idl_loop.idl, ovnnb_idl_loop.idl,
-                                  ovnisb_idl_loop.idl, ovninb_idl_loop.idl);
+                                  ovnisb_idl_loop.idl,
+                                  ovnisb_unlocked_idl_loop.idl,
+                                  ovninb_idl_loop.idl);
+
+        /* Postpone the next engine run by the length of the previous one, up
+         * to this interval, to coalesce bursts of change-driven runs.  A
+         * forced recompute (set_force_recompute) still runs immediately, so
+         * this only throttles the natural, incremental path. */
+        const struct icnbrec_ic_nb_global *ic_nb_global =
+            icnbrec_ic_nb_global_first(ovninb_idl_loop.idl);
+        eng_ctx.backoff_ms = ic_nb_global
+            ? smap_get_uint(&ic_nb_global->options,
+                            "ic-backoff-interval-ms", 0) : 0;
+
         memory_run();
         if (memory_should_report()) {
             struct simap usage = SIMAP_INITIALIZER(&usage);
@@ -2261,6 +1279,7 @@ main(int argc, char *argv[])
             simap_destroy(&usage);
         }
 
+        bool clear_idl_track = true;
         if (!state.paused) {
             if (!ovsdb_idl_has_lock(ovnsb_idl_loop.idl) &&
                 !ovsdb_idl_is_lock_contended(ovnsb_idl_loop.idl))
@@ -2272,67 +1291,245 @@ main(int argc, char *argv[])
                 ovsdb_idl_set_lock(ovnsb_idl_loop.idl, "ovn_ic");
             }
 
+            struct ovsdb_idl_txn *ovnnb_txn =
+                run_idl_loop(&ovnnb_idl_loop, "OVN_Northbound",
+                             &eng_ctx.nb_idl_duration_ms);
+            unsigned int new_ovnnb_cond_seqno =
+                        ovsdb_idl_get_condition_seqno(ovnnb_idl_loop.idl);
+            if (new_ovnnb_cond_seqno != ovnnb_cond_seqno) {
+                if (!new_ovnnb_cond_seqno) {
+                    VLOG_INFO("OVN NB IDL reconnected, force recompute.");
+                    inc_proc_ic_force_recompute();
+                }
+                ovnnb_cond_seqno = new_ovnnb_cond_seqno;
+            }
+
+            struct ovsdb_idl_txn *ovnsb_txn =
+                run_idl_loop(&ovnsb_idl_loop, "OVN_Southbound",
+                             &eng_ctx.sb_idl_duration_ms);
+            unsigned int new_ovnsb_cond_seqno =
+                        ovsdb_idl_get_condition_seqno(ovnsb_idl_loop.idl);
+            if (new_ovnsb_cond_seqno != ovnsb_cond_seqno) {
+                if (!new_ovnsb_cond_seqno) {
+                    VLOG_INFO("OVN SB IDL reconnected, force recompute.");
+                    inc_proc_ic_force_recompute();
+                }
+                ovnsb_cond_seqno = new_ovnsb_cond_seqno;
+            }
+
+            if (ovsdb_idl_has_lock(ovnsb_idl_loop.idl)) {
+                if (!ovsdb_idl_has_lock(ovnisb_idl_loop.idl) &&
+                    !ovsdb_idl_is_lock_contended(ovnisb_idl_loop.idl)) {
+                    /*
+                     * Ensure that only a single ovn-ic has the permission to
+                     * write to IC-SB. Only the instance that is active in
+                     * its own AZ may request it: a standby instance never
+                     * runs the engine, so if it held the IC-SB lock nobody
+                     * would ever write to IC-SB.
+                     */
+                    VLOG_INFO("Acquiring OVN ISB lock.");
+                    ovsdb_idl_set_lock(ovnisb_idl_loop.idl, "ovn_ic_sb");
+                }
+            } else {
+                /* Release the IC-SB lock, or withdraw a pending request for
+                 * it, as soon as the local SB lock is gone. */
+                ovsdb_idl_set_lock(ovnisb_idl_loop.idl, NULL);
+            }
+
+            struct ovsdb_idl_txn *ovninb_txn =
+                run_idl_loop(&ovninb_idl_loop, "OVN_IC_Northbound",
+                             &eng_ctx.inb_idl_duration_ms);
+            unsigned int new_ovninb_cond_seqno =
+                        ovsdb_idl_get_condition_seqno(ovninb_idl_loop.idl);
+            if (new_ovninb_cond_seqno != ovninb_cond_seqno) {
+                if (!new_ovninb_cond_seqno) {
+                    VLOG_INFO("OVN INB IDL reconnected, force recompute.");
+                    inc_proc_ic_force_recompute();
+                }
+                ovninb_cond_seqno = new_ovninb_cond_seqno;
+            }
+
+            struct ovsdb_idl_txn *ovnisb_txn =
+                run_idl_loop(&ovnisb_idl_loop, "OVN_IC_Southbound",
+                             &eng_ctx.isb_idl_duration_ms);
+            unsigned int new_ovnisb_cond_seqno =
+                        ovsdb_idl_get_condition_seqno(ovnisb_idl_loop.idl);
+            if (new_ovnisb_cond_seqno != ovnisb_cond_seqno) {
+                if (!new_ovnisb_cond_seqno) {
+                    VLOG_INFO("OVN ISB IDL reconnected, force recompute.");
+                    inc_proc_ic_force_recompute();
+                }
+                ovnisb_cond_seqno = new_ovnisb_cond_seqno;
+            }
+
+            struct ovsdb_idl_txn *ovnisb_unlocked_txn =
+                run_idl_loop(&ovnisb_unlocked_idl_loop, "OVN_IC_Southbound",
+                             &eng_ctx.isb_unlock_idl_duration_ms);
+            unsigned int new_ovnisb_unlocked_cond_seqno =
+                ovsdb_idl_get_condition_seqno(ovnisb_unlocked_idl_loop.idl);
+            if (new_ovnisb_unlocked_cond_seqno != ovnisb_unlocked_cond_seqno) {
+                if (!new_ovnisb_unlocked_cond_seqno) {
+                    VLOG_INFO("OVN ISB IDL Unlocked reconnected, "
+                              "force recompute.");
+                    inc_proc_ic_force_recompute();
+                }
+                ovnisb_unlocked_cond_seqno = new_ovnisb_unlocked_cond_seqno;
+            }
+
             struct ic_context ctx = {
                 .ovnnb_idl = ovnnb_idl_loop.idl,
-                .ovnnb_txn = ovsdb_idl_loop_run(&ovnnb_idl_loop),
+                .ovnnb_txn = ovnnb_txn,
                 .ovnsb_idl = ovnsb_idl_loop.idl,
-                .ovnsb_txn = ovsdb_idl_loop_run(&ovnsb_idl_loop),
+                .ovnsb_txn = ovnsb_txn,
                 .ovninb_idl = ovninb_idl_loop.idl,
-                .ovninb_txn = ovsdb_idl_loop_run(&ovninb_idl_loop),
+                .ovninb_txn = ovninb_txn,
                 .ovnisb_idl = ovnisb_idl_loop.idl,
-                .ovnisb_txn = ovsdb_idl_loop_run(&ovnisb_idl_loop),
+                .ovnisb_txn = ovnisb_txn,
+                .ovnisb_unlocked_idl = ovnisb_unlocked_idl_loop.idl,
+                .ovnisb_unlocked_txn = ovnisb_unlocked_txn,
                 .nbrec_ls_by_name = nbrec_ls_by_name,
+                .nbrec_lr_by_name = nbrec_lr_by_name,
                 .nbrec_lrp_by_name = nbrec_lrp_by_name,
                 .nbrec_port_by_name = nbrec_port_by_name,
                 .sbrec_port_binding_by_name = sbrec_port_binding_by_name,
+                .sbrec_datapath_binding_by_nb_uuid =
+                    sbrec_datapath_binding_by_nb_uuid,
                 .sbrec_chassis_by_name = sbrec_chassis_by_name,
+                .sbrec_learned_route_by_datapath =
+                  sbrec_learned_route_by_datapath,
+                .sbrec_service_monitor_by_remote_type =
+                    sbrec_service_monitor_by_remote_type,
+                .sbrec_service_monitor_by_ic_learned =
+                    sbrec_service_monitor_by_ic_learned,
+                .sbrec_service_monitor_by_remote_type_logical_port =
+                    sbrec_service_monitor_by_remote_type_logical_port,
                 .icnbrec_transit_switch_by_name =
                     icnbrec_transit_switch_by_name,
+                .icnbrec_transit_router_by_name =
+                    icnbrec_transit_router_by_name,
                 .icsbrec_port_binding_by_az = icsbrec_port_binding_by_az,
                 .icsbrec_port_binding_by_ts = icsbrec_port_binding_by_ts,
                 .icsbrec_port_binding_by_ts_az = icsbrec_port_binding_by_ts_az,
                 .icsbrec_route_by_az = icsbrec_route_by_az,
                 .icsbrec_route_by_ts = icsbrec_route_by_ts,
                 .icsbrec_route_by_ts_az = icsbrec_route_by_ts_az,
+                .icsbrec_service_monitor_by_source_az =
+                    icsbrec_service_monitor_by_source_az,
+                .icsbrec_service_monitor_by_target_az =
+                    icsbrec_service_monitor_by_target_az,
+                .icsbrec_service_monitor_by_target_az_logical_port =
+                    icsbrec_service_monitor_by_target_az_logical_port,
             };
 
-            if (!state.had_lock && ovsdb_idl_has_lock(ovnsb_idl_loop.idl)) {
+            if (!state.had_lock && ovsdb_idl_has_lock(ctx.ovnsb_idl)) {
                 VLOG_INFO("ovn-ic lock acquired. "
-                        "This ovn-ic instance is now active.");
+                            "This ovn-ic instance is now active.");
                 state.had_lock = true;
             } else if (state.had_lock &&
-                       !ovsdb_idl_has_lock(ovnsb_idl_loop.idl)) {
+                       !ovsdb_idl_has_lock(ctx.ovnsb_idl)) {
                 VLOG_INFO("ovn-ic lock lost. "
-                        "This ovn-ic instance is now on standby.");
+                            "This ovn-ic instance is now on standby.");
                 state.had_lock = false;
             }
 
-            if (ovsdb_idl_has_lock(ovnsb_idl_loop.idl) &&
+            if (!state.had_isb_lock && ovsdb_idl_has_lock(ctx.ovnisb_idl)) {
+                VLOG_INFO("OVN ISB lock acquired. "
+                          "This ovn-ic instance is now active.");
+                state.had_isb_lock = true;
+                inc_proc_ic_force_recompute_immediate();
+            } else if (state.had_isb_lock &&
+                       !ovsdb_idl_has_lock(ctx.ovnisb_idl)) {
+                VLOG_INFO("OVN ISB lock lost.");
+                state.had_isb_lock = false;
+            }
+
+            if (ovsdb_idl_has_lock(ctx.ovnsb_idl) &&
                 ovsdb_idl_has_ever_connected(ctx.ovnnb_idl) &&
                 ovsdb_idl_has_ever_connected(ctx.ovnsb_idl) &&
                 ovsdb_idl_has_ever_connected(ctx.ovninb_idl) &&
-                ovsdb_idl_has_ever_connected(ctx.ovnisb_idl)) {
-                const struct icsbrec_availability_zone *az = az_run(&ctx);
-                VLOG_DBG("Availability zone: %s", az ? az->name :
-                                               "not created yet.");
-                if (az) {
-                    ovn_db_run(&ctx, az);
-                    update_sequence_numbers(az, &ctx, &ovnisb_idl_loop);
+                ovsdb_idl_has_ever_connected(ctx.ovnisb_idl) &&
+                ovsdb_idl_has_ever_connected(ctx.ovnisb_unlocked_idl)) {
+                /* The AZ holding the IC-SB lock writes through the locked
+                 * connection, whose transaction isn't available while the
+                 * previous one is being committed.  Postpone the engine run
+                 * in that case, keeping the tracked changes, as the nodes
+                 * would otherwise skip their writes and the changes they
+                 * handle incrementally would be lost. */
+                bool isb_txn_ready = ctx.ovnisb_txn ||
+                                     !ovsdb_idl_has_lock(ctx.ovnisb_idl);
+                if (ctx.ovnnb_txn && ctx.ovnsb_txn && ctx.ovninb_txn &&
+                    ctx.ovnisb_unlocked_txn && isb_txn_ready &&
+                    inc_proc_ic_can_run(&eng_ctx)) {
+                    /* The availability zone is now resolved by the en_az
+                     * engine node.  The subsystem nodes skip their work when
+                     * there is no AZ; the sequence-number bookkeeping below
+                     * runs outside the engine, so it reads the resolved AZ via
+                     * inc_proc_ic_get_runned_az(). */
+                    (void) inc_proc_ic_run(&ctx, &eng_ctx);
+                    const struct icsbrec_availability_zone *runned_az =
+                        inc_proc_ic_get_runned_az();
+                    if (runned_az) {
+                        update_sequence_numbers(&ctx, runned_az,
+                                                &ovnisb_unlocked_idl_loop);
+                    }
+                } else if (!inc_proc_ic_get_force_recompute()) {
+                    clear_idl_track = false;
                 }
-            }
+                /* If there are any errors, we force a full recompute in order
+                 * to ensure we handle all changes. */
+                if (!ovsdb_idl_loop_commit_and_wait(&ovnnb_idl_loop)) {
+                    VLOG_INFO("OVNNB commit failed, "
+                                "force recompute next time.");
+                    inc_proc_ic_force_recompute_immediate();
+                }
 
-            int rc1 = ovsdb_idl_loop_commit_and_wait(&ovnnb_idl_loop);
-            int rc2 = ovsdb_idl_loop_commit_and_wait(&ovnsb_idl_loop);
-            int rc3 = ovsdb_idl_loop_commit_and_wait(&ovninb_idl_loop);
-            int rc4 = ovsdb_idl_loop_commit_and_wait(&ovnisb_idl_loop);
-            if (!rc1 || !rc2 || !rc3 || !rc4) {
-                VLOG_DBG(" a transaction failed in: %s %s %s %s",
-                         !rc1 ? "nb" : "", !rc2 ? "sb" : "",
-                         !rc3 ? "ic_nb" : "", rc4 ? "ic_sb" : "");
-                /* A transaction failed. Wake up immediately to give
-                 * opportunity to send the proper transaction
+                if (!ovsdb_idl_loop_commit_and_wait(&ovnsb_idl_loop)) {
+                    VLOG_INFO("OVNSB commit failed, "
+                                "force recompute next time.");
+                    inc_proc_ic_force_recompute_immediate();
+                }
+
+                if (!ovsdb_idl_loop_commit_and_wait(&ovninb_idl_loop)) {
+                    VLOG_INFO("OVNINB commit failed, "
+                                "force recompute next time.");
+                    inc_proc_ic_force_recompute_immediate();
+                }
+                if (!ovsdb_idl_loop_commit_and_wait(
+                                          &ovnisb_unlocked_idl_loop)) {
+                    VLOG_INFO("OVNISB Unlocked commit failed, "
+                                "force recompute next time.");
+                    inc_proc_ic_force_recompute_immediate();
+                }
+
+                /*
+                 * ovn-ic will only try to recompute a failed transaction from
+                 * the locked connection IF the AZ has the lock.
                  */
-                poll_immediate_wake();
+                if (!ovsdb_idl_loop_commit_and_wait(&ovnisb_idl_loop) &&
+                    ovsdb_idl_has_lock(ovnisb_idl_loop.idl)) {
+                    VLOG_INFO("OVNISB commit failed, "
+                              "force recompute next time.");
+                    inc_proc_ic_force_recompute_immediate();
+                }
+            } else {
+                /* Make sure we send any pending requests, e.g., lock. */
+                int rc1 = ovsdb_idl_loop_commit_and_wait(&ovnnb_idl_loop);
+                int rc2 = ovsdb_idl_loop_commit_and_wait(&ovnsb_idl_loop);
+                int rc3 = ovsdb_idl_loop_commit_and_wait(&ovninb_idl_loop);
+                int rc4 = ovsdb_idl_loop_commit_and_wait(&ovnisb_idl_loop);
+                int rc5 =
+                    ovsdb_idl_loop_commit_and_wait(&ovnisb_unlocked_idl_loop);
+                if (!rc1 || !rc2 || !rc3 || !rc4 || !rc5) {
+                    VLOG_DBG(" a transaction failed in: %s %s %s %s %s",
+                            !rc1 ? "nb" : "", !rc2 ? "sb" : "",
+                             !rc3 ? "ic_nb" : "", !rc4 ? "ic_sb" : "",
+                             !rc5 ? "ic_sb_unlocked" : "");
+                    /* A transaction failed. Wake up immediately to give
+                    * opportunity to send the proper transaction
+                    */
+                }
+                /* Force a full recompute next time we become active. */
+                inc_proc_ic_force_recompute();
             }
         } else {
             /* ovn-ic is paused
@@ -2341,9 +1538,16 @@ main(int argc, char *argv[])
              *      copy will be out of sync.
              *    - but we don't want to create any txns.
              * */
+            if (ovsdb_idl_has_lock(ovnisb_idl_loop.idl) ||
+                ovsdb_idl_is_lock_contended(ovnisb_idl_loop.idl)) {
+                VLOG_INFO("This ovn-ic instance is now paused. "
+                          "Removing IC-SB lock.");
+                ovsdb_idl_set_lock(ovnisb_idl_loop.idl, NULL);
+                state.had_isb_lock = false;
+            }
+
             if (ovsdb_idl_has_lock(ovnsb_idl_loop.idl) ||
-                ovsdb_idl_is_lock_contended(ovnsb_idl_loop.idl))
-            {
+                ovsdb_idl_is_lock_contended(ovnsb_idl_loop.idl)) {
                 /* make sure we don't hold the lock while paused */
                 VLOG_INFO("This ovn-ic instance is now paused.");
                 ovsdb_idl_set_lock(ovnsb_idl_loop.idl, NULL);
@@ -2354,10 +1558,23 @@ main(int argc, char *argv[])
             ovsdb_idl_run(ovnsb_idl_loop.idl);
             ovsdb_idl_run(ovninb_idl_loop.idl);
             ovsdb_idl_run(ovnisb_idl_loop.idl);
+            ovsdb_idl_run(ovnisb_unlocked_idl_loop.idl);
             ovsdb_idl_wait(ovnnb_idl_loop.idl);
             ovsdb_idl_wait(ovnsb_idl_loop.idl);
             ovsdb_idl_wait(ovninb_idl_loop.idl);
             ovsdb_idl_wait(ovnisb_idl_loop.idl);
+            ovsdb_idl_wait(ovnisb_unlocked_idl_loop.idl);
+
+            /* Force a full recompute next time we become active. */
+            inc_proc_ic_force_recompute();
+        }
+
+        if (clear_idl_track) {
+            ovsdb_idl_track_clear(ovnnb_idl_loop.idl);
+            ovsdb_idl_track_clear(ovnsb_idl_loop.idl);
+            ovsdb_idl_track_clear(ovninb_idl_loop.idl);
+            ovsdb_idl_track_clear(ovnisb_idl_loop.idl);
+            ovsdb_idl_track_clear(ovnisb_unlocked_idl_loop.idl);
         }
 
         unixctl_server_run(unixctl);
@@ -2368,17 +1585,15 @@ main(int argc, char *argv[])
         }
 
         poll_block();
-        if (should_service_stop()) {
-            exiting = true;
-        }
     }
+    inc_proc_ic_cleanup();
 
     unixctl_server_destroy(unixctl);
     ovsdb_idl_loop_destroy(&ovnnb_idl_loop);
     ovsdb_idl_loop_destroy(&ovnsb_idl_loop);
     ovsdb_idl_loop_destroy(&ovninb_idl_loop);
     ovsdb_idl_loop_destroy(&ovnisb_idl_loop);
-    service_stop();
+    ovsdb_idl_loop_destroy(&ovnisb_unlocked_idl_loop);
 
     exit(res);
 }
@@ -2400,6 +1615,7 @@ ovn_ic_pause(struct unixctl_conn *conn, int argc OVS_UNUSED,
     struct ic_state *state = state_;
     state->paused = true;
 
+    poll_immediate_wake();
     unixctl_command_reply(conn, NULL);
 }
 
@@ -2444,6 +1660,8 @@ ovn_ic_status(struct unixctl_conn *conn, int argc OVS_UNUSED,
      */
     struct ds s = DS_EMPTY_INITIALIZER;
     ds_put_format(&s, "Status: %s\n", status);
+    ds_put_format(&s, "IC-SB lock: %s\n",
+                  state->had_isb_lock ? "held" : "not held");
     unixctl_command_reply(conn, ds_cstr(&s));
     ds_destroy(&s);
 }

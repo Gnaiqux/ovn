@@ -35,6 +35,7 @@
 #include "lib/ovn-sb-idl.h"
 #include "lib/extend-table.h"
 #include "lib/uuidset.h"
+#include "neighbor-of.h"
 #include "packets.h"
 #include "physical.h"
 #include "simap.h"
@@ -50,10 +51,19 @@ COVERAGE_DEFINE(consider_logical_flow);
 /* Contains "struct expr_symbol"s for fields supported by OVN lflows. */
 static struct shash symtab;
 
+/* Alternative symbol table for ACL CT translation.
+ * This symbol table maps L4 port fields (tcp/udp/sctp) to their connection
+ * tracking equivalents (ct_tp_src/ct_tp_dst with ct_proto predicates).
+ * This allows matching on all IP fragments (not just the first fragment)
+ * so that all fragments can be matched based on the connection tracking state.
+ */
+static struct shash acl_ct_symtab;
+
 void
 lflow_init(void)
 {
     ovn_init_symtab(&symtab);
+    ovn_init_acl_ct_symtab(&acl_ct_symtab);
 }
 
 struct lookup_port_aux {
@@ -63,6 +73,7 @@ struct lookup_port_aux {
     const struct sbrec_logical_flow *lflow;
     struct objdep_mgr *deps_mgr;
     const struct hmap *chassis_tunnels;
+    const struct shash *local_bindings;
 };
 
 struct condition_aux {
@@ -100,7 +111,6 @@ consider_logical_flow(const struct sbrec_logical_flow *lflow,
 static void
 consider_lb_hairpin_flows(const struct ovn_controller_lb *lb,
                           const struct hmap *local_datapaths,
-                          bool use_ct_mark,
                           struct ovn_desired_flow_table *flow_table);
 
 static void add_port_sec_flows(const struct shash *binding_lports,
@@ -146,6 +156,20 @@ lookup_port_cb(const void *aux_, const char *port_name, unsigned int *portp)
         aux->sbrec_multicast_group_by_name_datapath, aux->dp, port_name);
     if (mg) {
         *portp = mg->tunnel_key;
+        return true;
+    }
+
+    return false;
+}
+
+/* Given the OVN port name, get true if port locates on local chassis,
+ * false otherwise. */
+static bool
+lookup_local_port_cb(const void *aux_, const char *port_name)
+{
+    const struct lookup_port_aux *aux = aux_;
+
+    if (local_binding_get_primary_pb(aux->local_bindings, port_name)) {
         return true;
     }
 
@@ -202,6 +226,27 @@ is_chassis_resident_cb(const void *c_aux_, const char *port_name)
         }
         return false;
     }
+}
+
+static bool
+lport_id_is_local(const struct lflow_ctx_in *l_ctx_in,
+                  const struct uuid *lflow_uuid,
+                  int64_t dp_id, int64_t port_id)
+{
+    /* To/from EVPN VTEP logical port keys are always local. */
+    if (OVN_IS_EVPN_KEY(port_id)) {
+        return true;
+    }
+
+    char buf[16];
+    get_unique_lport_key(dp_id, port_id, buf, sizeof(buf));
+
+    if (!sset_contains(l_ctx_in->related_lport_ids, buf)) {
+        VLOG_DBG("lflow "UUID_FMT" port %s in match is not local, skip",
+                 UUID_ARGS(lflow_uuid), buf);
+        return false;
+    }
+    return true;
 }
 
 /* Adds the logical flows from the Logical_Flow table to flow tables. */
@@ -332,14 +377,23 @@ lflow_parse_actions(const struct sbrec_logical_flow *lflow,
         .nd_ra_opts = l_ctx_in->nd_ra_opts,
         .controller_event_opts = l_ctx_in->controller_event_opts,
 
-        .pipeline = ingress ? OVNACT_P_INGRESS : OVNACT_P_EGRESS,
-        .n_tables = LOG_PIPELINE_LEN,
+        .pipeline = ingress ? OVNACT_P_INGRESS
+                            : OVNACT_P_EGRESS,
+        .n_tables = ingress ? LOG_PIPELINE_INGRESS_LEN
+                            : LOG_PIPELINE_EGRESS_LEN,
         .cur_ltable = lflow->table_id,
     };
 
-    struct lex_str actions_s =
-        lexer_parse_template_string(lflow->actions, l_ctx_in->template_vars,
-                                    template_vars_ref);
+    struct lex_str actions_s;
+    if (!lexer_parse_template_string(&actions_s, lflow->actions,
+                                     l_ctx_in->template_vars,
+                                     template_vars_ref)) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
+        VLOG_WARN_RL(&rl, "error parsing actions \"%s\"",
+                     lflow->actions);
+        return false;
+    }
+
     char *error = ovnacts_parse_string(lex_str_get(&actions_s), &pp,
                                        ovnacts_out, prereqs_out);
     lex_str_free(&actions_s);
@@ -438,21 +492,24 @@ consider_lflow_for_added_as_ips__(
     struct expr_constant_set *new_fake_as = NULL;
     struct in6_addr dummy_ip;
     bool has_dummy_ip = false;
-    ovs_assert(as_diff_added->n_values);
+    ovs_assert(vector_len(&as_diff_added->values));
 
     /* When there is only 1 element, we append a dummy address and create a
      * fake address set with 2 elements, so that the lflow parsing would
      * generate exactly the same format of flows as it would when parsing with
      * the original address set. */
-    if (as_diff_added->n_values == 1) {
+    if (vector_len(&as_diff_added->values) == 1) {
         new_fake_as = xzalloc(sizeof *new_fake_as);
-        new_fake_as->values = xzalloc(sizeof *new_fake_as->values * 2);
-        new_fake_as->n_values = 2;
-        new_fake_as->values[0] = new_fake_as->values[1] =
-            as_diff_added->values[0];
+        new_fake_as->values =
+            VECTOR_CAPACITY_INITIALIZER(struct expr_constant, 2);
+        struct expr_constant c =
+            vector_get(&as_diff_added->values, 0, struct expr_constant);
+        vector_push(&new_fake_as->values, &c);
         /* Make a dummy ip that is different from the real one. */
-        new_fake_as->values[1].value.u8_val++;
-        dummy_ip = new_fake_as->values[1].value.ipv6;
+        c.value.u8_val++;
+        dummy_ip = c.value.ipv6;
+        vector_push(&new_fake_as->values, &c);
+
         has_dummy_ip = true;
         fake_as = new_fake_as;
     }
@@ -519,13 +576,14 @@ consider_lflow_for_added_as_ips__(
      * the generated matches can't be mapped from the items in the
      * as_diff_added. So we need to fall back to reprocessing the lflow.
      */
-    if (hmap_count(&matches) != as_ref_count * as_diff_added->n_values) {
+    size_t n_values = vector_len(&as_diff_added->values);
+    if (hmap_count(&matches) != as_ref_count * n_values) {
         VLOG_DBG("lflow "UUID_FMT", addrset %s: Generated flows count "
                  "(%"PRIuSIZE") " "doesn't match added addresses count "
                  "(%"PRIuSIZE") and ref_count (%"PRIuSIZE"). "
                  "Need reprocessing.",
                  UUID_ARGS(&lflow->header_.uuid), as_name,
-                 hmap_count(&matches), as_diff_added->n_values, as_ref_count);
+                 hmap_count(&matches), n_values, as_ref_count);
         handled = false;
         goto done;
     }
@@ -601,19 +659,21 @@ as_update_can_be_handled(const char *as_name, struct addr_set_diff *as_diff,
     struct expr_constant_set *as = shash_find_data(l_ctx_in->addr_sets,
                                                    as_name);
     ovs_assert(as);
-    size_t n_added = as_diff->added ? as_diff->added->n_values : 0;
-    size_t n_deleted = as_diff->deleted ? as_diff->deleted->n_values : 0;
-    size_t old_as_size = as->n_values + n_deleted - n_added;
+    size_t n_values = vector_len(&as->values);
+    size_t n_added = as_diff->added ? vector_len(&as_diff->added->values) : 0;
+    size_t n_deleted =
+        as_diff->deleted ? vector_len(&as_diff->deleted->values) : 0;
+    size_t old_as_size = n_values + n_deleted - n_added;
 
     /* If the change may impact n_conj, i.e. the template of the flows would
      * change, we must reprocess the lflow. */
-    if (old_as_size <= 1 || as->n_values <= 1) {
+    if (old_as_size <= 1 || n_values <= 1) {
         return false;
     }
 
     /* If the size of the diff is too big, reprocessing may be more
      * efficient than incrementally processing the diffs.  */
-    if ((n_added + n_deleted) >= as->n_values) {
+    if ((n_added + n_deleted) >= n_values) {
         return false;
     }
 
@@ -710,8 +770,8 @@ lflow_handle_addr_set_update(const char *as_name,
 
         if (as_diff->deleted) {
             struct addrset_info as_info;
-            for (size_t i = 0; i < as_diff->deleted->n_values; i++) {
-                struct expr_constant *c = &as_diff->deleted->values[i];
+            const struct expr_constant *c;
+            VECTOR_FOR_EACH_PTR (&as_diff->deleted->values, c) {
                 if (!as_info_from_expr_const(as_name, c, &as_info)) {
                     continue;
                 }
@@ -741,7 +801,7 @@ done:
 
 bool
 lflow_handle_changed_ref(enum objdep_type type, const char *res_name,
-                         struct ovs_list *objs_todo,
+                         struct uuidset *objs_todo,
                          const void *in_arg, void *out_arg)
 {
     struct lflow_ctx_in *l_ctx_in = CONST_CAST(struct lflow_ctx_in *, in_arg);
@@ -749,22 +809,13 @@ lflow_handle_changed_ref(enum objdep_type type, const char *res_name,
 
     /* Re-parse the related lflows. */
     /* Firstly, flood remove the flows from desired flow table. */
-    struct object_to_resources_list_node *resource_list_node_uuid;
-    struct uuidset flood_remove_nodes =
-        UUIDSET_INITIALIZER(&flood_remove_nodes);
-    LIST_FOR_EACH_SAFE (resource_list_node_uuid, list_node, objs_todo) {
-        const struct uuid *obj_uuid = &resource_list_node_uuid->obj_uuid;
-        VLOG_DBG("Reprocess lflow "UUID_FMT" for resource type: %s,"
-                 " name: %s.",
-                 UUID_ARGS(obj_uuid), objdep_type_name(type), res_name);
-        uuidset_insert(&flood_remove_nodes, obj_uuid);
-        free(resource_list_node_uuid);
-    }
-    ofctrl_flood_remove_flows(l_ctx_out->flow_table, &flood_remove_nodes);
+    ofctrl_flood_remove_flows(l_ctx_out->flow_table, objs_todo);
 
     /* Secondly, for each lflow that is actually removed, reprocessing it. */
     struct uuidset_node *ofrn;
-    UUIDSET_FOR_EACH (ofrn, &flood_remove_nodes) {
+    UUIDSET_FOR_EACH (ofrn, objs_todo) {
+        VLOG_DBG("Reprocess lflow "UUID_FMT" for resource type: %s, name: %s.",
+                 UUID_ARGS(&ofrn->uuid), objdep_type_name(type), res_name);
         objdep_mgr_remove_obj(l_ctx_out->lflow_deps_mgr, &ofrn->uuid);
         lflow_conj_ids_free(l_ctx_out->conj_ids, &ofrn->uuid);
 
@@ -791,7 +842,8 @@ lflow_handle_changed_ref(enum objdep_type type, const char *res_name,
 
         consider_logical_flow(lflow, false, l_ctx_in, l_ctx_out);
     }
-    uuidset_destroy(&flood_remove_nodes);
+
+    uuidset_destroy(objs_todo);
     return true;
 }
 
@@ -849,6 +901,7 @@ add_matches_to_flow_table(const struct sbrec_logical_flow *lflow,
         .lflow = lflow,
         .deps_mgr = l_ctx_out->lflow_deps_mgr,
         .chassis_tunnels = l_ctx_in->chassis_tunnels,
+        .local_bindings = l_ctx_in->lbinding_lports,
     };
 
     /* Parse any meter to be used if this flow should punt packets to
@@ -863,6 +916,7 @@ add_matches_to_flow_table(const struct sbrec_logical_flow *lflow,
     struct ofpbuf ofpacts = OFPBUF_STUB_INITIALIZER(ofpacts_stub);
     struct ovnact_encode_params ep = {
         .lookup_port = lookup_port_cb,
+        .lookup_local_port = lookup_local_port_cb,
         .tunnel_ofport = tunnel_ofport_cb,
         .aux = &aux,
         .is_switch = ldp->is_switch,
@@ -871,7 +925,6 @@ add_matches_to_flow_table(const struct sbrec_logical_flow *lflow,
         .collector_ids = l_ctx_in->collector_ids,
         .lflow_uuid = lflow->header_.uuid,
         .dp_key = ldp->datapath->tunnel_key,
-        .explicit_arp_ns_output = l_ctx_in->explicit_arp_ns_output,
 
         .pipeline = ingress ? OVNACT_P_INGRESS : OVNACT_P_EGRESS,
         .ingress_ptable = OFTABLE_LOG_INGRESS_PIPELINE,
@@ -883,10 +936,18 @@ add_matches_to_flow_table(const struct sbrec_logical_flow *lflow,
         .lb_hairpin_reply_ptable = OFTABLE_CHK_LB_HAIRPIN_REPLY,
         .ct_snat_vip_ptable = OFTABLE_CT_SNAT_HAIRPIN,
         .fdb_ptable = OFTABLE_GET_FDB,
+        .remote_fdb_ptable = OFTABLE_GET_REMOTE_FDB,
         .fdb_lookup_ptable = OFTABLE_LOOKUP_FDB,
         .in_port_sec_ptable = OFTABLE_CHK_IN_PORT_SEC,
         .out_port_sec_ptable = OFTABLE_CHK_OUT_PORT_SEC,
         .mac_cache_use_table = OFTABLE_MAC_CACHE_USE,
+        .ct_nw_dst_load_table = OFTABLE_CT_ORIG_NW_DST_LOAD,
+        .ct_ip6_dst_load_table = OFTABLE_CT_ORIG_IP6_DST_LOAD,
+        .ct_tp_dst_load_table = OFTABLE_CT_ORIG_TP_DST_LOAD,
+        .ct_proto_load_table = OFTABLE_CT_ORIG_PROTO_LOAD,
+        .flood_remote_table = OFTABLE_FLOOD_REMOTE_CHASSIS,
+        .ct_state_save_table = OFTABLE_CT_STATE_SAVE,
+        .evpn_arp_ptable = OFTABLE_EVPN_ARP_LOOKUP,
         .ctrl_meter_id = ctrl_meter_id,
         .common_nat_ct_zone = get_common_nat_zone(ldp),
     };
@@ -894,22 +955,15 @@ add_matches_to_flow_table(const struct sbrec_logical_flow *lflow,
 
     struct expr_match *m;
     HMAP_FOR_EACH (m, hmap_node, matches) {
-        match_set_metadata(&m->match, htonll(ldp->datapath->tunnel_key));
+        int64_t dp_id = ldp->datapath->tunnel_key;
+        match_set_metadata(&m->match, htonll(dp_id));
         if (ldp->is_switch) {
             unsigned int reg_index
                 = (ingress ? MFF_LOG_INPORT : MFF_LOG_OUTPORT) - MFF_REG0;
             int64_t port_id = m->match.flow.regs[reg_index];
-            if (port_id) {
-                int64_t dp_id = ldp->datapath->tunnel_key;
-                char buf[16];
-                get_unique_lport_key(dp_id, port_id, buf, sizeof(buf));
-                if (!sset_contains(l_ctx_in->related_lport_ids, buf)) {
-                    VLOG_DBG("lflow "UUID_FMT
-                             " port %s in match is not local, skip",
-                             UUID_ARGS(&lflow->header_.uuid),
-                             buf);
-                    continue;
-                }
+            if (port_id && !lport_id_is_local(l_ctx_in, &lflow->header_.uuid,
+                                              dp_id, port_id)) {
+                continue;
             }
         }
 
@@ -918,7 +972,7 @@ add_matches_to_flow_table(const struct sbrec_logical_flow *lflow,
             .ip = m->as_ip,
             .mask = m->as_mask
         };
-        if (!m->n) {
+        if (vector_is_empty(&m->conjunctions)) {
             ofctrl_add_flow_metered(l_ctx_out->flow_table, ptable,
                                     lflow->priority,
                                     lflow->header_.uuid.parts[0], &m->match,
@@ -926,29 +980,14 @@ add_matches_to_flow_table(const struct sbrec_logical_flow *lflow,
                                     ctrl_meter_id,
                                     as_info.name ? &as_info : NULL);
         } else {
-            if (m->n > 1) {
+            if (vector_len(&m->conjunctions) > 1) {
                 ovs_assert(!as_info.name);
             }
-            uint64_t conj_stubs[64 / 8];
-            struct ofpbuf conj;
-
-            ofpbuf_use_stub(&conj, conj_stubs, sizeof conj_stubs);
-            for (int i = 0; i < m->n; i++) {
-                const struct cls_conjunction *src = &m->conjunctions[i];
-                struct ofpact_conjunction *dst;
-
-                dst = ofpact_put_CONJUNCTION(&conj);
-                dst->id = src->id;
-                dst->clause = src->clause;
-                dst->n_clauses = src->n_clauses;
-            }
-
-            ofctrl_add_or_append_flow(l_ctx_out->flow_table, ptable,
-                                      lflow->priority, 0,
-                                      &m->match, &conj, &lflow->header_.uuid,
-                                      ctrl_meter_id,
-                                      as_info.name ? &as_info : NULL);
-            ofpbuf_uninit(&conj);
+            ofctrl_add_or_append_conj_flow(l_ctx_out->flow_table, ptable,
+                                           lflow->priority, &m->match,
+                                           &m->conjunctions,
+                                           &lflow->header_.uuid, ctrl_meter_id,
+                                           as_info.name ? &as_info : NULL);
         }
     }
 
@@ -975,10 +1014,23 @@ convert_match_to_expr(const struct sbrec_logical_flow *lflow,
     struct sset port_groups_ref = SSET_INITIALIZER(&port_groups_ref);
     char *error = NULL;
 
-    struct lex_str match_s = lexer_parse_template_string(lflow->match,
-                                                         template_vars,
-                                                         template_vars_ref);
-    struct expr *e = expr_parse_string(lex_str_get(&match_s), &symtab,
+    struct lex_str match_s;
+    if (!lexer_parse_template_string(&match_s, lflow->match, template_vars,
+                                     template_vars_ref)) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
+        VLOG_WARN_RL(&rl, "error parsing match \"%s\"",
+                     lflow->match);
+        return NULL;
+    }
+
+    /* Check if this logical flow requires ACL CT translation.
+     * If the tags contains "acl_ct_translation"="true", we use the
+     * alternative symbol table that maps L4 fields (tcp/udp/sctp ports)
+     * to their CT equivalents. */
+    bool ct_trans = smap_get_bool(&lflow->tags, "acl_ct_translation", false);
+    struct shash *symtab_to_use = ct_trans ? &acl_ct_symtab : &symtab;
+
+    struct expr *e = expr_parse_string(lex_str_get(&match_s), symtab_to_use,
                                        addr_sets, port_groups, &addr_sets_ref,
                                        &port_groups_ref,
                                        ldp->datapath->tunnel_key,
@@ -1010,7 +1062,7 @@ convert_match_to_expr(const struct sbrec_logical_flow *lflow,
             e = expr_combine(EXPR_T_AND, e, *prereqs);
             *prereqs = NULL;
         }
-        e = expr_annotate(e, &symtab, &error);
+        e = expr_annotate(e, symtab_to_use, &error);
     }
     if (error) {
         static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
@@ -1050,11 +1102,8 @@ consider_logical_flow__(const struct sbrec_logical_flow *lflow,
                      "found, skip", UUID_ARGS(&lflow->header_.uuid), io_port);
             return;
         }
-        char buf[16];
-        get_unique_lport_key(dp->tunnel_key, pb->tunnel_key, buf, sizeof buf);
-        if (!sset_contains(l_ctx_in->related_lport_ids, buf)) {
-            VLOG_DBG("lflow "UUID_FMT" matches inport/outport %s that's not "
-                     "local, skip", UUID_ARGS(&lflow->header_.uuid), io_port);
+        if (!lport_id_is_local(l_ctx_in, &lflow->header_.uuid,
+                               dp->tunnel_key, pb->tunnel_key)) {
             return;
         }
     }
@@ -1283,36 +1332,12 @@ consider_logical_flow(const struct sbrec_logical_flow *lflow,
 }
 
 static void
-put_load(const uint8_t *data, size_t len,
-         enum mf_field_id dst, int ofs, int n_bits,
-         struct ofpbuf *ofpacts)
-{
-    struct ofpact_set_field *sf = ofpact_put_set_field(ofpacts,
-                                                       mf_from_id(dst), NULL,
-                                                       NULL);
-    bitwise_copy(data, len, 0, sf->value, sf->field->n_bytes, ofs, n_bits);
-    bitwise_one(ofpact_set_field_mask(sf), sf->field->n_bytes, ofs, n_bits);
-}
-
-static void
-put_load64(uint64_t value, enum mf_field_id dst, int ofs, int n_bits,
-           struct ofpbuf *ofpacts)
-{
-    struct ofpact_set_field *sf = ofpact_put_set_field(ofpacts,
-                                                       mf_from_id(dst), NULL,
-                                                       NULL);
-    ovs_be64 n_value = htonll(value);
-    bitwise_copy(&n_value, 8, 0, sf->value, sf->field->n_bytes, ofs, n_bits);
-    bitwise_one(ofpact_set_field_mask(sf), sf->field->n_bytes, ofs, n_bits);
-}
-
-static void
-consider_neighbor_flow(struct ovsdb_idl_index *sbrec_port_binding_by_name,
-                       const struct hmap *local_datapaths,
-                       const struct sbrec_mac_binding *b,
-                       const struct sbrec_static_mac_binding *smb,
-                       struct ovn_desired_flow_table *flow_table,
-                       uint16_t priority)
+consider_neighbor_flow__(struct ovsdb_idl_index *sbrec_port_binding_by_name,
+                         const struct hmap *local_datapaths,
+                         const struct sbrec_mac_binding *b,
+                         const struct sbrec_static_mac_binding *smb,
+                         struct ovn_desired_flow_table *flow_table,
+                         enum neigh_of_rule_prio priority)
 {
     if (!b && !smb) {
         return;
@@ -1321,6 +1346,7 @@ consider_neighbor_flow(struct ovsdb_idl_index *sbrec_port_binding_by_name,
     char *logical_port = b ? b->logical_port : smb->logical_port;
     char *ip = b ? b->ip : smb->ip;
     char *mac = b ? b->mac : smb->mac;
+    bool needs_usage_tracking = !!b;
 
     const struct sbrec_port_binding *pb
         = lport_lookup_by_name(sbrec_port_binding_by_name, logical_port);
@@ -1336,85 +1362,16 @@ consider_neighbor_flow(struct ovsdb_idl_index *sbrec_port_binding_by_name,
         return;
     }
 
-    struct match get_arp_match = MATCH_CATCHALL_INITIALIZER;
-    struct match lookup_arp_match = MATCH_CATCHALL_INITIALIZER;
-    struct match mb_cache_use_match = MATCH_CATCHALL_INITIALIZER;
-
-    if (strchr(ip, '.')) {
-        ovs_be32 ip_addr;
-        if (!ip_parse(ip, &ip_addr)) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-            VLOG_WARN_RL(&rl, "bad 'ip' %s", ip);
-            return;
-        }
-
-        match_set_reg(&get_arp_match, 0, ntohl(ip_addr));
-
-        match_set_reg(&lookup_arp_match, 0, ntohl(ip_addr));
-        match_set_dl_type(&lookup_arp_match, htons(ETH_TYPE_ARP));
-
-        match_set_dl_type(&mb_cache_use_match, htons(ETH_TYPE_IP));
-        match_set_nw_src(&mb_cache_use_match, ip_addr);
-    } else {
-        struct in6_addr ip6;
-        if (!ipv6_parse(ip, &ip6)) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-            VLOG_WARN_RL(&rl, "bad 'ip' %s", ip);
-            return;
-        }
-        ovs_be128 value;
-        memcpy(&value, &ip6, sizeof(value));
-        match_set_xxreg(&get_arp_match, 0, ntoh128(value));
-
-        match_set_xxreg(&lookup_arp_match, 0, ntoh128(value));
-        match_set_dl_type(&lookup_arp_match, htons(ETH_TYPE_IPV6));
-        match_set_nw_proto(&lookup_arp_match, 58);
-        match_set_icmp_code(&lookup_arp_match, 0);
-
-        match_set_dl_type(&mb_cache_use_match, htons(ETH_TYPE_IPV6));
-        match_set_ipv6_src(&mb_cache_use_match, &ip6);
+    struct in6_addr ip_addr;
+    if (!ip46_parse(ip, &ip_addr)) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
+        VLOG_WARN_RL(&rl, "bad 'ip' %s", ip);
+        return;
     }
 
-    match_set_metadata(&get_arp_match, htonll(pb->datapath->tunnel_key));
-    match_set_reg(&get_arp_match, MFF_LOG_OUTPORT - MFF_REG0, pb->tunnel_key);
-
-    match_set_metadata(&lookup_arp_match, htonll(pb->datapath->tunnel_key));
-    match_set_reg(&lookup_arp_match, MFF_LOG_INPORT - MFF_REG0,
-                  pb->tunnel_key);
-
-    match_set_dl_src(&mb_cache_use_match, mac_addr);
-    match_set_reg(&mb_cache_use_match, MFF_LOG_INPORT - MFF_REG0,
-                  pb->tunnel_key);
-    match_set_metadata(&mb_cache_use_match, htonll(pb->datapath->tunnel_key));
-
-    uint64_t stub[1024 / 8];
-    struct ofpbuf ofpacts = OFPBUF_STUB_INITIALIZER(stub);
-    uint8_t value = 1;
-    put_load(mac_addr.ea, sizeof mac_addr.ea, MFF_ETH_DST, 0, 48, &ofpacts);
-    put_load(&value, sizeof value, MFF_LOG_FLAGS, MLF_LOOKUP_MAC_BIT, 1,
-             &ofpacts);
-    ofctrl_add_flow(flow_table, OFTABLE_MAC_BINDING, priority,
-                    b ? b->header_.uuid.parts[0] : smb->header_.uuid.parts[0],
-                    &get_arp_match, &ofpacts,
-                    b ? &b->header_.uuid : &smb->header_.uuid);
-
-    ofpbuf_clear(&ofpacts);
-    put_load(&value, sizeof value, MFF_LOG_FLAGS, MLF_LOOKUP_MAC_BIT, 1,
-             &ofpacts);
-    match_set_dl_src(&lookup_arp_match, mac_addr);
-    ofctrl_add_flow(flow_table, OFTABLE_MAC_LOOKUP, priority,
-                    b ? b->header_.uuid.parts[0] : smb->header_.uuid.parts[0],
-                    &lookup_arp_match, &ofpacts,
-                    b ? &b->header_.uuid : &smb->header_.uuid);
-
-    if (b) {
-        ofpbuf_clear(&ofpacts);
-        ofctrl_add_flow(flow_table, OFTABLE_MAC_CACHE_USE, priority,
-                        b->header_.uuid.parts[0], &mb_cache_use_match,
-                        &ofpacts, &b->header_.uuid);
-    }
-
-    ofpbuf_uninit(&ofpacts);
+    consider_neighbor_flow(pb,  b ? &b->header_.uuid : &smb->header_.uuid,
+                           &ip_addr, mac_addr, flow_table, priority,
+                           needs_usage_tracking);
 }
 
 /* Adds an OpenFlow flow to flow tables for each MAC binding in the OVN
@@ -1429,16 +1386,19 @@ add_neighbor_flows(struct ovsdb_idl_index *sbrec_port_binding_by_name,
     /* Add flows for learnt MAC bindings */
     const struct sbrec_mac_binding *b;
     SBREC_MAC_BINDING_TABLE_FOR_EACH (b, mac_binding_table) {
-        consider_neighbor_flow(sbrec_port_binding_by_name, local_datapaths,
-                               b, NULL, flow_table, 100);
+        consider_neighbor_flow__(sbrec_port_binding_by_name, local_datapaths,
+                                 b, NULL, flow_table,
+                                 NEIGH_OF_DYNAMIC_MAC_BINDING_PRIO);
     }
 
     /* Add flows for statically configured MAC bindings */
     const struct sbrec_static_mac_binding *smb;
     SBREC_STATIC_MAC_BINDING_TABLE_FOR_EACH (smb, smb_table) {
-        consider_neighbor_flow(sbrec_port_binding_by_name, local_datapaths,
-                               NULL, smb, flow_table,
-                               smb->override_dynamic_mac ? 150 : 50);
+        consider_neighbor_flow__(sbrec_port_binding_by_name, local_datapaths,
+                                 NULL, smb, flow_table,
+                                 smb->override_dynamic_mac
+                                 ? NEIGH_OF_STATIC_MAC_BINDING_HIGH_PRIO
+                                 : NEIGH_OF_STATIC_MAC_BINDING_LOW_PRIO);
     }
 }
 
@@ -1631,24 +1591,13 @@ static void
 add_lb_vip_hairpin_flows(const struct ovn_controller_lb *lb,
                          struct ovn_lb_vip *lb_vip,
                          struct ovn_lb_backend *lb_backend,
-                         bool use_ct_mark,
                          struct ovn_desired_flow_table *flow_table)
 {
     uint64_t stub[1024 / 8];
     struct ofpbuf ofpacts = OFPBUF_STUB_INITIALIZER(stub);
     struct match hairpin_match = MATCH_CATCHALL_INITIALIZER;
 
-    uint8_t value = 1;
-    put_load(&value, sizeof value, MFF_LOG_FLAGS,
-             MLF_LOOKUP_LB_HAIRPIN_BIT, 1, &ofpacts);
-
-    /* Matching on ct_nw_dst()/ct_ipv6_dst()/ct_tp_dst() requires matching
-     * on ct_state first.
-     */
-    if (!lb->hairpin_orig_tuple) {
-        uint32_t ct_state = OVS_CS_F_TRACKED | OVS_CS_F_DST_NAT;
-        match_set_ct_state_masked(&hairpin_match, ct_state, ct_state);
-    }
+    put_load(1, MFF_LOG_FLAGS, MLF_LOOKUP_LB_HAIRPIN_BIT, 1, &ofpacts);
 
     if (IN6_IS_ADDR_V4MAPPED(&lb_vip->vip)) {
         ovs_be32 bip4 = in6_addr_get_mapped_ipv4(&lb_backend->ip);
@@ -1660,14 +1609,8 @@ add_lb_vip_hairpin_flows(const struct ovn_controller_lb *lb,
         match_set_dl_type(&hairpin_match, htons(ETH_TYPE_IP));
         match_set_nw_src(&hairpin_match, bip4);
         match_set_nw_dst(&hairpin_match, bip4);
-
-        if (!lb->hairpin_orig_tuple) {
-            match_set_ct_nw_dst(&hairpin_match, vip4);
-        } else {
-            match_set_reg(&hairpin_match,
-                          MFF_LOG_LB_ORIG_DIP_IPV4 - MFF_LOG_REG0,
-                          ntohl(vip4));
-        }
+        match_set_reg(&hairpin_match, MFF_LOG_LB_ORIG_DIP_IPV4 - MFF_LOG_REG0,
+                      ntohl(vip4));
 
         add_lb_vip_hairpin_reply_action(NULL, snat_vip4, lb->proto,
                                         lb_backend->port,
@@ -1683,16 +1626,11 @@ add_lb_vip_hairpin_flows(const struct ovn_controller_lb *lb,
         match_set_ipv6_src(&hairpin_match, bip6);
         match_set_ipv6_dst(&hairpin_match, bip6);
 
-        if (!lb->hairpin_orig_tuple) {
-            match_set_ct_ipv6_dst(&hairpin_match, &lb_vip->vip);
-        } else {
-            ovs_be128 vip6_value;
-
-            memcpy(&vip6_value, &lb_vip->vip, sizeof vip6_value);
-            match_set_xxreg(&hairpin_match,
-                            MFF_LOG_LB_ORIG_DIP_IPV6 - MFF_LOG_XXREG0,
-                            ntoh128(vip6_value));
-        }
+        ovs_be128 vip6_value;
+        memcpy(&vip6_value, &lb_vip->vip, sizeof vip6_value);
+        match_set_xxreg(&hairpin_match,
+                        MFF_LOG_LB_ORIG_DIP_IPV6 - MFF_LOG_XXREG0,
+                        ntoh128(vip6_value));
 
         add_lb_vip_hairpin_reply_action(snat_vip6, 0, lb->proto,
                                         lb_backend->port,
@@ -1703,14 +1641,9 @@ add_lb_vip_hairpin_flows(const struct ovn_controller_lb *lb,
     if (lb_backend->port) {
         match_set_nw_proto(&hairpin_match, lb->proto);
         match_set_tp_dst(&hairpin_match, htons(lb_backend->port));
-        if (!lb->hairpin_orig_tuple) {
-            match_set_ct_nw_proto(&hairpin_match, lb->proto);
-            match_set_ct_tp_dst(&hairpin_match, htons(lb_vip->vip_port));
-        } else {
-            match_set_reg_masked(&hairpin_match,
-                                 MFF_LOG_LB_ORIG_TP_DPORT - MFF_REG0,
-                                 lb_vip->vip_port, UINT16_MAX);
-        }
+        match_set_reg_masked(&hairpin_match,
+                             MFF_LOG_LB_ORIG_TP_DPORT - MFF_REG0,
+                             lb_vip->vip_port, UINT16_MAX);
     }
 
     /* In the original direction, only match on traffic that was already
@@ -1722,29 +1655,13 @@ add_lb_vip_hairpin_flows(const struct ovn_controller_lb *lb,
      * - packets must have ip.src == ip.dst at this point.
      * - the destination protocol and port must be of a valid backend that
      *   has the same IP as ip.dst.
-     *
-     * During upgrades logical flows might still use the old way of storing
-     * ct.natted in ct_label.  For backwards compatibility, only use ct_mark
-     * if ovn-northd notified ovn-controller to do that.
      */
-    if (use_ct_mark) {
-        uint32_t lb_ct_mark = OVN_CT_NATTED;
-        match_set_ct_mark_masked(&hairpin_match, lb_ct_mark, lb_ct_mark);
+    uint32_t lb_ct_mark = OVN_CT_NATTED;
+    match_set_ct_mark_masked(&hairpin_match, lb_ct_mark, lb_ct_mark);
 
-        ofctrl_add_flow(flow_table, OFTABLE_CHK_LB_HAIRPIN, 100,
-                        lb->slb->header_.uuid.parts[0], &hairpin_match,
-                        &ofpacts, &lb->slb->header_.uuid);
-    } else {
-        match_set_ct_mark_masked(&hairpin_match, 0, 0);
-        ovs_u128 lb_ct_label = {
-            .u64.lo = OVN_CT_NATTED,
-        };
-        match_set_ct_label_masked(&hairpin_match, lb_ct_label, lb_ct_label);
-
-        ofctrl_add_flow(flow_table, OFTABLE_CHK_LB_HAIRPIN, 100,
-                        lb->slb->header_.uuid.parts[0], &hairpin_match,
-                        &ofpacts, &lb->slb->header_.uuid);
-    }
+    ofctrl_add_flow(flow_table, OFTABLE_CHK_LB_HAIRPIN, 100,
+                    lb->slb->header_.uuid.parts[0], &hairpin_match,
+                    &ofpacts, &lb->slb->header_.uuid);
 
     ofpbuf_uninit(&ofpacts);
 }
@@ -1795,6 +1712,7 @@ add_lb_ct_snat_hairpin_vip_flow(const struct ovn_controller_lb *lb,
 {
     uint64_t stub[1024 / 8];
     struct ofpbuf ofpacts = OFPBUF_STUB_INITIALIZER(stub);
+    const size_t ct_offset = ofpacts.size;
 
     uint8_t address_family;
     if (IN6_IS_ADDR_V4MAPPED(&lb_vip->vip)) {
@@ -1811,10 +1729,6 @@ add_lb_ct_snat_hairpin_vip_flow(const struct ovn_controller_lb *lb,
     ct->flags = NX_CT_F_COMMIT;
     ct->alg = 0;
 
-    size_t nat_offset;
-    nat_offset = ofpacts.size;
-    ofpbuf_pull(&ofpacts, nat_offset);
-
     struct ofpact_nat *nat = ofpact_put_NAT(&ofpacts);
     nat->flags = NX_NAT_F_SRC;
     nat->range_af = address_family;
@@ -1828,52 +1742,31 @@ add_lb_ct_snat_hairpin_vip_flow(const struct ovn_controller_lb *lb,
                                    ? lb->hairpin_snat_ips.ipv6_addrs[0].addr
                                    : lb_vip->vip;
     }
-    ofpacts.header = ofpbuf_push_uninit(&ofpacts, nat_offset);
-    ofpact_finish(&ofpacts, &ct->ofpact);
+
+    ct = ofpbuf_at_assert(&ofpacts, ct_offset, sizeof *ct);
+    ofpacts.header = ct;
+    ofpact_finish_CT(&ofpacts, &ct);
 
     struct match match = MATCH_CATCHALL_INITIALIZER;
-
-    /* Matching on ct_nw_dst()/ct_ipv6_dst()/ct_tp_dst() requires matching
-     * on ct_state first.
-     */
-    if (!lb->hairpin_orig_tuple) {
-        uint32_t ct_state = OVS_CS_F_TRACKED | OVS_CS_F_DST_NAT;
-        match_set_ct_state_masked(&match, ct_state, ct_state);
-    }
 
     if (address_family == AF_INET) {
         ovs_be32 vip4 = in6_addr_get_mapped_ipv4(&lb_vip->vip);
 
         match_set_dl_type(&match, htons(ETH_TYPE_IP));
-
-        if (!lb->hairpin_orig_tuple) {
-            match_set_ct_nw_dst(&match, vip4);
-        } else {
-            match_set_reg(&match, MFF_LOG_LB_ORIG_DIP_IPV4 - MFF_LOG_REG0,
-                          ntohl(vip4));
-        }
+        match_set_reg(&match, MFF_LOG_LB_ORIG_DIP_IPV4 - MFF_LOG_REG0,
+                      ntohl(vip4));
     } else {
         match_set_dl_type(&match, htons(ETH_TYPE_IPV6));
-        if (!lb->hairpin_orig_tuple) {
-            match_set_ct_ipv6_dst(&match, &lb_vip->vip);
-        } else {
-            ovs_be128 vip6_value;
-
-            memcpy(&vip6_value, &lb_vip->vip, sizeof vip6_value);
-            match_set_xxreg(&match, MFF_LOG_LB_ORIG_DIP_IPV6 - MFF_LOG_XXREG0,
-                            ntoh128(vip6_value));
-        }
+        ovs_be128 vip6_value;
+        memcpy(&vip6_value, &lb_vip->vip, sizeof vip6_value);
+        match_set_xxreg(&match, MFF_LOG_LB_ORIG_DIP_IPV6 - MFF_LOG_XXREG0,
+                        ntoh128(vip6_value));
     }
 
     if (lb_vip->vip_port) {
         match_set_nw_proto(&match, lb->proto);
-        if (!lb->hairpin_orig_tuple) {
-            match_set_ct_nw_proto(&match, lb->proto);
-            match_set_ct_tp_dst(&match, htons(lb_vip->vip_port));
-        } else {
-            match_set_reg_masked(&match, MFF_LOG_LB_ORIG_TP_DPORT - MFF_REG0,
-                                 lb_vip->vip_port, UINT16_MAX);
-        }
+        match_set_reg_masked(&match, MFF_LOG_LB_ORIG_TP_DPORT - MFF_REG0,
+                             lb_vip->vip_port, UINT16_MAX);
     }
 
     bool use_hairpin_snat_ip = false;
@@ -1967,17 +1860,14 @@ add_lb_ct_snat_hairpin_flows(const struct ovn_controller_lb *lb,
 static void
 consider_lb_hairpin_flows(const struct ovn_controller_lb *lb,
                           const struct hmap *local_datapaths,
-                          bool use_ct_mark,
                           struct ovn_desired_flow_table *flow_table)
 {
     for (size_t i = 0; i < lb->n_vips; i++) {
         struct ovn_lb_vip *lb_vip = &lb->vips[i];
 
-        for (size_t j = 0; j < lb_vip->n_backends; j++) {
-            struct ovn_lb_backend *lb_backend = &lb_vip->backends[j];
-
-            add_lb_vip_hairpin_flows(lb, lb_vip, lb_backend,
-                                     use_ct_mark, flow_table);
+        struct ovn_lb_backend *lb_backend;
+        VECTOR_FOR_EACH_PTR (&lb_vip->backends, lb_backend) {
+            add_lb_vip_hairpin_flows(lb, lb_vip, lb_backend, flow_table);
         }
     }
 
@@ -1989,13 +1879,11 @@ consider_lb_hairpin_flows(const struct ovn_controller_lb *lb,
 static void
 add_lb_hairpin_flows(const struct hmap *local_lbs,
                      const struct hmap *local_datapaths,
-                     bool use_ct_mark,
                      struct ovn_desired_flow_table *flow_table)
 {
     const struct ovn_controller_lb *lb;
     HMAP_FOR_EACH (lb, hmap_node, local_lbs) {
-        consider_lb_hairpin_flows(lb, local_datapaths,
-                                  use_ct_mark, flow_table);
+        consider_lb_hairpin_flows(lb, local_datapaths, flow_table);
     }
 }
 
@@ -2027,8 +1915,9 @@ lflow_handle_changed_mac_bindings(
             }
             VLOG_DBG("handle new mac_binding "UUID_FMT,
                      UUID_ARGS(&mb->header_.uuid));
-            consider_neighbor_flow(sbrec_port_binding_by_name, local_datapaths,
-                                   mb, NULL, flow_table, 100);
+            consider_neighbor_flow__(sbrec_port_binding_by_name,
+                                     local_datapaths, mb, NULL, flow_table,
+                                     NEIGH_OF_DYNAMIC_MAC_BINDING_PRIO);
         }
     }
 }
@@ -2055,9 +1944,11 @@ lflow_handle_changed_static_mac_bindings(
             }
             VLOG_DBG("handle new static_mac_binding "UUID_FMT,
                      UUID_ARGS(&smb->header_.uuid));
-            consider_neighbor_flow(sbrec_port_binding_by_name, local_datapaths,
-                                   NULL, smb, flow_table,
-                                   smb->override_dynamic_mac ? 150 : 50);
+            consider_neighbor_flow__(sbrec_port_binding_by_name,
+                                     local_datapaths, NULL, smb, flow_table,
+                                     smb->override_dynamic_mac
+                                     ? NEIGH_OF_STATIC_MAC_BINDING_HIGH_PRIO
+                                     : NEIGH_OF_STATIC_MAC_BINDING_LOW_PRIO);
         }
     }
 }
@@ -2090,16 +1981,14 @@ consider_fdb_flows(const struct sbrec_fdb *fdb,
 
     uint64_t stub[1024 / 8];
     struct ofpbuf ofpacts = OFPBUF_STUB_INITIALIZER(stub);
-    put_load64(fdb->port_key, MFF_LOG_OUTPORT, 0, 32, &ofpacts);
+    put_load(fdb->port_key, MFF_LOG_OUTPORT, 0, 32, &ofpacts);
     ofctrl_add_flow(flow_table, OFTABLE_GET_FDB, 100,
                     fdb->header_.uuid.parts[0], &match, &ofpacts,
                     &fdb->header_.uuid);
     ofpbuf_clear(&ofpacts);
 
-    uint8_t value = 1;
     uint8_t is_vif =  pb ? !strcmp(pb->type, "") : 0;
-    put_load(&value, sizeof value, MFF_LOG_FLAGS,
-             MLF_LOOKUP_FDB_BIT, 1, &ofpacts);
+    put_load(1, MFF_LOG_FLAGS, MLF_LOOKUP_FDB_BIT, 1, &ofpacts);
 
     struct match lookup_match = MATCH_CATCHALL_INITIALIZER;
     match_set_metadata(&lookup_match, htonll(fdb->dp_key));
@@ -2155,7 +2044,6 @@ lflow_run(struct lflow_ctx_in *l_ctx_in, struct lflow_ctx_out *l_ctx_out)
                        l_ctx_out->flow_table);
     add_lb_hairpin_flows(l_ctx_in->local_lbs,
                          l_ctx_in->local_datapaths,
-                         l_ctx_in->lb_hairpin_use_ct_mark,
                          l_ctx_out->flow_table);
     add_fdb_flows(l_ctx_in->fdb_table, l_ctx_in->local_datapaths,
                   l_ctx_out->flow_table,
@@ -2187,6 +2075,8 @@ lflow_destroy(void)
 {
     expr_symtab_destroy(&symtab);
     shash_destroy(&symtab);
+    expr_symtab_destroy(&acl_ct_symtab);
+    shash_destroy(&acl_ct_symtab);
 }
 
 bool
@@ -2262,9 +2152,10 @@ lflow_add_flows_for_datapath(const struct sbrec_datapath_binding *dp,
     const struct sbrec_mac_binding *mb;
     SBREC_MAC_BINDING_FOR_EACH_EQUAL (
         mb, mb_index_row, l_ctx_in->sbrec_mac_binding_by_datapath) {
-        consider_neighbor_flow(l_ctx_in->sbrec_port_binding_by_name,
-                               l_ctx_in->local_datapaths,
-                               mb, NULL, l_ctx_out->flow_table, 100);
+        consider_neighbor_flow__(l_ctx_in->sbrec_port_binding_by_name,
+                                 l_ctx_in->local_datapaths,
+                                 mb, NULL, l_ctx_out->flow_table,
+                                 NEIGH_OF_DYNAMIC_MAC_BINDING_PRIO);
     }
     sbrec_mac_binding_index_destroy_row(mb_index_row);
 
@@ -2275,10 +2166,12 @@ lflow_add_flows_for_datapath(const struct sbrec_datapath_binding *dp,
     const struct sbrec_static_mac_binding *smb;
     SBREC_STATIC_MAC_BINDING_FOR_EACH_EQUAL (
         smb, smb_index_row, l_ctx_in->sbrec_static_mac_binding_by_datapath) {
-        consider_neighbor_flow(l_ctx_in->sbrec_port_binding_by_name,
-                               l_ctx_in->local_datapaths,
-                               NULL, smb, l_ctx_out->flow_table,
-                               smb->override_dynamic_mac ? 150 : 50);
+        consider_neighbor_flow__(l_ctx_in->sbrec_port_binding_by_name,
+                                 l_ctx_in->local_datapaths,
+                                 NULL, smb, l_ctx_out->flow_table,
+                                 smb->override_dynamic_mac
+                                 ? NEIGH_OF_STATIC_MAC_BINDING_HIGH_PRIO
+                                 : NEIGH_OF_STATIC_MAC_BINDING_LOW_PRIO);
     }
     sbrec_static_mac_binding_index_destroy_row(smb_index_row);
 
@@ -2290,7 +2183,8 @@ lflow_add_flows_for_datapath(const struct sbrec_datapath_binding *dp,
 bool
 lflow_handle_flows_for_lport(const struct sbrec_port_binding *pb,
                              struct lflow_ctx_in *l_ctx_in,
-                             struct lflow_ctx_out *l_ctx_out)
+                             struct lflow_ctx_out *l_ctx_out,
+                             bool deleted)
 {
     bool changed;
 
@@ -2311,6 +2205,9 @@ lflow_handle_flows_for_lport(const struct sbrec_port_binding *pb,
      * port binding'uuid', then this function should handle it properly.
      */
     ofctrl_remove_flows(l_ctx_out->flow_table, &pb->header_.uuid);
+    if (deleted) {
+        return true;
+    }
 
     if (pb->n_port_security && shash_find(l_ctx_in->binding_lports,
                                           pb->logical_port)) {
@@ -2388,15 +2285,12 @@ lflow_handle_changed_lbs(struct lflow_ctx_in *l_ctx_in,
                          struct lflow_ctx_out *l_ctx_out,
                          const struct uuidset *deleted_lbs,
                          const struct uuidset *updated_lbs,
-                         const struct uuidset *new_lbs,
-                         const struct hmap *old_lbs)
+                         const struct uuidset *new_lbs)
 {
     const struct ovn_controller_lb *lb;
 
     struct uuidset_node *uuid_node;
     UUIDSET_FOR_EACH (uuid_node, deleted_lbs) {
-        lb = ovn_controller_lb_find(old_lbs, &uuid_node->uuid);
-
         VLOG_DBG("Remove hairpin flows for deleted load balancer "UUID_FMT,
                  UUID_ARGS(&uuid_node->uuid));
         ofctrl_remove_flows(l_ctx_out->flow_table, &uuid_node->uuid);
@@ -2409,7 +2303,6 @@ lflow_handle_changed_lbs(struct lflow_ctx_in *l_ctx_in,
                   UUID_FMT, UUID_ARGS(&uuid_node->uuid));
         ofctrl_remove_flows(l_ctx_out->flow_table, &uuid_node->uuid);
         consider_lb_hairpin_flows(lb, l_ctx_in->local_datapaths,
-                                  l_ctx_in->lb_hairpin_use_ct_mark,
                                   l_ctx_out->flow_table);
     }
 
@@ -2419,7 +2312,6 @@ lflow_handle_changed_lbs(struct lflow_ctx_in *l_ctx_in,
         VLOG_DBG("Add load balancer hairpin flows for "UUID_FMT,
                  UUID_ARGS(&uuid_node->uuid));
         consider_lb_hairpin_flows(lb, l_ctx_in->local_datapaths,
-                                  l_ctx_in->lb_hairpin_use_ct_mark,
                                   l_ctx_out->flow_table);
     }
 
@@ -2478,6 +2370,156 @@ add_port_sec_flows(const struct shash *binding_lports,
     }
 }
 
+struct masked_ip4_addr {
+    ovs_be32 addr;
+    ovs_be32 mask;
+    ovs_be32 bcast;
+};
+
+struct masked_ip6_addr {
+    struct in6_addr addr;
+    struct in6_addr mask;
+};
+
+struct masked_eth_addr {
+    struct eth_addr addr;
+    struct eth_addr mask;
+};
+
+struct port_security_addresses {
+    struct eth_addr phys_addr;
+    /* Vector of 'struct masked_eth_addr'. */
+    struct vector vrrp4;
+    /* Vector of 'struct masked_eth_addr'. */
+    struct vector vrrp6;
+    /* Vector of 'struct masked_ip4_addr' .*/
+    struct vector ip4;
+    /* Vector of 'struct masked_ip6_addr' .*/
+    struct vector ip6;
+};
+
+static void
+port_security_addresses_init(struct port_security_addresses *ps_addr)
+{
+    *ps_addr = (struct port_security_addresses) {
+        .phys_addr = eth_addr_zero,
+        .vrrp4 = VECTOR_EMPTY_INITIALIZER(struct masked_eth_addr),
+        .vrrp6 = VECTOR_EMPTY_INITIALIZER(struct masked_eth_addr),
+        .ip4 = VECTOR_EMPTY_INITIALIZER(struct masked_ip4_addr),
+        .ip6 = VECTOR_EMPTY_INITIALIZER(struct masked_ip6_addr),
+    };
+}
+
+static void
+port_security_addresses_clear(struct port_security_addresses *ps_addr)
+{
+    vector_clear(&ps_addr->vrrp4);
+    vector_clear(&ps_addr->vrrp6);
+    vector_clear(&ps_addr->ip4);
+    vector_clear(&ps_addr->ip6);
+}
+
+static void
+port_security_addresses_destroy(struct port_security_addresses *ps_addr)
+{
+    vector_destroy(&ps_addr->vrrp4);
+    vector_destroy(&ps_addr->vrrp6);
+    vector_destroy(&ps_addr->ip4);
+    vector_destroy(&ps_addr->ip6);
+}
+
+static const struct masked_eth_addr maddr_any_vrrp4 = {
+    .addr = ETH_ADDR_C(00,00,5e,00,01,00),
+    .mask = ETH_ADDR_C(ff,ff,ff,ff,ff,00),
+};
+static const struct masked_eth_addr maddr_any_vrrp6 = {
+    .addr = ETH_ADDR_C(00,00,5e,00,02,00),
+    .mask = ETH_ADDR_C(ff,ff,ff,ff,ff,00),
+};
+
+static bool
+port_security_addresses_add_vrrp_mac(struct port_security_addresses *ps_addr,
+                                     struct eth_addr mac, unsigned int plen)
+{
+    /* Only the last byte contains ID for VRRPv3. */
+    if (plen < 40) {
+        return false;
+    }
+
+    /* Allow only zeroed masked portion of MAC. */
+    struct eth_addr mask = eth_addr_create_mask(plen);
+    if (eth_addr_to_uint64(mac) & ~eth_addr_to_uint64(mask)) {
+        return false;
+    }
+
+    struct masked_eth_addr maddr = (struct masked_eth_addr) {
+        .addr = mac,
+        .mask = mask,
+    };
+
+    /* The exact match on VRRPv3 MAC ending with zero is not allowed, the
+     * id is starting from 1. */
+    if (plen == 48) {
+        if (eth_addr_equals(mac, maddr_any_vrrp4.addr) ||
+            eth_addr_equals(mac, maddr_any_vrrp6.addr)) {
+            return false;
+        }
+    }
+
+    if (eth_addr_equal_except(maddr_any_vrrp4.addr, mac,
+                              maddr_any_vrrp4.mask)) {
+        vector_push(&ps_addr->vrrp4, &maddr);
+        return true;
+    }
+
+    if (eth_addr_equal_except(maddr_any_vrrp6.addr, mac,
+                              maddr_any_vrrp6.mask)) {
+        vector_push(&ps_addr->vrrp6, &maddr);
+        return true;
+    }
+
+    return false;
+}
+
+static bool
+port_security_addresses_add_ip(struct port_security_addresses *ps_addr,
+                               struct in6_addr ip, unsigned int plen)
+{
+    /* When the netmask is applied, if the host portion is non-zero, the host
+     * can only use the specified address. If zero, the host is allowed to
+     * use any address in the subnet. Also add broadcast in the special case
+     * of matching only the specified address.
+     */
+    if (IN6_IS_ADDR_V4MAPPED(&ip)) {
+        if (plen > 32) {
+            return false;
+        }
+
+        ovs_be32 addr = in6_addr_get_mapped_ipv4(&ip);
+        ovs_be32 mask = be32_prefix_mask(plen);
+
+        struct masked_ip4_addr maddr = (struct masked_ip4_addr) {
+            .addr = addr,
+            .mask = (addr & ~mask) ? OVS_BE32_MAX : mask,
+            .bcast = (addr & ~mask) ? (addr | ~mask) : htonl(0),
+        };
+        vector_push(&ps_addr->ip4, &maddr);
+    } else {
+        if (plen > 128) {
+            return false;
+        }
+
+        struct in6_addr mask = ipv6_create_mask(plen);
+        struct masked_ip6_addr maddr = (struct masked_ip6_addr) {
+            .addr = ip,
+            .mask = !ipv6_addr_is_host_zero(&ip, &mask) ? in6addr_exact : mask,
+        };
+        vector_push(&ps_addr->ip6, &maddr);
+    }
+
+    return true;
+}
+
 static void
 reset_match_for_port_sec_flows(const struct sbrec_port_binding *pb,
                                enum mf_field_id reg_id, struct match *match)
@@ -2490,17 +2532,13 @@ reset_match_for_port_sec_flows(const struct sbrec_port_binding *pb,
 static void build_port_sec_deny_action(struct ofpbuf *ofpacts)
 {
     ofpbuf_clear(ofpacts);
-    uint8_t value = 1;
-    put_load(&value, sizeof value, MFF_LOG_FLAGS,
-             MLF_CHECK_PORT_SEC_BIT, 1, ofpacts);
+    put_load(1, MFF_LOG_FLAGS, MLF_CHECK_PORT_SEC_BIT, 1, ofpacts);
 }
 
 static void build_port_sec_allow_action(struct ofpbuf *ofpacts)
 {
     ofpbuf_clear(ofpacts);
-    uint8_t value = 0;
-    put_load(&value, sizeof value, MFF_LOG_FLAGS,
-             MLF_CHECK_PORT_SEC_BIT, 1, ofpacts);
+    put_load(0, MFF_LOG_FLAGS, MLF_CHECK_PORT_SEC_BIT, 1, ofpacts);
 }
 
 static void build_port_sec_adv_nd_check(struct ofpbuf *ofpacts)
@@ -2575,51 +2613,52 @@ build_in_port_sec_default_flows(const struct sbrec_port_binding *pb,
     /* Add the below logical flow equivalent OF rules in 'in_port_sec_nd' table
      * priority: 80
      * match - "inport == pb->logical_port && icmp6 && icmp6.code == 135"
-     * action - "port_sec_failed = 0;"
+     * action - "port_sec_failed = 1;"
      * description: "Default allow all IPv6 NS packets"
-     * note: This is a hack for now.  Ideally we should do default drop.
-     *       There seems to be a bug in ovs-vswitchd which needs further
-     *       investigation.
-     *
-     * Eg.  If there are below OF rules in the same table
-     * (1) priority=90,icmp6,reg14=0x1,metadata=0x1,nw_ttl=255,icmp_type=135,
-     *     icmp_code=0,nd_sll=fa:16:3e:94:05:98
-     *     actions=load:0->NXM_NX_REG10[12]
-     * (2) priority=80,icmp6,reg14=0x1,metadata=0x1,nw_ttl=255,icmp_type=135,
-     *     icmp_code=0 actions=load:1->NXM_NX_REG10[12]
-     *
-     * An IPv6 NS packet with nd_sll = fa:16:3e:94:05:98 is matching on the
-     * second prio-80 flow instead of the first one.
+     * note: "Higher priority flows are added to allow the legit NS packets.
      */
     match_set_dl_type(m, htons(ETH_TYPE_IPV6));
     match_set_nw_proto(m, IPPROTO_ICMPV6);
     match_set_nw_ttl(m, 255);
     match_set_icmp_type(m, 135);
-    build_port_sec_allow_action(ofpacts); /*TODO:  Change this to
-                                           * build_port_sec_deny_action(). */
     ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 80,
                     pb->header_.uuid.parts[0], m, ofpacts,
                     &pb->header_.uuid);
 }
 
 static void
+build_out_port_sec_default_flows(const struct sbrec_port_binding *pb,
+                                struct match *m, struct ofpbuf *ofpacts,
+                                struct ovn_desired_flow_table *flow_table)
+{
+    /* Add the below logical flow equivalent OF rules in 'out_port_sec_nd'
+     * table.
+     * priority: 80
+     * match - "outport == pb->logical_port"
+     * action - "port_sec_failed = 1;"
+     * description: "Drop all traffic"
+     */
+    reset_match_for_port_sec_flows(pb, MFF_LOG_OUTPORT, m);
+    build_port_sec_deny_action(ofpacts);
+    ofctrl_add_flow(flow_table, OFTABLE_CHK_OUT_PORT_SEC, 80,
+                    pb->header_.uuid.parts[0], m, ofpacts,
+                    &pb->header_.uuid);
+}
+
+static void
 build_in_port_sec_no_ip_flows(const struct sbrec_port_binding *pb,
-                              struct lport_addresses *ps_addr,
+                              struct eth_addr mac, struct eth_addr mask,
                               struct match *m, struct ofpbuf *ofpacts,
                               struct ovn_desired_flow_table *flow_table)
 {
-    if (ps_addr->n_ipv4_addrs || ps_addr->n_ipv6_addrs) {
-        return;
-    }
-
     /* Add the below logical flow equivalent OF rules in 'in_port_sec' table.
      * priority: 90
-     * match - "inport == pb->logical_port && eth.src == ps_addr.ea"
+     * match - "inport == pb->logical_port && eth.src == mac/mask"
      * action - "next;"
      * description: "Advance the packet for ARP/ND check"
      */
     reset_match_for_port_sec_flows(pb, MFF_LOG_INPORT, m);
-    match_set_dl_src(m, ps_addr->ea);
+    match_set_dl_src_masked(m, mac, mask);
     build_port_sec_adv_nd_check(ofpacts);
     ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC, 90,
                     pb->header_.uuid.parts[0], m, ofpacts,
@@ -2628,43 +2667,26 @@ build_in_port_sec_no_ip_flows(const struct sbrec_port_binding *pb,
 
 static void
 build_in_port_sec_ip4_flows(const struct sbrec_port_binding *pb,
-                           struct lport_addresses *ps_addr,
-                           struct match *m, struct ofpbuf *ofpacts,
-                           struct ovn_desired_flow_table *flow_table)
+                            struct eth_addr mac, struct eth_addr mask,
+                            const struct vector *ip4_addrs,
+                            struct match *m, struct ofpbuf *ofpacts,
+                            struct ovn_desired_flow_table *flow_table)
 {
-    if (!ps_addr->n_ipv4_addrs) {
-        /* If no IPv4 addresses, then 'pb' is not allowed to send IPv4 traffic.
-         * build_in_port_sec_default_flows() takes care of this scenario. */
-        return;
-    }
-
     /* Advance all traffic from the port security eth address for ND check. */
     build_port_sec_allow_action(ofpacts);
+    reset_match_for_port_sec_flows(pb, MFF_LOG_INPORT, m);
+    match_set_dl_src_masked(m, mac, mask);
+    match_set_dl_type(m, htons(ETH_TYPE_IP));
 
     /* Add the below logical flow equivalent OF rules in in_port_sec.
      * priority: 90
-     * match - "inport == pb->port && eth.src == ps_addr.ea &&
-     *         ip4.src == {ps_addr.ipv4_addrs}"
+     * match - "inport == pb->port && eth.src == mac/mask &&
+     *         ip4.src == {ip4}"
      * action - "port_sec_failed = 0;"
      */
-    for (size_t j = 0; j < ps_addr->n_ipv4_addrs; j++) {
-        reset_match_for_port_sec_flows(pb, MFF_LOG_INPORT, m);
-        match_set_dl_src(m, ps_addr->ea);
-        match_set_dl_type(m, htons(ETH_TYPE_IP));
-
-        ovs_be32 mask = ps_addr->ipv4_addrs[j].mask;
-        /* When the netmask is applied, if the host portion is
-         * non-zero, the host can only use the specified
-         * address.  If zero, the host is allowed to use any
-         * address in the subnet.
-         */
-        if (ps_addr->ipv4_addrs[j].plen == 32 ||
-                ps_addr->ipv4_addrs[j].addr & ~mask) {
-            match_set_nw_src(m, ps_addr->ipv4_addrs[j].addr);
-        } else {
-            match_set_nw_src_masked(m, ps_addr->ipv4_addrs[j].addr, mask);
-        }
-
+    const struct masked_ip4_addr *ip;
+    VECTOR_FOR_EACH_PTR (ip4_addrs, ip) {
+        match_set_nw_src_masked(m, ip->addr, ip->mask);
         ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC, 90,
                         pb->header_.uuid.parts[0], m, ofpacts,
                         &pb->header_.uuid);
@@ -2672,20 +2694,14 @@ build_in_port_sec_ip4_flows(const struct sbrec_port_binding *pb,
 
     /* Add the below logical flow equivalent OF rules in in_port_sec.
      * priority: 90
-     * match - "inport == pb->port && eth.src == ps_addr.ea &&
+     * match - "inport == pb->port && eth.src == mac/mask &&
      *          ip4.src == 0.0.0.0 && ip4.dst == 255.255.255.255 &&
      *          udp.src == 67 && udp.dst == 68"
      * action - "port_sec_failed = 0;"
      * description: "Allow the DHCP requests."
      */
-    reset_match_for_port_sec_flows(pb, MFF_LOG_INPORT, m);
-    match_set_dl_src(m, ps_addr->ea);
-    match_set_dl_type(m, htons(ETH_TYPE_IP));
-
-    ovs_be32 ip4 = htonl(0);
-    match_set_nw_src(m, ip4);
-    ip4 = htonl(0xffffffff);
-    match_set_nw_dst(m, ip4);
+    match_set_nw_src(m, htonl(0));
+    match_set_nw_dst(m, htonl(0xffffffff));
     match_set_nw_proto(m, IPPROTO_UDP);
     match_set_tp_src(m, htons(68));
     match_set_tp_dst(m, htons(67));
@@ -2698,33 +2714,42 @@ build_in_port_sec_ip4_flows(const struct sbrec_port_binding *pb,
 /* Adds the OF rules to allow ARP packets in 'in_port_sec_nd' table. */
 static void
 build_in_port_sec_arp_flows(const struct sbrec_port_binding *pb,
-                           struct lport_addresses *ps_addr,
-                           struct match *m, struct ofpbuf *ofpacts,
-                           struct ovn_desired_flow_table *flow_table)
+                            struct eth_addr phys_mac,
+                            const struct vector *ip4_addrs,
+                            const struct vector *vrrp4_addrs,
+                            bool is_vrrp, struct match *m,
+                            struct ofpbuf *ofpacts,
+                            struct ovn_desired_flow_table *flow_table)
 {
-    if (!ps_addr->n_ipv4_addrs && ps_addr->n_ipv6_addrs) {
-        /* No ARP is allowed as only IPv6 addresses are configured. */
-        return;
-    }
-
     build_port_sec_allow_action(ofpacts);
+    reset_match_for_port_sec_flows(pb, MFF_LOG_INPORT, m);
+    match_set_dl_src(m, phys_mac);
+    match_set_dl_type(m, htons(ETH_TYPE_ARP));
 
-    if (!ps_addr->n_ipv4_addrs) {
+    if (vector_is_empty(ip4_addrs)) {
         /* No IPv4 addresses.
          * Add the below logical flow equivalent OF rules in 'in_port_sec_nd'
          * table.
          * priority: 90
-         * match - "inport == pb->port && eth.src == ps_addr.ea &&
-         *          arp && arp.sha == ps_addr.ea"
+         * match - "inport == pb->port && eth.src == phys_mac &&
+         *          arp && arp.sha == {phys_mac, vrrp4_addrs}"
          * action - "port_sec_failed = 0;"
          */
-        reset_match_for_port_sec_flows(pb, MFF_LOG_INPORT, m);
-        match_set_dl_src(m, ps_addr->ea);
-        match_set_dl_type(m, htons(ETH_TYPE_ARP));
-        match_set_arp_sha(m, ps_addr->ea);
-        ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
-                        pb->header_.uuid.parts[0], m, ofpacts,
-                        &pb->header_.uuid);
+
+        if (!is_vrrp) {
+            match_set_arp_sha(m, phys_mac);
+            ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
+                            pb->header_.uuid.parts[0], m, ofpacts,
+                            &pb->header_.uuid);
+        }
+
+        struct masked_eth_addr *mmac;
+        VECTOR_FOR_EACH_PTR (vrrp4_addrs, mmac) {
+            match_set_arp_sha_masked(m, mmac->addr, mmac->mask);
+            ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
+                            pb->header_.uuid.parts[0], m, ofpacts,
+                            &pb->header_.uuid);
+        }
     }
 
     /* Add the below logical flow equivalent OF rules in 'in_port_sec_nd'
@@ -2734,74 +2759,62 @@ build_in_port_sec_arp_flows(const struct sbrec_port_binding *pb,
      *         arp && arp.sha == ps_addr.ea && arp.spa == {ps_addr.ipv4_addrs}"
      * action - "port_sec_failed = 0;"
      */
-    for (size_t j = 0; j < ps_addr->n_ipv4_addrs; j++) {
-        reset_match_for_port_sec_flows(pb, MFF_LOG_INPORT, m);
-        match_set_dl_src(m, ps_addr->ea);
-        match_set_dl_type(m, htons(ETH_TYPE_ARP));
-        match_set_arp_sha(m, ps_addr->ea);
+    const struct masked_ip4_addr *ip;
+    VECTOR_FOR_EACH_PTR (ip4_addrs, ip) {
+        match_set_nw_src_masked(m, ip->addr, ip->mask);
 
-        ovs_be32 mask = ps_addr->ipv4_addrs[j].mask;
-        if (ps_addr->ipv4_addrs[j].plen == 32 ||
-                ps_addr->ipv4_addrs[j].addr & ~mask) {
-            match_set_nw_src(m, ps_addr->ipv4_addrs[j].addr);
-        } else {
-            match_set_nw_src_masked(m, ps_addr->ipv4_addrs[j].addr, mask);
+        if (!is_vrrp) {
+            match_set_arp_sha(m, phys_mac);
+            ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
+                            pb->header_.uuid.parts[0], m, ofpacts,
+                            &pb->header_.uuid);
         }
-        ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
-                        pb->header_.uuid.parts[0], m, ofpacts,
-                        &pb->header_.uuid);
+
+        struct masked_eth_addr *mmac;
+        VECTOR_FOR_EACH_PTR (vrrp4_addrs, mmac) {
+            match_set_arp_sha_masked(m, mmac->addr, mmac->mask);
+            ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
+                            pb->header_.uuid.parts[0], m, ofpacts,
+                            &pb->header_.uuid);
+        }
     }
 }
 
 static void
 build_in_port_sec_ip6_flows(const struct sbrec_port_binding *pb,
-                           struct lport_addresses *ps_addr,
-                           struct match *m, struct ofpbuf *ofpacts,
-                           struct ovn_desired_flow_table *flow_table)
+                            struct eth_addr mac, struct eth_addr mask,
+                            const struct vector *ip6_addrs,
+                            struct match *m, struct ofpbuf *ofpacts,
+                            struct ovn_desired_flow_table *flow_table)
 {
-    if (!ps_addr->n_ipv6_addrs) {
-        /* If no IPv6 addresses, then 'pb' is not allowed to send IPv6 traffic.
-         * build_in_port_sec_default_flows() takes care of this scenario. */
-        return;
-    }
-
     /* Add the below logical flow equivalent OF rules in 'in_port_sec_nd'
      * table.
      * priority: 90
-     * match - "inport == pb->port && eth.src == ps_addr.ea &&
+     * match - "inport == pb->port && eth.src == mac/mask &&
      *         ip6.src == {ps_addr.ipv6_addrs, lla}"
      * action - "next;"
      * description - Advance the packet for Neighbor Solicit/Adv check.
      */
     build_port_sec_adv_nd_check(ofpacts);
+    reset_match_for_port_sec_flows(pb, MFF_LOG_INPORT, m);
+    match_set_dl_src_masked(m, mac, mask);
+    match_set_dl_type(m, htons(ETH_TYPE_IPV6));
 
-    for (size_t j = 0; j < ps_addr->n_ipv6_addrs; j++) {
-        reset_match_for_port_sec_flows(pb, MFF_LOG_INPORT, m);
-        match_set_dl_src(m, ps_addr->ea);
-        match_set_dl_type(m, htons(ETH_TYPE_IPV6));
-
-        if (ps_addr->ipv6_addrs[j].plen == 128
-            || !ipv6_addr_is_host_zero(&ps_addr->ipv6_addrs[j].addr,
-                                        &ps_addr->ipv6_addrs[j].mask)) {
-            match_set_ipv6_src(m, &ps_addr->ipv6_addrs[j].addr);
-        } else {
-            match_set_ipv6_src_masked(m, &ps_addr->ipv6_addrs[j].network,
-                                        &ps_addr->ipv6_addrs[j].mask);
-        }
-
+    const struct masked_ip6_addr *ip;
+    VECTOR_FOR_EACH_PTR (ip6_addrs, ip) {
+        match_set_ipv6_src_masked(m, &ip->addr, &ip->mask);
         ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC, 90,
                         pb->header_.uuid.parts[0], m, ofpacts,
                         &pb->header_.uuid);
     }
 
-    reset_match_for_port_sec_flows(pb, MFF_LOG_INPORT, m);
-    match_set_dl_src(m, ps_addr->ea);
-    match_set_dl_type(m, htons(ETH_TYPE_IPV6));
 
     struct in6_addr lla;
-    in6_generate_lla(ps_addr->ea, &lla);
-    match_set_ipv6_src(m, &lla);
+    in6_generate_lla(mac, &lla);
+    unsigned int plen = 128 - 48 + eth_addr_get_prefix_len(mask);
+    struct in6_addr lla_mask = ipv6_create_mask(plen);
 
+    match_set_ipv6_src_masked(m, &lla, &lla_mask);
     ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC, 90,
                     pb->header_.uuid.parts[0], m, ofpacts,
                     &pb->header_.uuid);
@@ -2816,11 +2829,12 @@ build_in_port_sec_ip6_flows(const struct sbrec_port_binding *pb,
      */
     build_port_sec_allow_action(ofpacts);
     match_set_ipv6_src(m, &in6addr_any);
-    struct in6_addr ip6, mask;
-    char *err = ipv6_parse_masked("ff02::/16", &ip6, &mask);
+
+    struct in6_addr ip6, ip_mask;
+    char *err = ipv6_parse_masked("ff02::/16", &ip6, &ip_mask);
     ovs_assert(!err);
 
-    match_set_ipv6_dst_masked(m, &ip6, &mask);
+    match_set_ipv6_dst_masked(m, &ip6, &ip_mask);
     match_set_nw_proto(m, IPPROTO_ICMPV6);
     match_set_icmp_type(m, 131);
     match_set_icmp_code(m, 0);
@@ -2853,97 +2867,118 @@ build_in_port_sec_ip6_flows(const struct sbrec_port_binding *pb,
  * 'in_port_sec_nd' table. */
 static void
 build_in_port_sec_nd_flows(const struct sbrec_port_binding *pb,
-                           struct lport_addresses *ps_addr,
-                           struct match *m, struct ofpbuf *ofpacts,
+                           struct eth_addr phys_mac,
+                           const struct vector *ip6_addrs,
+                           const struct vector *vrrp6_addrs,
+                           bool is_vrrp, struct match *m,
+                           struct ofpbuf *ofpacts,
                            struct ovn_desired_flow_table *flow_table)
 {
     build_port_sec_allow_action(ofpacts);
+    reset_match_for_port_sec_flows(pb, MFF_LOG_INPORT, m);
+    match_set_dl_src(m, phys_mac);
+    match_set_dl_type(m, htons(ETH_TYPE_IPV6));
+    match_set_nw_proto(m, IPPROTO_ICMPV6);
+    match_set_icmp_code(m, 0);
+    match_set_nw_ttl(m, 255);
 
     /* Add the below logical flow equivalent OF rules in 'in_port_sec_nd'
      * table.
      * priority: 90
-     * match - "inport == pb->port && eth.src == ps_addr.ea &&
-     *          icmp6 && icmp6.code == 135 && icmp6.type == 0 &&
-     *          ip6.tll == 255 && nd.sll == {00:00:00:00:00:00, ps_addr.ea}"
+     * match - "inport == pb->port && eth.src == phys_mac &&
+     *          icmp6 && icmp6.type == 135 && icmp6.code == 0 &&
+     *          ip6.tll == 255 &&
+     *          nd.sll == {00:00:00:00:00:00, phys_mac, vrrp6_addrs}"
      * action - "port_sec_failed = 0;"
      */
-    reset_match_for_port_sec_flows(pb, MFF_LOG_INPORT, m);
-    match_set_dl_type(m, htons(ETH_TYPE_IPV6));
-    match_set_nw_proto(m, IPPROTO_ICMPV6);
-    match_set_nw_ttl(m, 255);
+
     match_set_icmp_type(m, 135);
-    match_set_icmp_code(m, 0);
 
     match_set_arp_sha(m, eth_addr_zero);
     ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
                     pb->header_.uuid.parts[0], m, ofpacts,
                     &pb->header_.uuid);
 
-    match_set_arp_sha(m, ps_addr->ea);
-    ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
-                    pb->header_.uuid.parts[0], m, ofpacts,
-                    &pb->header_.uuid);
+    if (!is_vrrp) {
+        match_set_arp_sha(m, phys_mac);
+        ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
+                        pb->header_.uuid.parts[0], m, ofpacts,
+                        &pb->header_.uuid);
+    }
 
+    struct masked_eth_addr *mmac;
+    VECTOR_FOR_EACH_PTR (vrrp6_addrs, mmac) {
+        match_set_arp_sha_masked(m, mmac->addr, mmac->mask);
+        ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
+                        pb->header_.uuid.parts[0], m, ofpacts,
+                        &pb->header_.uuid);
+    }
+
+    match_set_arp_sha_masked(m, eth_addr_zero, eth_addr_zero);
     match_set_icmp_type(m, 136);
-    match_set_icmp_code(m, 0);
-    if (ps_addr->n_ipv6_addrs) {
+    if (!vector_is_empty(ip6_addrs)) {
         /* Add the below logical flow equivalent OF rules in 'in_port_sec_nd'
          * table if IPv6 addresses are configured.
          * priority: 90
-         * match - "inport == pb->port && eth.src == ps_addr.ea && icmp6 &&
-         *          icmp6.code == 136 && icmp6.type == 0 && ip6.tll == 255 &&
-         *          nd.tll == {00:00:00:00:00:00, ps_addr.ea} &&
-         *          nd.target == {ps_addr.ipv6_addrs, lla}"
+         * match - "inport == pb->port && eth.src == phys_mac && icmp6 &&
+         *          icmp6.type == 136 && icmp6.code == 0 && ip6.tll == 255 &&
+         *          nd.tll == {00:00:00:00:00:00, phys_mac, vrrp6_addrs} &&
+         *          nd.target == {lla, ip6_addrs}"
          * action - "port_sec_failed = 0;"
          */
         struct in6_addr lla;
-        in6_generate_lla(ps_addr->ea, &lla);
+        in6_generate_lla(phys_mac, &lla);
+        match_set_nd_target(m, &lla);
+
         match_set_arp_tha(m, eth_addr_zero);
-
-        match_set_nd_target(m, &lla);
-        ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
-                        pb->header_.uuid.parts[0], m, ofpacts,
-                        &pb->header_.uuid);
-        match_set_arp_tha(m, ps_addr->ea);
-        match_set_nd_target(m, &lla);
         ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
                         pb->header_.uuid.parts[0], m, ofpacts,
                         &pb->header_.uuid);
 
-        for (size_t j = 0; j < ps_addr->n_ipv6_addrs; j++) {
-            reset_match_for_port_sec_flows(pb, MFF_LOG_INPORT, m);
-            match_set_dl_src(m, ps_addr->ea);
-            match_set_dl_type(m, htons(ETH_TYPE_IPV6));
-            match_set_nw_proto(m, IPPROTO_ICMPV6);
-            match_set_icmp_type(m, 136);
-            match_set_icmp_code(m, 0);
+        if (!is_vrrp) {
+            match_set_arp_tha(m, phys_mac);
+            ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
+                            pb->header_.uuid.parts[0], m, ofpacts,
+                            &pb->header_.uuid);
+        }
+
+        VECTOR_FOR_EACH_PTR (vrrp6_addrs, mmac) {
+            match_set_arp_tha_masked(m, mmac->addr, mmac->mask);
+            ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
+                            pb->header_.uuid.parts[0], m, ofpacts,
+                            &pb->header_.uuid);
+        }
+
+        const struct masked_ip6_addr *ip;
+        VECTOR_FOR_EACH_PTR (ip6_addrs, ip) {
+            match_set_nd_target_masked(m, &ip->addr, &ip->mask);
+
             match_set_arp_tha(m, eth_addr_zero);
+            ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
+                            pb->header_.uuid.parts[0], m, ofpacts,
+                            &pb->header_.uuid);
 
-            if (ps_addr->ipv6_addrs[j].plen == 128
-                || !ipv6_addr_is_host_zero(&ps_addr->ipv6_addrs[j].addr,
-                                            &ps_addr->ipv6_addrs[j].mask)) {
-                match_set_nd_target(m, &ps_addr->ipv6_addrs[j].addr);
-            } else {
-                match_set_nd_target_masked(m, &ps_addr->ipv6_addrs[j].network,
-                                           &ps_addr->ipv6_addrs[j].mask);
+            if (!is_vrrp) {
+                match_set_arp_tha(m, phys_mac);
+                ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
+                                pb->header_.uuid.parts[0], m, ofpacts,
+                                &pb->header_.uuid);
             }
 
-            ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
-                            pb->header_.uuid.parts[0], m, ofpacts,
-                            &pb->header_.uuid);
-
-            match_set_arp_tha(m, ps_addr->ea);
-            ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
-                            pb->header_.uuid.parts[0], m, ofpacts,
-                            &pb->header_.uuid);
+            VECTOR_FOR_EACH_PTR (vrrp6_addrs, mmac) {
+                match_set_arp_tha_masked(m, mmac->addr, mmac->mask);
+                ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
+                                pb->header_.uuid.parts[0], m, ofpacts,
+                                &pb->header_.uuid);
+            }
         }
     } else {
         /* Add the below logical flow equivalent OF rules in 'in_port_sec_nd'
          * table if no IPv6 addresses are configured.
          * priority: 90
-         * match - "inport == pb->port && eth.src == ps_addr.ea && icmp6 &&
-         *          icmp6.code == 136 && icmp6.type == 0 && ip6.tll == 255 &&
-         *          nd.tll == {00:00:00:00:00:00, ps_addr.ea}"
+         * match - "inport == pb->port && eth.src == phys_mac && icmp6 &&
+         *          icmp6.type == 136 && icmp6.code == 0 && ip6.tll == 255 &&
+         *          nd.tll == {00:00:00:00:00:00, phys_mac, vrrp6_addrs}"
          * action - "port_sec_failed = 0;"
          */
         match_set_arp_tha(m, eth_addr_zero);
@@ -2951,27 +2986,36 @@ build_in_port_sec_nd_flows(const struct sbrec_port_binding *pb,
                         pb->header_.uuid.parts[0], m, ofpacts,
                         &pb->header_.uuid);
 
-        match_set_arp_tha(m, ps_addr->ea);
-        ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
-                        pb->header_.uuid.parts[0], m, ofpacts,
-                        &pb->header_.uuid);
+        if (!is_vrrp) {
+            match_set_arp_tha(m, phys_mac);
+            ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
+                            pb->header_.uuid.parts[0], m, ofpacts,
+                            &pb->header_.uuid);
+        }
+
+        VECTOR_FOR_EACH_PTR (vrrp6_addrs, mmac) {
+            match_set_arp_tha_masked(m, mmac->addr, mmac->mask);
+            ofctrl_add_flow(flow_table, OFTABLE_CHK_IN_PORT_SEC_ND, 90,
+                            pb->header_.uuid.parts[0], m, ofpacts,
+                            &pb->header_.uuid);
+        }
     }
 }
 
 static void
 build_out_port_sec_no_ip_flows(const struct sbrec_port_binding *pb,
-                               struct lport_addresses *ps_addr,
+                               struct eth_addr mac, struct eth_addr mask,
                                struct match *m, struct ofpbuf *ofpacts,
                                struct ovn_desired_flow_table *flow_table)
 {
     /* Add the below logical flow equivalent OF rules in 'out_port_sec' table.
      * priority: 85
-     * match - "outport == pb->logical_port && eth.dst == ps_addr.ea"
+     * match - "outport == pb->logical_port && eth.dst == mac/mask"
      * action - "port_sec_failed = 0;"
      * description: "Allow the packet if eth.dst matches."
      */
     reset_match_for_port_sec_flows(pb, MFF_LOG_OUTPORT, m);
-    match_set_dl_dst(m, ps_addr->ea);
+    match_set_dl_dst_masked(m, mac, mask);
     build_port_sec_allow_action(ofpacts);
     ofctrl_add_flow(flow_table, OFTABLE_CHK_OUT_PORT_SEC, 85,
                     pb->header_.uuid.parts[0], m, ofpacts,
@@ -2980,97 +3024,70 @@ build_out_port_sec_no_ip_flows(const struct sbrec_port_binding *pb,
 
 static void
 build_out_port_sec_ip4_flows(const struct sbrec_port_binding *pb,
-                            struct lport_addresses *ps_addr,
-                            struct match *m, struct ofpbuf *ofpacts,
-                            struct ovn_desired_flow_table *flow_table)
+                             struct eth_addr mac, struct eth_addr mask,
+                             const struct vector *ip4_addrs,
+                             struct match *m, struct ofpbuf *ofpacts,
+                             struct ovn_desired_flow_table *flow_table)
 {
-    if (!ps_addr->n_ipv4_addrs && !ps_addr->n_ipv6_addrs) {
-         /* No IPv4 and no IPv6 addresses in the port security.
-          * Both IPv4 and IPv6 traffic should be delivered to the
-          * lport. build_out_port_sec_no_ip_flows() takes care of
-          * adding the required flow(s) to allow. */
-        return;
-    }
+    reset_match_for_port_sec_flows(pb, MFF_LOG_OUTPORT, m);
+    match_set_dl_dst_masked(m, mac, mask);
+    match_set_dl_type(m, htons(ETH_TYPE_IP));
 
     /* Add the below logical flow equivalent OF rules in 'out_port_sec' table.
      * priority: 90
-     * match - "outport == pb->logical_port && eth.dst == ps_addr.ea && ip4"
+     * match - "outport == pb->logical_port && eth.dst == mac/mask && ip4"
      * action - "port_sec_failed = 1;"
      * description: Default drop IPv4 packets.  If IPv4 addresses are
      *              configured, then higher priority flows are added
      *              to allow specific IPv4 packets.
      */
-    reset_match_for_port_sec_flows(pb, MFF_LOG_OUTPORT, m);
-    match_set_dl_dst(m, ps_addr->ea);
-    match_set_dl_type(m, htons(ETH_TYPE_IP));
+
     build_port_sec_deny_action(ofpacts);
     ofctrl_add_flow(flow_table, OFTABLE_CHK_OUT_PORT_SEC, 90,
                     pb->header_.uuid.parts[0], m, ofpacts,
                     &pb->header_.uuid);
 
-    if (!ps_addr->n_ipv4_addrs) {
+    if (vector_is_empty(ip4_addrs)) {
         return;
     }
 
+    build_port_sec_allow_action(ofpacts);
     /* Add the below logical flow equivalent OF rules in 'out_port_sec' table.
      * priority: 95
-     * match - "outport == pb->logical_port && eth.dst == ps_addr.ea &&
-     *          ip4.dst == {ps_addr.ipv4_addrs, 255.255.255.255, 224.0.0.0/4},"
+     * match - "outport == pb->logical_port && eth.dst == mac/mask &&
+     *          ip4.dst == {ip4_addrs, 255.255.255.255, 224.0.0.0/4},"
      * action - "port_sec_failed = 0;"
      */
-    build_port_sec_allow_action(ofpacts);
-    for (size_t j = 0; j < ps_addr->n_ipv4_addrs; j++) {
-        reset_match_for_port_sec_flows(pb, MFF_LOG_OUTPORT, m);
-        match_set_dl_dst(m, ps_addr->ea);
-        match_set_dl_type(m, htons(ETH_TYPE_IP));
-        ovs_be32 mask = ps_addr->ipv4_addrs[j].mask;
-        if (ps_addr->ipv4_addrs[j].plen == 32
-                || ps_addr->ipv4_addrs[j].addr & ~mask) {
-
-            if (ps_addr->ipv4_addrs[j].plen != 32) {
-                /* Special case to allow bcast traffic.
-                 * Eg. If ps_addr is 10.0.0.4/24, then add the below flow
-                 * priority: 95
-                 * match - "outport == pb->logical_port &&
-                 *          eth.dst == ps_addr.ea &&
-                 *          ip4.dst == 10.0.0.255"
-                 * action - "port_sec_failed = 0;"
-                 */
-                ovs_be32 bcast_addr;
-                ovs_assert(ip_parse(ps_addr->ipv4_addrs[j].bcast_s,
-                                    &bcast_addr));
-                match_set_nw_dst(m, bcast_addr);
-                ofctrl_add_flow(flow_table, OFTABLE_CHK_OUT_PORT_SEC, 95,
-                                pb->header_.uuid.parts[0], m, ofpacts,
-                                &pb->header_.uuid);
-            }
-
-            match_set_nw_dst(m, ps_addr->ipv4_addrs[j].addr);
-        } else {
-            /* host portion is zero */
-            match_set_nw_dst_masked(m, ps_addr->ipv4_addrs[j].addr,
-                                    mask);
-        }
-
+    const struct masked_ip4_addr *ip;
+    VECTOR_FOR_EACH_PTR (ip4_addrs, ip) {
+        match_set_nw_dst_masked(m, ip->addr, ip->mask);
         ofctrl_add_flow(flow_table, OFTABLE_CHK_OUT_PORT_SEC, 95,
                         pb->header_.uuid.parts[0], m, ofpacts,
                         &pb->header_.uuid);
+
+        if (ip->bcast) {
+            /* Special case to allow bcast traffic.
+             * Eg. If address is 10.0.0.4/24, then add the below flow
+             * priority: 95
+             * match - "outport == pb->logical_port &&
+             *          eth.dst == ps_addr.ea &&
+             *          ip4.dst == 10.0.0.255"
+             * action - "port_sec_failed = 0;"
+             */
+            match_set_nw_dst(m, ip->bcast);
+            ofctrl_add_flow(flow_table, OFTABLE_CHK_OUT_PORT_SEC, 95,
+                            pb->header_.uuid.parts[0], m, ofpacts,
+                            &pb->header_.uuid);
+        }
     }
 
-    reset_match_for_port_sec_flows(pb, MFF_LOG_OUTPORT, m);
-    match_set_dl_dst(m, ps_addr->ea);
-    match_set_dl_type(m, htons(ETH_TYPE_IP));
-
-    ovs_be32 ip4 = htonl(0xffffffff);
-    match_set_nw_dst(m, ip4);
+    match_set_nw_dst(m, htonl(0xffffffff));
     ofctrl_add_flow(flow_table, OFTABLE_CHK_OUT_PORT_SEC, 95,
                     pb->header_.uuid.parts[0], m, ofpacts,
                     &pb->header_.uuid);
 
     /* Allow 224.0.0.0/4 traffic. */
-    ip4 = htonl(0xe0000000);
-    ovs_be32 mask = htonl(0xf0000000);
-    match_set_nw_dst_masked(m, ip4, mask);
+    match_set_nw_dst_masked(m, htonl(0xe0000000), htonl(0xf0000000));
     ofctrl_add_flow(flow_table, OFTABLE_CHK_OUT_PORT_SEC, 95,
                     pb->header_.uuid.parts[0], m, ofpacts,
                     &pb->header_.uuid);
@@ -3078,83 +3095,263 @@ build_out_port_sec_ip4_flows(const struct sbrec_port_binding *pb,
 
 static void
 build_out_port_sec_ip6_flows(const struct sbrec_port_binding *pb,
-                            struct lport_addresses *ps_addr,
-                            struct match *m, struct ofpbuf *ofpacts,
-                            struct ovn_desired_flow_table *flow_table)
+                             struct eth_addr mac, struct eth_addr mask,
+                             const struct vector *ip6_addrs,
+                             struct match *m, struct ofpbuf *ofpacts,
+                             struct ovn_desired_flow_table *flow_table)
 {
-    if (!ps_addr->n_ipv4_addrs && !ps_addr->n_ipv6_addrs) {
-        /* No IPv4 and no IPv6 addresses in the port security.
-         * Both IPv4 and IPv6 traffic should be delivered to the
-         * lport. build_out_port_sec_no_ip_flows() takes care of
-         * adding the required flow(s) to allow. */
-        return;
-    }
+    reset_match_for_port_sec_flows(pb, MFF_LOG_OUTPORT, m);
+    match_set_dl_dst_masked(m, mac, mask);
+    match_set_dl_type(m, htons(ETH_TYPE_IPV6));
 
     /* Add the below logical flow equivalent OF rules in 'out_port_sec' table.
      * priority: 90
-     * match - "outport == pb->logical_port && eth.dst == ps_addr.ea && ip6"
+     * match - "outport == pb->logical_port && eth.dst == mac/mask && ip6"
      * action - "port_sec_failed = 1;"
      * description: Default drop IPv6 packets.  If IPv6 addresses are
      *              configured, then higher priority flows are added
      *              to allow specific IPv6 packets.
      */
-    reset_match_for_port_sec_flows(pb, MFF_LOG_OUTPORT, m);
-    match_set_dl_dst(m, ps_addr->ea);
-    match_set_dl_type(m, htons(ETH_TYPE_IPV6));
     build_port_sec_deny_action(ofpacts);
     ofctrl_add_flow(flow_table, OFTABLE_CHK_OUT_PORT_SEC, 90,
                     pb->header_.uuid.parts[0], m, ofpacts,
                     &pb->header_.uuid);
 
-    if (!ps_addr->n_ipv6_addrs) {
+    if (vector_is_empty(ip6_addrs)) {
         return;
     }
 
+    build_port_sec_allow_action(ofpacts);
     /* Add the below logical flow equivalent OF rules in 'out_port_sec' table.
      * priority: 95
-     * match - "outport == pb->logical_port && eth.dst == ps_addr.ea &&
-     *          ip6.dst == {ps_addr.ipv6_addrs, lla, ff00::/8},"
+     * match - "outport == pb->logical_port && eth.dst == mac/mask &&
+     *          ip6.dst == {mac/mask, ip6_addrs, lla, ff00::/8},"
      * action - "port_sec_failed = 0;"
      */
-    build_port_sec_allow_action(ofpacts);
-    for (size_t j = 0; j < ps_addr->n_ipv6_addrs; j++) {
-        reset_match_for_port_sec_flows(pb, MFF_LOG_OUTPORT, m);
-        match_set_dl_dst(m, ps_addr->ea);
-        match_set_dl_type(m, htons(ETH_TYPE_IPV6));
-
-        if (ps_addr->ipv6_addrs[j].plen == 128
-            || !ipv6_addr_is_host_zero(&ps_addr->ipv6_addrs[j].addr,
-                                        &ps_addr->ipv6_addrs[j].mask)) {
-            match_set_ipv6_dst(m, &ps_addr->ipv6_addrs[j].addr);
-        } else {
-            match_set_ipv6_dst_masked(m, &ps_addr->ipv6_addrs[j].network,
-                                      &ps_addr->ipv6_addrs[j].mask);
-        }
-
+    const struct masked_ip6_addr *ip;
+    VECTOR_FOR_EACH_PTR (ip6_addrs, ip) {
+        match_set_ipv6_dst_masked(m, &ip->addr, &ip->mask);
         ofctrl_add_flow(flow_table, OFTABLE_CHK_OUT_PORT_SEC, 95,
                         pb->header_.uuid.parts[0], m, ofpacts,
                         &pb->header_.uuid);
     }
 
     struct in6_addr lla;
-    in6_generate_lla(ps_addr->ea, &lla);
+    in6_generate_lla(mac, &lla);
+    unsigned int plen = 128 - 48 + eth_addr_get_prefix_len(mask);
+    struct in6_addr lla_mask = ipv6_create_mask(plen);
 
-    reset_match_for_port_sec_flows(pb, MFF_LOG_OUTPORT, m);
-    match_set_dl_dst(m, ps_addr->ea);
-    match_set_dl_type(m, htons(ETH_TYPE_IPV6));
-    match_set_ipv6_dst(m, &lla);
+    match_set_ipv6_dst_masked(m, &lla, &lla_mask);
     ofctrl_add_flow(flow_table, OFTABLE_CHK_OUT_PORT_SEC, 95,
                     pb->header_.uuid.parts[0], m, ofpacts,
                     &pb->header_.uuid);
 
-    struct in6_addr ip6, mask;
-    char *err = ipv6_parse_masked("ff00::/8", &ip6, &mask);
+    struct in6_addr ip6, ip_mask;
+    char *err = ipv6_parse_masked("ff00::/8", &ip6, &ip_mask);
     ovs_assert(!err);
 
-    match_set_ipv6_dst_masked(m, &ip6, &mask);
+    match_set_ipv6_dst_masked(m, &ip6, &ip_mask);
     ofctrl_add_flow(flow_table, OFTABLE_CHK_OUT_PORT_SEC, 95,
                     pb->header_.uuid.parts[0], m, ofpacts,
                     &pb->header_.uuid);
+}
+
+static void
+build_port_sec_entry_flows(const struct sbrec_port_binding *pb,
+                           const struct port_security_addresses *ps_addr,
+                           struct match *m, struct ofpbuf *ofpacts,
+                           struct ovn_desired_flow_table *flow_table)
+{
+    /* Input no-ip flows. */
+    if (vector_is_empty(&ps_addr->ip4) && vector_is_empty(&ps_addr->ip6)) {
+        build_in_port_sec_no_ip_flows(pb, ps_addr->phys_addr, eth_addr_exact,
+                                      m, ofpacts, flow_table);
+    }
+
+    /* Input IPv4 flows. */
+    if (!vector_is_empty(&ps_addr->ip4)) {
+        build_in_port_sec_ip4_flows(pb, ps_addr->phys_addr, eth_addr_exact,
+                                    &ps_addr->ip4, m, ofpacts, flow_table);
+    }
+
+    /* Input ARP flows. */
+    if (!vector_is_empty(&ps_addr->ip4) || vector_is_empty(&ps_addr->ip6)) {
+        build_in_port_sec_arp_flows(pb, ps_addr->phys_addr, &ps_addr->ip4,
+                                    &ps_addr->vrrp4, false, m, ofpacts,
+                                    flow_table);
+    }
+
+    /* Input Ipv6 flows. */
+    if (!vector_is_empty(&ps_addr->ip6)) {
+        build_in_port_sec_ip6_flows(pb, ps_addr->phys_addr, eth_addr_exact,
+                                    &ps_addr->ip6, m, ofpacts, flow_table);
+    }
+
+    /* Input ND flows. */
+    build_in_port_sec_nd_flows(pb, ps_addr->phys_addr, &ps_addr->ip6,
+                               &ps_addr->vrrp6, false, m, ofpacts,
+                               flow_table);
+
+    /* Output no-ip flows. */
+    build_out_port_sec_no_ip_flows(pb, ps_addr->phys_addr, eth_addr_exact,
+                                    m, ofpacts, flow_table);
+
+    /* Output IPv4 flows. */
+    if (!vector_is_empty(&ps_addr->ip4) || !vector_is_empty(&ps_addr->ip6)) {
+        build_out_port_sec_ip4_flows(pb, ps_addr->phys_addr, eth_addr_exact,
+                                     &ps_addr->ip4, m, ofpacts, flow_table);
+    }
+
+    /* Output Ipv6 flows. */
+    if (!vector_is_empty(&ps_addr->ip4) || !vector_is_empty(&ps_addr->ip6)) {
+        build_out_port_sec_ip6_flows(pb, ps_addr->phys_addr, eth_addr_exact,
+                                     &ps_addr->ip6, m, ofpacts, flow_table);
+    }
+}
+
+static void
+build_port_sec_entry_vrrp_flows(const struct sbrec_port_binding *pb,
+                                const struct port_security_addresses *ps_addr,
+                                struct match *m, struct ofpbuf *ofpacts,
+                                struct ovn_desired_flow_table *flow_table)
+{
+    const struct masked_eth_addr *maddr;
+
+    /* Input no-ip flows. */
+    if (vector_is_empty(&ps_addr->ip4) && vector_is_empty(&ps_addr->ip6)) {
+        VECTOR_FOR_EACH_PTR (&ps_addr->vrrp4, maddr) {
+            build_in_port_sec_no_ip_flows(pb, maddr->addr, maddr->mask,
+                                          m, ofpacts, flow_table);
+        }
+
+        VECTOR_FOR_EACH_PTR (&ps_addr->vrrp6, maddr) {
+            build_in_port_sec_no_ip_flows(pb, maddr->addr, maddr->mask,
+                                          m, ofpacts, flow_table);
+        }
+    }
+
+    /* Input IPv4 flows. */
+    if (!vector_is_empty(&ps_addr->ip4)) {
+        VECTOR_FOR_EACH_PTR (&ps_addr->vrrp4, maddr) {
+            build_in_port_sec_ip4_flows(pb, maddr->addr, maddr->mask,
+                                        &ps_addr->ip4, m, ofpacts, flow_table);
+        }
+    }
+
+    /* Input ARP flows. */
+    if (!vector_is_empty(&ps_addr->ip4) || vector_is_empty(&ps_addr->ip6)) {
+        build_in_port_sec_arp_flows(pb, ps_addr->phys_addr, &ps_addr->ip4,
+                                    &ps_addr->vrrp4, true, m, ofpacts,
+                                    flow_table);
+    }
+
+    /* Input Ipv6 flows. */
+    if (!vector_is_empty(&ps_addr->ip6)) {
+        VECTOR_FOR_EACH_PTR (&ps_addr->vrrp6, maddr) {
+            build_in_port_sec_ip6_flows(pb, maddr->addr, maddr->mask,
+                                        &ps_addr->ip6, m, ofpacts, flow_table);
+        }
+    }
+
+    /* Input ND flows. */
+    build_in_port_sec_nd_flows(pb, ps_addr->phys_addr, &ps_addr->ip6,
+                               &ps_addr->vrrp6, true, m, ofpacts,
+                               flow_table);
+
+    /* Output no-ip flows. */
+    VECTOR_FOR_EACH_PTR (&ps_addr->vrrp4, maddr) {
+        build_out_port_sec_no_ip_flows(pb, maddr->addr, maddr->mask,
+                                       m, ofpacts, flow_table);
+    }
+
+    VECTOR_FOR_EACH_PTR (&ps_addr->vrrp6, maddr) {
+        build_out_port_sec_no_ip_flows(pb, maddr->addr, maddr->mask,
+                                       m, ofpacts, flow_table);
+    }
+
+    /* Output IPv4 flows. */
+    if (!vector_is_empty(&ps_addr->ip4) || !vector_is_empty(&ps_addr->ip6)) {
+        VECTOR_FOR_EACH_PTR (&ps_addr->vrrp4, maddr) {
+            build_out_port_sec_ip4_flows(pb, maddr->addr, maddr->mask,
+                                         &ps_addr->ip4, m, ofpacts,
+                                         flow_table);
+        }
+    }
+
+    /* Output Ipv6 flows. */
+    if (!vector_is_empty(&ps_addr->ip4) || !vector_is_empty(&ps_addr->ip6)) {
+        VECTOR_FOR_EACH_PTR (&ps_addr->vrrp6, maddr) {
+            build_out_port_sec_ip6_flows(pb, maddr->addr, maddr->mask,
+                                         &ps_addr->ip6, m, ofpacts,
+                                         flow_table);
+        }
+    }
+}
+
+static bool
+port_security_addresses_parse_entry(const char *entry, const char *lsp,
+                                    struct port_security_addresses *ps_addr)
+{
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
+
+    bool vrrpv3 = !strncmp(entry, "VRRPv3", 6);
+    int n = vrrpv3 ? 7 : 0;
+
+    if (!ovs_scan_len(entry, &n, ETH_ADDR_SCAN_FMT,
+                      ETH_ADDR_SCAN_ARGS(ps_addr->phys_addr))) {
+        VLOG_WARN_RL(&rl, "invalid syntax '%s' in port security for LSP %s: "
+                     "No MAC address found", entry, lsp);
+        return false;
+    }
+
+    bool ok = true;
+
+    /* Only MAC address is provided. */
+    if (!entry[n]) {
+        goto vrrp_check;
+    }
+
+    char *save_ptr = NULL;
+    char *tokstr = xstrdup(entry + n);
+    for (char *token = strtok_r(tokstr, " ", &save_ptr);
+         token != NULL;
+         token = strtok_r(NULL, " ", &save_ptr)) {
+        struct eth_addr mac;
+        struct in6_addr ip;
+        unsigned int plen;
+
+        if (vrrpv3 && eth_addr_parse_masked(token, &mac, &plen)) {
+            if (!port_security_addresses_add_vrrp_mac(ps_addr, mac, plen)) {
+                VLOG_WARN_RL(&rl, "invalid syntax '%s' in port security for"
+                             " LSP %s: Invalid VRRPv3 MAC", token, lsp);
+                ok = false;
+                break;
+            }
+        } else if (ip46_parse_cidr(token, &ip, &plen)) {
+            if (!port_security_addresses_add_ip(ps_addr, ip, plen)) {
+                VLOG_WARN_RL(&rl, "invalid syntax '%s' in port security for"
+                             " LSP %s: Invalid IP", token, lsp);
+                ok = false;
+                break;
+            }
+        } else {
+            VLOG_WARN_RL(&rl, "invalid syntax '%s' in port security for"
+                         " LSP %s: Invalid IP or MAC", token, lsp);
+            ok = false;
+            break;
+        }
+    }
+
+    free(tokstr);
+
+vrrp_check:
+    if (vrrpv3 && vector_is_empty(&ps_addr->vrrp4) &&
+        vector_is_empty(&ps_addr->vrrp6)) {
+        vector_push(&ps_addr->vrrp4, &maddr_any_vrrp4);
+        vector_push(&ps_addr->vrrp6, &maddr_any_vrrp6);
+    }
+
+    return ok;
 }
 
 static void
@@ -3165,74 +3362,38 @@ consider_port_sec_flows(const struct sbrec_port_binding *pb,
         return;
     }
 
-    struct lport_addresses *ps_addrs;   /* Port security addresses. */
-    size_t n_ps_addrs = 0;
-
-    ps_addrs = xmalloc(sizeof *ps_addrs * pb->n_port_security);
-    for (size_t i = 0; i < pb->n_port_security; i++) {
-        if (!extract_lsp_addresses(pb->port_security[i],
-                                    &ps_addrs[n_ps_addrs])) {
-            static struct vlog_rate_limit rl
-                = VLOG_RATE_LIMIT_INIT(1, 1);
-            VLOG_INFO_RL(&rl, "invalid syntax '%s' in port "
-                         "security. No MAC address found",
-                         pb->port_security[i]);
-            continue;
-        }
-        n_ps_addrs++;
-    }
-
-    if (!n_ps_addrs) {
-        free(ps_addrs);
-        return;
-    }
-
     struct match match = MATCH_CATCHALL_INITIALIZER;
     uint64_t stub[1024 / 8];
     struct ofpbuf ofpacts = OFPBUF_STUB_INITIALIZER(stub);
 
-    build_in_port_sec_default_flows(pb, &match, &ofpacts, flow_table);
+    bool flows_installed = false;
+    struct port_security_addresses ps_addr;
+    port_security_addresses_init(&ps_addr);
 
-    for (size_t i = 0; i < n_ps_addrs; i++) {
-        build_in_port_sec_no_ip_flows(pb, &ps_addrs[i], &match, &ofpacts,
-                                      flow_table);
-        build_in_port_sec_ip4_flows(pb, &ps_addrs[i], &match, &ofpacts,
-                                    flow_table);
-        build_in_port_sec_arp_flows(pb, &ps_addrs[i], &match, &ofpacts,
-                                    flow_table);
-        build_in_port_sec_ip6_flows(pb, &ps_addrs[i], &match, &ofpacts,
-                                    flow_table);
-        build_in_port_sec_nd_flows(pb, &ps_addrs[i], &match, &ofpacts,
-                                   flow_table);
+    for (size_t i = 0; i < pb->n_port_security; i++) {
+        if (port_security_addresses_parse_entry(pb->port_security[i],
+                                                pb->logical_port, &ps_addr)) {
+            if (vector_is_empty(&ps_addr.vrrp4) &&
+                vector_is_empty(&ps_addr.vrrp6)) {
+                build_port_sec_entry_flows(pb, &ps_addr, &match,
+                                           &ofpacts, flow_table);
+
+            } else {
+                build_port_sec_entry_vrrp_flows(pb, &ps_addr, &match,
+                                                &ofpacts, flow_table);
+            }
+
+            flows_installed = true;
+        }
+
+        port_security_addresses_clear(&ps_addr);
     }
 
-    /* Out port security. */
-
-    /* Add the below logical flow equivalent OF rules in 'out_port_sec_nd'
-     * table.
-     * priority: 80
-     * match - "outport == pb->logical_port"
-     * action - "port_sec_failed = 1;"
-     * descrption: "Drop all traffic"
-     */
-    reset_match_for_port_sec_flows(pb, MFF_LOG_OUTPORT, &match);
-    build_port_sec_deny_action(&ofpacts);
-    ofctrl_add_flow(flow_table, OFTABLE_CHK_OUT_PORT_SEC, 80,
-                    pb->header_.uuid.parts[0], &match, &ofpacts,
-                    &pb->header_.uuid);
-
-    for (size_t i = 0; i < n_ps_addrs; i++) {
-        build_out_port_sec_no_ip_flows(pb, &ps_addrs[i], &match, &ofpacts,
-                                       flow_table);
-        build_out_port_sec_ip4_flows(pb, &ps_addrs[i], &match, &ofpacts,
-                                       flow_table);
-        build_out_port_sec_ip6_flows(pb, &ps_addrs[i], &match, &ofpacts,
-                                       flow_table);
+    if (flows_installed) {
+        build_in_port_sec_default_flows(pb, &match, &ofpacts, flow_table);
+        build_out_port_sec_default_flows(pb, &match, &ofpacts, flow_table);
     }
 
     ofpbuf_uninit(&ofpacts);
-    for (size_t i = 0; i < n_ps_addrs; i++) {
-        destroy_lport_addresses(&ps_addrs[i]);
-    }
-    free(ps_addrs);
+    port_security_addresses_destroy(&ps_addr);
 }

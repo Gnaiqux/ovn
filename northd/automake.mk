@@ -3,11 +3,23 @@ bin_PROGRAMS += northd/ovn-northd
 northd_ovn_northd_SOURCES = \
 	northd/aging.c \
 	northd/aging.h \
+	northd/datapath-sync.c \
+	northd/datapath-sync.h \
 	northd/debug.c \
 	northd/debug.h \
 	northd/northd.c \
 	northd/northd.h \
 	northd/ovn-northd.c \
+	northd/en-datapath-logical-switch.c \
+	northd/en-datapath-logical-switch.h \
+	northd/en-datapath-logical-router.c \
+	northd/en-datapath-logical-router.h \
+	northd/en-datapath-sync.c \
+	northd/en-datapath-sync.h \
+	northd/en-dp-group.c \
+	northd/en-dp-group.h \
+	northd/en-ecmp-nexthop.c \
+	northd/en-ecmp-nexthop.h \
 	northd/en-global-config.c \
 	northd/en-global-config.h \
 	northd/en-northd.c \
@@ -16,10 +28,14 @@ northd_ovn_northd_SOURCES = \
 	northd/en-lflow.h \
 	northd/en-meters.c \
 	northd/en-meters.h \
+	northd/en-multicast.c \
+	northd/en-multicast.h \
 	northd/en-northd-output.c \
 	northd/en-northd-output.h \
 	northd/en-port-group.c \
 	northd/en-port-group.h \
+	northd/en-route-policies.c \
+	northd/en-route-policies.h \
 	northd/en-sync-sb.c \
 	northd/en-sync-sb.h \
 	northd/en-sync-from-sb.c \
@@ -32,6 +48,16 @@ northd_ovn_northd_SOURCES = \
 	northd/en-lr-stateful.h \
 	northd/en-ls-stateful.c \
 	northd/en-ls-stateful.h \
+	northd/en-sampling-app.c \
+	northd/en-sampling-app.h \
+	northd/en-acl-ids.c \
+	northd/en-acl-ids.h \
+	northd/en-advertised-route-sync.c \
+	northd/en-advertised-route-sync.h \
+	northd/en-learned-route-sync.c \
+	northd/en-learned-route-sync.h \
+	northd/en-group-ecmp-route.c \
+	northd/en-group-ecmp-route.h \
 	northd/inc-proc-northd.c \
 	northd/inc-proc-northd.h \
 	northd/ipam.c \

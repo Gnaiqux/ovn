@@ -25,6 +25,8 @@
 OVN To-do List
 ==============
 
+* Add vxlan_mode handling for Transit Router.
+
 * Refactor ovn-northd code to have separate functions to add logical flows
   for gateway logical routers and logical routers with distributed gateway
   port.
@@ -97,6 +99,8 @@ OVN To-do List
 * ovn-controller Incremental processing
 
   * Implement I-P for datapath groups.
+  * Implement I-P for route exchange relevant ports.
+  * Implement I-P in en-routes based on BFD changes.
 
 * ovn-northd parallel logical flow processing
 
@@ -130,3 +134,111 @@ OVN To-do List
   * Move the lflow build parallel processing from northd.c to lflow-mgr.c
     This would also ensure that the variables declared in northd.c
     (eg. thread_lflow_counter) are not externed in lflow-mgr.c.
+
+* Remove flows with `check_pkt_larger` when userspace datapath can handle
+  PMTUD. (https://issues.redhat.com/browse/FDP-256)
+
+* Remove ssl_ciphersuites workaround for clustered databases from ovn-ctl
+  after 26.03 release, assuming it will be an LTS release.
+
+* Dynamic Routing
+
+  * Add incremental processing of en_dynamic_routes for stateful configuration
+    changes.
+
+  * Improve handling of the Learned_Route table in ovn-controller conditional
+    monitoring; once a new local datapath is added we need to wait for
+    monitoring conditions to update before we actually try to learn routes.
+    Otherwise we could try to add duplicated Learned_Routes and the ovnsb
+    commit would fail.
+
+* Datapath sync nodes
+
+  * Migrate data stored in the ovn\_datapath structure to
+    ovn\_synced\_logical_router and ovn\_synced\_logical\_switch. This will
+    allow for the eventual removal of the ovn\_datapath structure from the
+    codebase.
+
+* Logical Router Policies
+
+  * Add support for configuring output\_port for reroute router policies that
+    have more than one nexthop (ECMP).  This probably requires a redesign of
+    the Northbound Logical_Router_Policy database schema.
+
+* Network function insertion
+
+  * Geneve tunnel is used for supporting this feature for VLAN network.
+    Extend the support over VxLAN tunnel as well.
+
+  * Inline-NF loop prevention has limitations in topologies where
+    a post-NF flood copy may reach the same logical inport from a
+    different node than the packet's original ingress node.  In that
+    case, the lookup runs on a different node than where the inport
+    was learned, so loopback copies are not identified.
+    Known example: OVN-IC L2 stretch with the NF and IC gateway on
+    different chassis.  With ``unknown``-addressed ports, the post-NF
+    packet can be flooded across AZs and come back to the source AZ via
+    another node, so the lookup does not hit the original learn entry.
+
+* CI
+
+  * ovn-kubernetes: Only a subset of the ovn-kubernetes features is currently
+    tested in GitHub CI.  We should extend our testing to support
+    OVN_ENABLE_INTERCONNECT=true and potentially more of the CI lanes
+    ovn-kubernetes/ovn-kubernetes defines in its GitHub project.
+
+* Distributed Load Balancers
+
+  * Currently, this feature works when in OVN topology physical network is
+    connected via a switch directly connected to the DGR.
+    We need to make it work for a topology with two levels of routers:
+    first the GW router, then the DGR.
+
+==============
+OVN Deprecation plan
+==============
+
+The following section contains deprecation plan for certain internal features
+and actions. For each OVN version it contains ``Deprecated`` and ``Removed``.
+``Deprecated`` means that the internal action will print a warning on usage,
+but it will still be parsed and processed. There should be also clearly stated
+when the feature/action will move from ``Deprecated`` to ``Removed``.
+``Removed`` will print a warning and won't be processed further.
+
+* 27.03 Removed
+  * ``chk_ecmp_nh`` logical flow action.
+  * ``chk_ecmp_nh_mac`` logical flow action.
+  * ``commit_ecmp_nh`` logical flow action.
+
+* 26.09 Removed
+
+  * ``OVN_FEATURE_PORT_UP_NOTIF`` feature.
+  * ``OVN_FEATURE_CT_NO_MASKED_LABEL`` feature.
+  * ``OVN_FEATURE_CT_LB_RELATED`` feature.
+  * ``ct_lb`` action.
+
+* 26.09 Deprecated
+
+  * ``OVN_FEATURE_MAC_BINDING_TIMESTAMP`` feature, should be removed in 28.09.
+  * ``OVN_FEATURE_FDB_TIMESTAMP`` feature, should be removed in 28.09.
+  * ``OVN_FEATURE_LS_DPG_COLUMN`` feature, should be removed in 28.09.
+  * ``ic-route-filter-tag`` Logical_Router_Port option, superseded by
+    ``ic-route-learn-tag-rules``, should be removed in 28.09.
+
+* 26.03 Deprecated
+
+  * ``ct_lb`` action, should be removed in 26.09.
+  * ``SPLIT_BUF_ACTION`` action, should be removed in 28.09.
+
+* 26.03 Removed
+
+  * ``PUT_ICMP4_FRAG_MTU`` action
+  * ``PUT_ICMP6_FRAG_MTU`` action
+
+* 24.09 Deprecated
+
+  * ``OVN_FEATURE_PORT_UP_NOTIF`` feature, should be removed in 26.09.
+  * ``OVN_FEATURE_CT_NO_MASKED_LABEL``, should be removed in 26.09.
+  * ``OVN_FEATURE_CT_LB_RELATED``, should be removed in 26.09.
+  * ``PUT_ICMP4_FRAG_MTU`` action, should be removed in 26.03
+  * ``PUT_ICMP6_FRAG_MTU`` action, should be removed in 26.03.

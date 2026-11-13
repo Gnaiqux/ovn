@@ -22,7 +22,9 @@
 
 struct sbrec_chassis;
 struct sbrec_ha_chassis_group;
+struct sbrec_ha_chassis_group_table;
 struct sset;
+struct uuidset;
 
 struct ha_chassis_ordered {
     struct sbrec_ha_chassis *ha_ch;
@@ -41,10 +43,21 @@ bool ha_chassis_group_contains(
     const struct sbrec_ha_chassis_group *ha_chassis_grp,
     const struct sbrec_chassis *chassis);
 
+void ha_chassis_groups_collect_local(
+    const struct sbrec_ha_chassis_group_table *ha_ch_grp_table,
+    const struct sset *active_tunnels,
+    const struct sbrec_chassis *local_chassis,
+    struct uuidset *local_groups,
+    struct uuidset *active_groups);
+
 struct ha_chassis_ordered *ha_chassis_get_ordered(
     const struct sbrec_ha_chassis_group *ha_chassis_grp);
 
 void ha_chassis_destroy_ordered(
     struct ha_chassis_ordered *ordered_ha_ch);
+struct ha_chassis_ordered *get_ordered_ha_chassis_list(
+    const struct sbrec_ha_chassis_group *ha_ch_grp,
+    const struct sset *active_tunnels,
+    const struct sbrec_chassis *local_chassis);
 
 #endif /* OVN_HA_CHASSIS_H */

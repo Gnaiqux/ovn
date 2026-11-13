@@ -13,7 +13,7 @@
 # limitations under the License.
 
 AC_PREREQ(2.63)
-AC_INIT(ovn, 24.03.90, bugs@openvswitch.org)
+AC_INIT(ovn, 26.09.90, bugs@openvswitch.org)
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_HEADERS([config.h])
@@ -82,11 +82,10 @@ AC_SEARCH_LIBS([pthread_rwlock_tryrdlock], [pthread])
 AC_SEARCH_LIBS([pthread_rwlockattr_destroy], [pthread])
 AC_FUNC_STRERROR_R
 
-OVS_CHECK_WIN64
-OVS_CHECK_WIN32
-OVS_CHECK_VISUAL_STUDIO_DDK
 OVN_CHECK_COVERAGE
 OVS_CHECK_NDEBUG
+OVS_CHECK_NETLINK
+OVS_CHECK_LINUX_NETLINK
 OVS_CHECK_OPENSSL
 OVN_CHECK_LOGDIR
 OVN_CHECK_PYTHON3
@@ -169,8 +168,12 @@ OVS_ENABLE_WERROR
 OVS_ENABLE_SPARSE
 
 OVS_CHECK_PRAGMA_MESSAGE
+OVN_CHECK_VERSION_SUFFIX
 OVN_CHECK_OVS
 OVN_CHECK_VIF_PLUG_PROVIDER
+OVN_CHECK_LINUX_NDA_NH_ID
+OVN_CHECK_LINUX_NHA_FDB
+OVN_CHECK_LINUX_NEXTHOP_WEIGHT
 OVN_ENABLE_VIF_PLUG
 OVS_CTAGS_IDENTIFIERS
 AC_SUBST([OVS_CFLAGS])
@@ -189,7 +192,6 @@ AC_CONFIG_FILES(include/ovn/version.h)
 dnl This makes sure that include/openflow gets created in the build directory.
 AC_CONFIG_COMMANDS([include/openflow/openflow.h.stamp])
 
-AC_CONFIG_COMMANDS([utilities/bugtool/dummy], [:])
 AC_CONFIG_COMMANDS([utilities/dummy], [:])
 AC_CONFIG_COMMANDS([ipsec/dummy], [:])
 

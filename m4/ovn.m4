@@ -60,139 +60,6 @@ AC_DEFUN([OVS_CHECK_NDEBUG],
      [ndebug=false])
    AM_CONDITIONAL([NDEBUG], [test x$ndebug = xtrue])])
 
-dnl Checks for MSVC x64 compiler.
-AC_DEFUN([OVS_CHECK_WIN64],
-  [AC_CACHE_CHECK(
-    [for MSVC x64 compiler],
-    [cl_cv_x64],
-    [dnl "cl" writes x64 output to stdin:
-     if (cl) 2>&1 | grep 'x64' >/dev/null 2>&1; then
-       cl_cv_x64=yes
-       MSVC64_LDFLAGS=" /MACHINE:X64 "
-       MSVC_PLATFORM="x64"
-     else
-       cl_cv_x64=no
-       MSVC64_LDFLAGS=""
-       MSVC_PLATFORM="x86"
-     fi])
-     AC_SUBST([MSVC64_LDFLAGS])
-     AC_SUBST([MSVC_PLATFORM])
-])
-
-dnl Checks for WINDOWS.
-AC_DEFUN([OVS_CHECK_WIN32],
-  [AC_CHECK_HEADER([windows.h],
-                   [WIN32=yes],
-                   [WIN32=no])
-   AM_CONDITIONAL([WIN32], [test "$WIN32" = yes])
-   if test "$WIN32" = yes; then
-      AC_ARG_WITH([pthread],
-         [AS_HELP_STRING([--with-pthread=DIR],
-            [root of the pthread-win32 directory])],
-         [
-            case "$withval" in
-            "" | y | ye | yes | n | no)
-            AC_MSG_ERROR([Invalid --with-pthread value])
-              ;;
-            *)
-            if (cl) 2>&1 | grep 'x64' >/dev/null 2>&1; then
-              cl_cv_x64=yes
-            else
-              cl_cv_x64=no
-            fi
-            if test "$cl_cv_x64" = yes; then
-                PTHREAD_WIN32_DIR=$withval/lib/x64
-                PTHREAD_WIN32_DIR_DLL=/$(echo ${withval} | ${SED} -e 's/://')/dll/x64
-                PTHREAD_WIN32_DIR_DLL_WIN_FORM=$withval/dll/x64
-            else
-                PTHREAD_WIN32_DIR=$withval/lib/x86
-                PTHREAD_WIN32_DIR_DLL=/$(echo ${withval} | ${SED} -e 's/://')/dll/x86
-                PTHREAD_WIN32_DIR_DLL_WIN_FORM=$withval/dll/x86
-            fi
-            PTHREAD_INCLUDES=-I$withval/include
-            PTHREAD_LDFLAGS=-L$PTHREAD_WIN32_DIR
-            PTHREAD_LIBS="-lpthreadVC2"
-            AC_SUBST([PTHREAD_WIN32_DIR_DLL_WIN_FORM])
-            AC_SUBST([PTHREAD_WIN32_DIR_DLL])
-            AC_SUBST([PTHREAD_INCLUDES])
-            AC_SUBST([PTHREAD_LDFLAGS])
-            AC_SUBST([PTHREAD_LIBS])
-              ;;
-            esac
-         ], [
-            AC_MSG_ERROR([pthread directory not specified])
-         ]
-      )
-      AC_ARG_WITH([debug],
-         [AS_HELP_STRING([--with-debug],
-            [Build without compiler optimizations])],
-         [
-            MSVC_CFLAGS="-O0"
-            AC_SUBST([MSVC_CFLAGS])
-         ], [
-            MSVC_CFLAGS="-O2"
-            AC_SUBST([MSVC_CFLAGS])
-         ]
-      )
-
-      AC_DEFINE([WIN32], [1], [Define to 1 if building on WIN32.])
-      AC_CHECK_TYPES([struct timespec], [], [], [[#include <time.h>]])
-      AH_BOTTOM([#ifdef WIN32
-#include "include/windows/windefs.h"
-#endif])
-   fi])
-
-dnl OVS_CHECK_WINDOWS
-dnl
-dnl Configure Visual Studio solution build
-AC_DEFUN([OVS_CHECK_VISUAL_STUDIO_DDK], [
-AC_ARG_WITH([vstudiotarget],
-         [AS_HELP_STRING([--with-vstudiotarget=target_type],
-            [Target type: Debug/Release])],
-         [
-            case "$withval" in
-            "Release") ;;
-            "Debug") ;;
-            *) AC_MSG_ERROR([No valid Visual Studio configuration found]) ;;
-            esac
-
-            VSTUDIO_CONFIG=$withval
-         ], [
-            VSTUDIO_CONFIG=
-         ]
-      )
-
-  AC_SUBST([VSTUDIO_CONFIG])
-
-AC_ARG_WITH([vstudiotargetver],
-         [AS_HELP_STRING([--with-vstudiotargetver=target_ver1,target_ver2],
-            [Target versions: Win8,Win8.1,Win10])],
-         [
-            targetver=`echo "$withval" | tr -s , ' ' `
-            for ver in $targetver; do
-                case "$ver" in
-                "Win8") VSTUDIO_WIN8=true ;;
-                "Win8.1")  VSTUDIO_WIN8_1=true ;;
-                "Win10") VSTUDIO_WIN10=true ;;
-                *) AC_MSG_ERROR([No valid Visual Studio target version found]) ;;
-                esac
-            done
-
-         ], [
-            VSTUDIO_WIN8=true
-            VSTUDIO_WIN8_1=true
-            VSTUDIO_WIN10=true
-         ]
-      )
-
-  AM_CONDITIONAL([VSTUDIO_WIN8], [test -n "$VSTUDIO_WIN8"])
-  AM_CONDITIONAL([VSTUDIO_WIN8_1], [test -n "$VSTUDIO_WIN8_1"])
-  AM_CONDITIONAL([VSTUDIO_WIN10], [test -n "$VSTUDIO_WIN10"])
-
-  AC_DEFINE([VSTUDIO_DDK], [1], [System uses the Visual Studio build target.])
-  AM_CONDITIONAL([VSTUDIO_DDK], [test -n "$VSTUDIO_CONFIG"])
-])
-
 dnl Checks for OpenSSL.
 AC_DEFUN([OVS_CHECK_OPENSSL],
   [AC_ARG_ENABLE(
@@ -217,7 +84,7 @@ $SSL_PKG_ERRORS
 OpenFlow connections over SSL will not be supported.
 (You may use --disable-ssl to suppress this warning.)])
           else
-            AC_MSG_ERROR([Cannot find openssl (use --disable-ssl to configure without SSL support)])
+            AC_MSG_ERROR([Cannot find openssl (use --disable-ssl to configure without SSL/TLS support)])
           fi])
    else
        HAVE_OPENSSL=no
@@ -227,22 +94,6 @@ OpenFlow connections over SSL will not be supported.
    if test "$HAVE_OPENSSL" = yes; then
       AC_DEFINE([HAVE_OPENSSL], [1], [Define to 1 if OpenSSL is installed.])
    fi
-
-   OPENSSL_SUPPORTS_SNI=no
-   if test $HAVE_OPENSSL = yes; then
-      save_CPPFLAGS=$CPPFLAGS
-      CPPFLAGS="$CPPFLAGS $SSL_INCLUDES"
-      AC_CHECK_DECL([SSL_set_tlsext_host_name], [OPENSSL_SUPPORTS_SNI=yes],
-                    [], [#include <openssl/ssl.h>
-])
-      if test $OPENSSL_SUPPORTS_SNI = yes; then
-        AC_DEFINE(
-          [OPENSSL_SUPPORTS_SNI], [1],
-          [Define to 1 if OpenSSL supports Server Name Indication (SNI).])
-      fi
-      CPPFLAGS=$save_CPPFLAGS
-   fi
-   AC_SUBST([OPENSSL_SUPPORTS_SNI])
 ])
 
 dnl Checks for the directory in which to store the PKI.
@@ -300,22 +151,22 @@ dnl Checks for valgrind/valgrind.h.
 AC_DEFUN([OVN_CHECK_VALGRIND],
   [AC_CHECK_HEADERS([valgrind/valgrind.h])])
 
-dnl Checks for Python 3.6 or later.
+dnl Checks for Python 3.7 or later.
 AC_DEFUN([OVN_CHECK_PYTHON3],
   [AC_CACHE_CHECK(
-     [for Python 3 (version 3.6 or later)],
+     [for Python 3 (version 3.7 or later)],
      [ovs_cv_python3],
      [if test -n "$PYTHON3"; then
         ovs_cv_python3=$PYTHON3
       else
         ovs_cv_python3=no
-        for binary in python3 python3.6 python3.7 python3.8 python3.9 python 3.10 python 3.11; do
+        for binary in python3 python3.7 python3.8 python3.9 python 3.10 python 3.11 python 3.12 python 3.13; do
           ovs_save_IFS=$IFS; IFS=$PATH_SEPARATOR
           for dir in $PATH; do
             IFS=$ovs_save_IFS
             test -z "$dir" && dir=.
             if test -x "$dir"/"$binary" && "$dir"/"$binary" -c 'import sys
-if sys.hexversion >= 0x03060000 and sys.hexversion < 0x04000000:
+if sys.hexversion >= 0x03070000 and sys.hexversion < 0x04000000:
     sys.exit(0)
 else:
     sys.exit(1)'; then
@@ -326,7 +177,7 @@ else:
         done
       fi])
    if test "$ovs_cv_python3" = no; then
-     AC_MSG_ERROR([Python 3.6 or later is required but not found in $PATH, please install it or set $PYTHON3 to point to it])
+     AC_MSG_ERROR([Python 3.7 or later is required but not found in $PATH, please install it or set $PYTHON3 to point to it])
    fi
    AC_ARG_VAR([PYTHON3])
    PYTHON3=$ovs_cv_python3])
@@ -576,3 +427,68 @@ AC_DEFUN([OVN_CHECK_UNBOUND],
    fi
    AM_CONDITIONAL([HAVE_UNBOUND], [test "$HAVE_UNBOUND" = yes])
    AC_SUBST([HAVE_UNBOUND])])
+
+dnl Checks for Netlink support.
+AC_DEFUN([OVS_CHECK_NETLINK],
+  [AC_CHECK_HEADER([linux/netlink.h],
+                   [HAVE_NETLINK=yes],
+                   [HAVE_NETLINK=no],
+                   [#include <sys/socket.h>
+   ])
+   AM_CONDITIONAL([HAVE_NETLINK], [test "$HAVE_NETLINK" = yes])
+   if test "$HAVE_NETLINK" = yes; then
+      AC_DEFINE([HAVE_NETLINK], [1],
+                [Define to 1 if Netlink protocol is available.])
+   fi])
+
+dnl OVS_CHECK_LINUX_NETLINK
+dnl
+dnl Configure Linux netlink compat.
+AC_DEFUN([OVS_CHECK_LINUX_NETLINK], [
+  AC_COMPILE_IFELSE([
+    AC_LANG_PROGRAM([#include <linux/netlink.h>], [
+        struct nla_bitfield32 x =  { 0 };
+    ])],
+    [AC_DEFINE([HAVE_NLA_BITFIELD32], [1],
+    [Define to 1 if struct nla_bitfield32 is available.])])
+])
+
+dnl OVN_CHECK_LINUX_NDA_NH_ID
+dnl
+dnl Configure Linux netlink neighbour NDA_NH_ID compat.
+AC_DEFUN([OVN_CHECK_LINUX_NDA_NH_ID], [
+  AC_COMPILE_IFELSE([
+    AC_LANG_PROGRAM([#include <linux/neighbour.h>], [
+        int x = NDA_NH_ID;
+    ])],
+    [AC_DEFINE([HAVE_NDA_NH_ID], [1],
+    [Define to 1 if NDA_NH_ID is available.])])
+])
+
+dnl OVN_CHECK_LINUX_NHA_FDB
+dnl
+dnl Configure Linux netlink nexthop NHA_FDB compat.
+AC_DEFUN([OVN_CHECK_LINUX_NHA_FDB], [
+  AC_COMPILE_IFELSE([
+    AC_LANG_PROGRAM([#include <linux/nexthop.h>], [
+        int x = NHA_FDB;
+    ])],
+    [AC_DEFINE([HAVE_NHA_FDB], [1],
+    [Define to 1 if NHA_FDB is available.])])
+])
+
+dnl OVN_CHECK_LINUX_NEXTHOP_WEIGHT
+dnl
+dnl Configure Linux netlink nexthop compat.
+AC_DEFUN([OVN_CHECK_LINUX_NEXTHOP_WEIGHT], [
+    save_CFLAGS="$CFLAGS"
+    CFLAGS="$CFLAGS -Werror=implicit-function-declaration"
+    AC_COMPILE_IFELSE([
+      AC_LANG_PROGRAM([#include <linux/nexthop.h>], [
+          struct nexthop_grp grp = { 0 };
+          nexthop_grp_weight(&grp);
+      ])],
+      [AC_DEFINE([HAVE_NH_GRP_WEIGHT], [1],
+      [Define to 1 if nexthop_grp_weight() is available.])])
+    CFLAGS="$save_CFLAGS"
+  ])

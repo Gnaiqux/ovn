@@ -20,6 +20,7 @@
 
 /* OVS includes. */
 #include "lib/hmapx.h"
+#include "lib/uuidset.h"
 #include "openvswitch/hmap.h"
 #include "sset.h"
 
@@ -32,6 +33,12 @@
 #include "lib/stopwatch-names.h"
 
 struct lflow_ref;
+
+struct acl_tier {
+    uint64_t ingress_pre_lb;
+    uint64_t ingress_post_lb;
+    uint64_t egress;
+};
 
 struct ls_stateful_record {
     struct hmap_node key_node;
@@ -46,7 +53,10 @@ struct ls_stateful_record {
     bool has_stateful_acl;
     bool has_lb_vip;
     bool has_acls;
-    uint64_t max_acl_tier;
+    struct acl_tier max_acl_tier;
+
+    /* Set of ACLs that are related to this LS. */
+    struct uuidset related_acls;
 
     /* 'lflow_ref' is used to reference logical flows generated for
      * this ls_stateful record.
@@ -87,6 +97,7 @@ struct ls_stateful_table {
 struct ls_stateful_tracked_data {
     /* Created or updated logical switch with LB and ACL data. */
     struct hmapx crupdated; /* Stores 'struct ls_stateful_record'. */
+    struct hmapx deleted;
 };
 
 struct ed_type_ls_stateful {
@@ -97,17 +108,22 @@ struct ed_type_ls_stateful {
 void *en_ls_stateful_init(struct engine_node *, struct engine_arg *);
 void en_ls_stateful_cleanup(void *data);
 void en_ls_stateful_clear_tracked_data(void *data);
-void en_ls_stateful_run(struct engine_node *, void *data);
+enum engine_node_state en_ls_stateful_run(struct engine_node *, void *data);
 
-bool ls_stateful_northd_handler(struct engine_node *, void *data);
-bool ls_stateful_port_group_handler(struct engine_node *, void *data);
+enum engine_input_handler_result
+ls_stateful_northd_handler(struct engine_node *, void *data);
+enum engine_input_handler_result
+ls_stateful_port_group_handler(struct engine_node *, void *data);
+enum engine_input_handler_result
+ls_stateful_acl_handler(struct engine_node *node, void *data);
 
 const struct ls_stateful_record *ls_stateful_table_find(
     const struct ls_stateful_table *, const struct nbrec_logical_switch *);
 
 static inline bool
 ls_stateful_has_tracked_data(struct ls_stateful_tracked_data *trk_data) {
-    return !hmapx_is_empty(&trk_data->crupdated);
+    return !hmapx_is_empty(&trk_data->crupdated) ||
+           !hmapx_is_empty(&trk_data->deleted);
 }
 
 #endif /* EN_LS_STATEFUL_H */

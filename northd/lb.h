@@ -18,6 +18,7 @@
 #define OVN_NORTHD_LB_H 1
 
 #include "openvswitch/hmap.h"
+#include "hmapx.h"
 #include "uuid.h"
 
 #include "lib/lb.h"
@@ -38,9 +39,11 @@ struct ovn_lb_ip_set {
     struct sset ips_v4;
     struct sset ips_v4_routable;
     struct sset ips_v4_reachable;
+    struct sset ips_v4_adv;
     struct sset ips_v6;
     struct sset ips_v6_routable;
     struct sset ips_v6_reachable;
+    struct sset ips_v6_adv;
 };
 
 struct ovn_lb_ip_set *ovn_lb_ip_set_create(void);
@@ -72,6 +75,13 @@ struct ovn_northd_lb {
 
     /* Indicates if the load balancer has health checks configured. */
     bool health_checks;
+
+    /* Indicates if distributed option is enabled for load balancer. */
+    bool is_distributed;
+
+    bool use_stateless_nat;
+
+    char *hairpin_snat_ip;
 };
 
 /* ovn-northd specific backend information. */
@@ -85,8 +95,19 @@ struct ovn_northd_lb_vip {
 
 struct ovn_northd_lb_backend {
     bool health_check;
-    char *logical_port; /* Logical port to which the ip belong to. */
-    char *svc_mon_src_ip; /* Source IP to use for monitoring. */
+     /* Set to true if port does not locate in local AZ. */
+    bool remote_backend;
+    bool distributed_backend;
+    /* Logical port to which the ip belong to. */
+    char *logical_port;
+    /* Source IP address to be used for service monitoring. */
+    char *svc_mon_src_ip;
+    /* Target Availability Zone name for service monitoring. */
+    char *az_name;
+    /* LRP used as the source of health_check traffic.  This may be NULL if
+     * health_check uses "reserved" IP address that does not belong to any
+     * LRP in the backend's datapath. */
+    struct ovn_port *svc_mon_lrp;
 };
 
 struct ovn_northd_lb *ovn_northd_lb_create(const struct nbrec_load_balancer *);
@@ -100,7 +121,7 @@ void ovn_northd_lb_reinit(struct ovn_northd_lb *,
 void build_lrouter_lb_ips(struct ovn_lb_ip_set *,
                           const struct ovn_northd_lb *);
 void add_ips_to_lb_ip_set(struct ovn_lb_ip_set *lb_ips,
-                          bool is_routable,
+                          bool is_routable, bool advertise,
                           const struct sset *lb_ips_v4,
                           const struct sset *lb_ips_v6);
 void remove_ips_from_lb_ip_set(struct ovn_lb_ip_set *lb_ips,
@@ -114,7 +135,9 @@ struct ovn_lb_group {
     size_t n_lbs;
     struct ovn_northd_lb **lbs;
     struct ovn_lb_ip_set *lb_ips;
+    bool has_health_checks;
     bool has_routable_lb;
+    bool has_distributed_lb;
 };
 
 struct ovn_lb_group *ovn_lb_group_create(
@@ -133,11 +156,11 @@ struct ovn_lb_datapaths {
     struct hmap_node hmap_node;
 
     const struct ovn_northd_lb *lb;
-    size_t n_nb_ls;
-    unsigned long *nb_ls_map;
 
-    size_t n_nb_lr;
-    unsigned long *nb_lr_map;
+    struct dynamic_bitmap nb_ls_map;
+    struct dynamic_bitmap nb_lr_map;
+
+    struct hmapx ls_lb_with_stateless_mode;
 
     /* Reference of lflows generated for this load balancer.
      *
@@ -175,9 +198,15 @@ struct ovn_lb_datapaths *ovn_lb_datapaths_find(const struct hmap *,
 void ovn_lb_datapaths_destroy(struct ovn_lb_datapaths *);
 
 void ovn_lb_datapaths_add_lr(struct ovn_lb_datapaths *, size_t n,
-                             struct ovn_datapath **);
+                             struct ovn_datapath **,
+                             size_t n_lr_datapaths);
 void ovn_lb_datapaths_add_ls(struct ovn_lb_datapaths *, size_t n,
-                             struct ovn_datapath **);
+                             struct ovn_datapath **,
+                             size_t n_ls_datapaths);
+
+void ovn_northd_lb_backend_set_mon_port(const struct ovn_lb_datapaths *,
+                                        const struct ovn_port *,
+                                        struct ovn_northd_lb_backend *);
 
 struct ovn_lb_group_datapaths {
     struct hmap_node hmap_node;
@@ -185,10 +214,8 @@ struct ovn_lb_group_datapaths {
     const struct ovn_lb_group *lb_group;
 
     /* Datapaths to which 'lb_group' is applied. */
-    size_t n_ls;
-    struct ovn_datapath **ls;
-    size_t n_lr;
-    struct ovn_datapath **lr;
+    struct vector ls;
+    struct vector lr;
 };
 
 struct ovn_lb_group_datapaths *ovn_lb_group_datapaths_create(
@@ -201,17 +228,16 @@ struct ovn_lb_group_datapaths *ovn_lb_group_datapaths_find(
 
 static inline void
 ovn_lb_group_datapaths_add_ls(struct ovn_lb_group_datapaths *lbg_dps, size_t n,
-                               struct ovn_datapath **ods)
+                              struct ovn_datapath **ods)
 {
-    memcpy(&lbg_dps->ls[lbg_dps->n_ls], ods, n * sizeof *ods);
-    lbg_dps->n_ls += n;
+    vector_push_array(&lbg_dps->ls, ods, n);
 }
 
 static inline void
 ovn_lb_group_datapaths_add_lr(struct ovn_lb_group_datapaths *lbg_dps,
-                               struct ovn_datapath *lr)
+                              struct ovn_datapath *lr)
 {
-    lbg_dps->lr[lbg_dps->n_lr++] = lr;
+    vector_push(&lbg_dps->lr, &lr);
 }
 
 #endif /* OVN_NORTHD_LB_H */

@@ -49,8 +49,7 @@ First Steps
 
 Getting started with Open Virtual Network (OVN) for Open vSwitch? Start here.
 
-- **Install:** :doc:`intro/install/general` |
-  :doc:`intro/install/windows`
+- **Install:** :doc:`intro/install/general`
 
 - **Tutorials:** :doc:`tutorials/ovn-sandbox` |
   :doc:`tutorials/ovn-openstack` |
@@ -81,9 +80,11 @@ Learn more about the Open Virtual Network (OVN) project and about how you can co
 
 - **Contributing:** :doc:`internals/contributing/submitting-patches` |
   :doc:`internals/contributing/backporting-patches` |
+  :doc:`internals/contributing/inclusive-language` |
   :doc:`internals/contributing/coding-style`
 
-- **Maintaining:** :doc:`internals/maintainers` |
+- **Maintaining:** :doc:`internals/charter` |
+  :doc:`internals/maintainers` |
   :doc:`internals/committer-responsibilities` |
   :doc:`internals/committer-grant-revocation` |
   :doc:`internals/committer-emeritus-status`

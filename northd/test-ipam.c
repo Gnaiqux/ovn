@@ -38,21 +38,17 @@ test_ipam_get_unused_ip(struct ovs_cmdl_context *ctx)
     }
     init_ipam_info(&info, &config, "Unused IP test");
 
-    bool fail = false;
     struct ds output = DS_EMPTY_INITIALIZER;
     struct ds err = DS_EMPTY_INITIALIZER;
     for (size_t i = 0; i < num_ips; i++) {
         uint32_t next_ip = ipam_get_unused_ip(&info);
         ds_put_format(&output, IP_FMT "\n", IP_ARGS(htonl(next_ip)));
         if (next_ip) {
-            ovs_assert(ipam_insert_ip(&info, next_ip));
+            ovs_assert(ipam_insert_ip(&info, next_ip, true));
         }
     }
 
     printf("%s", ds_cstr(&output));
-    if (fail) {
-        fprintf(stderr, "%s", ds_cstr(&err));
-    }
 
     smap_destroy(&config);
     destroy_ipam_info(&info);

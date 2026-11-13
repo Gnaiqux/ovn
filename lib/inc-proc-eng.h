@@ -157,6 +157,9 @@ struct engine_context {
     struct ovsdb_idl_txn *ovs_idl_txn;
     struct ovsdb_idl_txn *ovnsb_idl_txn;
     struct ovsdb_idl_txn *ovnnb_idl_txn;
+    struct ovsdb_idl_txn *ovnbr_idl_txn;
+    struct ovsdb_idl_txn *ovnisb_idl_txn;
+    struct ovsdb_idl_txn *ovninb_idl_txn;
 
     void *client_ctx;
 };
@@ -165,26 +168,13 @@ struct engine_context {
 struct engine_arg {
     struct ovsdb_idl *sb_idl;
     struct ovsdb_idl *nb_idl;
+    struct ovsdb_idl *ovnbr_idl;
+    struct ovsdb_idl *icsb_idl;
+    struct ovsdb_idl *icnb_idl;
     struct ovsdb_idl *ovs_idl;
 };
 
 struct engine_node;
-
-struct engine_node_input {
-    /* The input node. */
-    struct engine_node *node;
-
-    /* Change handler for changes of the input node. The changes may need to be
-     * evaluated against all the other inputs. Returns:
-     *  - true: if change can be handled
-     *  - false: if change cannot be handled (indicating full recompute needed)
-     * A change handler can also call engine_get_context() but it must make
-     * sure the txn pointers returned by it are non-NULL. In case the change
-     * handler needs to use the txn pointers returned by engine_get_context(),
-     * and the pointers are NULL, the change handler MUST return false.
-     */
-    bool (*change_handler)(struct engine_node *node, void *data);
-};
 
 enum engine_node_state {
     EN_STALE,     /* Data in the node is not up to date with the DB. */
@@ -194,16 +184,44 @@ enum engine_node_state {
     EN_UNCHANGED, /* Data in the node is valid and didn't change during the
                    * last run.
                    */
-    EN_ABORTED,   /* During the last run, processing was aborted for
+    EN_CANCELED,  /* During the last run, processing was canceled for
                    * this node.
                    */
     EN_STATE_MAX,
 };
 
+enum engine_input_handler_result {
+    EN_UNHANDLED = -1,
+    EN_HANDLED_UPDATED = EN_UPDATED,
+    EN_HANDLED_UNCHANGED = EN_UNCHANGED,
+};
+
+struct engine_node_input {
+    /* The input node. */
+    struct engine_node *node;
+
+    /* Change handler for changes of the input node. The changes may need to be
+     * evaluated against all the other inputs. Returns:
+     *  - EN_UNHANDLED: the change cannot be handled (indicating full
+     *    recompute needed).
+     *  - EN_HANDLED_UPDATED: the change can be handled, and the node's
+     *    data was updated as a result.
+     *  - EN_HANDLED_UNCHANGED: the change can be handled, and the node's
+     *    data was left unchanged.
+     * A change handler can also call engine_get_context() but it must make
+     * sure the txn pointers returned by it are non-NULL. In case the change
+     * handler needs to use the txn pointers returned by engine_get_context(),
+     * and the pointers are NULL, the change handler MUST return EN_UNHANDLED.
+     */
+    const char *change_handler_name;
+    enum engine_input_handler_result (*change_handler)
+        (struct engine_node *node, void *data);
+};
+
 struct engine_stats {
     uint64_t recompute;
     uint64_t compute;
-    uint64_t abort;
+    uint64_t cancel;
 };
 
 struct engine_node {
@@ -241,7 +259,7 @@ struct engine_node {
      * implementation guarantees that the txn pointers returned
      * engine_get_context() are not NULL and valid.
      */
-    void (*run)(struct engine_node *node, void *data);
+    enum engine_node_state (*run)(struct engine_node *node, void *data);
 
     /* Method to validate if the 'internal_data' is valid. This allows users
      * to customize when 'data' can be used (e.g., even if the node
@@ -254,8 +272,19 @@ struct engine_node {
      * engine 'data'. It may be NULL. */
     void (*clear_tracked_data)(void *tracked_data);
 
+    /* Method used to dump info about node input compute failues. It may be
+     * NULL.
+     */
+    void (*get_compute_failure_info)(struct engine_node *);
+
     /* Engine stats. */
     struct engine_stats stats;
+
+    /* Indication if the node writes to SB DB. */
+    bool sb_write;
+
+    /* Whether stopwatches are enabled for this node. */
+    bool stopwatch_enabled;
 };
 
 /* Initialize the data for the engine nodes. It calls each node's
@@ -271,7 +300,7 @@ void engine_init_run(void);
 /* Execute the processing, which should be called in the main loop.
  * Updates the engine node's states accordingly. If 'recompute_allowed' is
  * false and a recompute is required by the current engine run then the engine
- * aborts.
+ * cancels its processing.
  */
 void engine_run(bool recompute_allowed);
 
@@ -294,14 +323,43 @@ void *engine_get_input_data(const char *input_name, struct engine_node *);
  * which can be NULL. If the change_handler is NULL, the engine will not
  * be able to process the change incrementally, and will fall back to call
  * the run method to recompute. */
-void engine_add_input(struct engine_node *node, struct engine_node *input,
-                      bool (*change_handler)(struct engine_node *, void *));
+void engine_add_input_impl(struct engine_node *node, struct engine_node *input,
+                           enum engine_input_handler_result (*change_handler)
+                               (struct engine_node *, void *),
+                           const char *change_handler_name);
+#define engine_add_input(node, input, change_handler) \
+    engine_add_input_impl(node, input, change_handler, #change_handler)
 
-/* Force the engine to recompute everything if set to true. It is used
+void engine_add_input_with_compute_debug_impl(
+        struct engine_node *node, struct engine_node *input,
+        enum engine_input_handler_result (*change_handler)
+            (struct engine_node *, void *),
+        void (*get_compute_failure_info)(struct engine_node *),
+        const char *change_handler_name);
+#define engine_add_input_with_compute_debug(node, input, change_handler, \
+                                            get_failure_info) \
+    engine_add_input_with_compute_debug_impl(node, input, change_handler, \
+                                             get_failure_info,            \
+                                             #change_handler)
+
+/* Force the engine to recompute everything. It is used
  * in circumstances when we are not sure there is change or not, or
  * when there is change but the engine couldn't be executed in that
- * iteration, and the change can't be tracked across iterations */
-void engine_set_force_recompute(bool val);
+ * iteration, and the change can't be tracked across iterations. */
+void engine_set_force_recompute(void);
+
+void engine_dump_graph(const char *node_name);
+
+/* Same as "engine_set_force_recompute()", but the poll_loop is woken up
+ * immediately and the next engine run is not delayed. */
+void engine_set_force_recompute_immediate(void);
+
+/* Clear the force flag for the next run so the engine does the
+ * usual processing without forced full recompute. */
+void engine_clear_force_recompute(void);
+
+/* Returns whether next engine_run() is forced to rempute. */
+bool engine_get_force_recompute(void);
 
 /* Return the current engine_context. The values in the context can be NULL
  * if the engine is run with allow_recompute == false in the current
@@ -313,10 +371,6 @@ const struct engine_context *engine_get_context(void);
 
 void engine_set_context(const struct engine_context *);
 
-void engine_set_node_state_at(struct engine_node *node,
-                              enum engine_node_state state,
-                              const char *where);
-
 /* Return true if during the last iteration the node's data was updated. */
 bool engine_node_changed(struct engine_node *node);
 
@@ -327,8 +381,8 @@ bool engine_has_run(void);
  * has changed; false if nothing has changed. */
 bool engine_has_updated(void);
 
-/* Returns true if during the last engine run we had to abort processing. */
-bool engine_aborted(void);
+/* Returns true if during the last engine run we had to cancel processing. */
+bool engine_canceled(void);
 
 /* Return a pointer to node data accessible for users outside the processing
  * engine. If the node data is not valid (e.g., last engine_run() failed or
@@ -342,16 +396,12 @@ bool engine_aborted(void);
  */
 void *engine_get_data(struct engine_node *node);
 
-/* Return a pointer to node data *without* performing any sanity checks on
+/* Return a pointer to node data *without* performing any coherance checks on
  * the state of the node. This may be used only in specific cases when data
  * is guaranteed to be valid, e.g., immediately after initialization and
  * before the first engine_run().
  */
 void *engine_get_internal_data(struct engine_node *node);
-
-/* Set the state of the node and log changes. */
-#define engine_set_node_state(node, state) \
-    engine_set_node_state_at(node, state, OVS_SOURCE_LOCATOR)
 
 /* Trigger a full recompute. */
 void engine_trigger_recompute(void);
@@ -374,10 +424,10 @@ struct ovsdb_idl_index * engine_ovsdb_node_get_index(struct engine_node *,
                                                      const char *name);
 
 /* Any engine node can use this function for no-op handlers. */
-static inline bool
+static inline enum engine_input_handler_result
 engine_noop_handler(struct engine_node *node OVS_UNUSED, void *data OVS_UNUSED)
 {
-    return true;
+    return EN_HANDLED_UNCHANGED;
 }
 
 /* Adds an OVSDB IDL index to the node. This should be called only after
@@ -386,44 +436,59 @@ engine_noop_handler(struct engine_node *node OVS_UNUSED, void *data OVS_UNUSED)
 void engine_ovsdb_node_add_index(struct engine_node *, const char *name,
                                  struct ovsdb_idl_index *);
 
-/* Macro to define an engine node. */
-#define ENGINE_NODE_DEF(NAME, NAME_STR, CLEAR_TRACKED_DATA, IS_VALID) \
+#define ENGINE_NODE_DEF_START(NAME, NAME_STR) \
     struct engine_node en_##NAME = { \
         .name = NAME_STR, \
         .data = NULL, \
         .state = EN_STALE, \
         .init = en_##NAME##_init, \
         .run = en_##NAME##_run, \
-        .cleanup = en_##NAME##_cleanup, \
-        .is_valid = IS_VALID, \
-        .clear_tracked_data = CLEAR_TRACKED_DATA, \
-    };
+        .cleanup = en_##NAME##_cleanup,
 
-#define ENGINE_NODE(NAME, NAME_STR) \
-    ENGINE_NODE_DEF(NAME, NAME_STR, NULL, NULL)
+#define ENGINE_NODE_DEF_END };
 
-#define ENGINE_NODE_WITH_CLEAR_TRACK_DATA(NAME, NAME_STR) \
-    ENGINE_NODE_DEF(NAME, NAME_STR, en_##NAME##_clear_tracked_data, NULL)
+#define ENGINE_NODE1(NAME) \
+    ENGINE_NODE_DEF_START(NAME, #NAME) \
+    ENGINE_NODE_DEF_END
 
-#define ENGINE_NODE_WITH_CLEAR_TRACK_DATA_IS_VALID(NAME, NAME_STR) \
-    ENGINE_NODE_DEF(NAME, NAME_STR, \
-                    en_##NAME##_clear_tracked_data, \
-                    en_##NAME##_is_valid)
+#define CLEAR_TRACKED_DATA(NAME) \
+    .clear_tracked_data = en_##NAME##_clear_tracked_data
+
+#define IS_VALID(NAME) \
+    .is_valid = en_##NAME##_is_valid
+
+#define COMPUTE_FAIL_INFO(NAME) \
+        .get_compute_failure_info = en_##NAME##_compute_failure_info,
+
+#define SB_WRITE(NAME) \
+    .sb_write = true
+
+#define ENGINE_NODE2(NAME, ARG1) \
+    ENGINE_NODE_DEF_START(NAME, #NAME) \
+    ARG1(NAME), \
+    ENGINE_NODE_DEF_END
+
+#define ENGINE_NODE3(NAME, ARG1, ARG2) \
+    ENGINE_NODE_DEF_START(NAME, #NAME) \
+    ARG1(NAME), \
+    ARG2(NAME), \
+    ENGINE_NODE_DEF_END
+
+#define ENGINE_NODE(...) VFUNC(ENGINE_NODE, __VA_ARGS__)
 
 /* Macro to define member functions of an engine node which represents
  * a table of OVSDB */
 #define ENGINE_FUNC_OVSDB(DB_NAME, TBL_NAME) \
-static void \
+static enum engine_node_state \
 en_##DB_NAME##_##TBL_NAME##_run(struct engine_node *node, \
                                 void *data OVS_UNUSED) \
 { \
     const struct DB_NAME##rec_##TBL_NAME##_table *table = \
         EN_OVSDB_GET(node); \
     if (DB_NAME##rec_##TBL_NAME##_table_track_get_first(table)) { \
-        engine_set_node_state(node, EN_UPDATED); \
-        return; \
+        return EN_UPDATED; \
     } \
-    engine_set_node_state(node, EN_UNCHANGED); \
+    return EN_UNCHANGED; \
 } \
 static void *en_##DB_NAME##_##TBL_NAME##_init( \
     struct engine_node *node OVS_UNUSED, \
@@ -436,6 +501,42 @@ static void *en_##DB_NAME##_##TBL_NAME##_init( \
 } \
 static void en_##DB_NAME##_##TBL_NAME##_cleanup(void *data OVS_UNUSED) \
 { \
+} \
+static void \
+en_##DB_NAME##_##TBL_NAME##_compute_failure_info(struct engine_node *node)  \
+{                                                                           \
+    if (!VLOG_IS_DBG_ENABLED()) {                                           \
+        return;                                                             \
+    }                                                                       \
+    const struct ovsdb_idl *table = EN_OVSDB_GET(node);                     \
+    const struct ovsdb_idl_row *row;                                        \
+    struct ds s = DS_EMPTY_INITIALIZER;                                     \
+    ds_put_format(&s, "Node \"%s\" compute failure info:\n", node->name);   \
+    for ((row) = ovsdb_idl_track_get_first(table,                           \
+                                           &DB_NAME##rec_table_##TBL_NAME); \
+         (row); (row) = ovsdb_idl_track_get_next(row)) {                    \
+        if (ovsdb_idl_row_get_seqno((row), OVSDB_IDL_CHANGE_INSERT) > 0) {  \
+            ds_put_format(&s, "%s (New) "UUID_FMT"\n",                      \
+                          #DB_NAME"_"#TBL_NAME, UUID_ARGS(&row->uuid));     \
+        } else if (ovsdb_idl_row_get_seqno((row),                           \
+                                           OVSDB_IDL_CHANGE_DELETE) > 0) {  \
+            ds_put_format(&s, "%s (Deleted) "UUID_FMT"\n",                  \
+                          #DB_NAME"_"#TBL_NAME, UUID_ARGS(&row->uuid));     \
+        } else {                                                            \
+            ds_put_format(&s, "%s (Updated) "UUID_FMT" columns:",           \
+                          #DB_NAME"_"#TBL_NAME, UUID_ARGS(&row->uuid));     \
+            for (size_t i = 0; i < row->table->class_->n_columns; i++) {    \
+                struct ovsdb_idl_column *col =                              \
+                    &DB_NAME##rec_##TBL_NAME##_columns[i];                  \
+                if (ovsdb_idl_track_is_updated(row, col)) {                 \
+                    ds_put_format(&s, " %s,", col->name);                   \
+                }                                                           \
+            }                                                               \
+            ds_chomp(&s, ',');                                              \
+        }                                                                   \
+    }                                                                       \
+    VLOG_DBG("%s", ds_cstr(&s));                                            \
+    ds_destroy(&s);                                                         \
 }
 
 /* Macro to define member functions of an engine node which represents
@@ -449,25 +550,53 @@ static void en_##DB_NAME##_##TBL_NAME##_cleanup(void *data OVS_UNUSED) \
     ENGINE_FUNC_OVSDB(nb, TBL_NAME)
 
 /* Macro to define member functions of an engine node which represents
+ * a table of OVN BR DB */
+#define ENGINE_FUNC_BR(TBL_NAME) \
+    ENGINE_FUNC_OVSDB(ovnbr, TBL_NAME)
+
+/* Macro to define member functions of an engine node which represents
+ * a table of OVN ISB DB */
+#define ENGINE_FUNC_ICSB(TBL_NAME) \
+    ENGINE_FUNC_OVSDB(icsb, TBL_NAME)
+
+/* Macro to define member functions of an engine node which represents
+ * a table of OVN INB DB */
+#define ENGINE_FUNC_ICNB(TBL_NAME) \
+    ENGINE_FUNC_OVSDB(icnb, TBL_NAME)
+
+/* Macro to define member functions of an engine node which represents
  * a table of open_vswitch DB */
 #define ENGINE_FUNC_OVS(TBL_NAME) \
     ENGINE_FUNC_OVSDB(ovs, TBL_NAME)
 
 /* Macro to define an engine node which represents a table of OVSDB */
 #define ENGINE_NODE_OVSDB(DB_NAME, DB_NAME_STR, TBL_NAME, TBL_NAME_STR) \
-    ENGINE_NODE(DB_NAME##_##TBL_NAME, DB_NAME_STR"_"TBL_NAME_STR)
+    ENGINE_NODE_DEF_START(DB_NAME##_##TBL_NAME, DB_NAME_STR"_"TBL_NAME_STR) \
+    COMPUTE_FAIL_INFO(DB_NAME##_##TBL_NAME) \
+    ENGINE_NODE_DEF_END
 
 /* Macro to define an engine node which represents a table of OVN SB DB */
-#define ENGINE_NODE_SB(TBL_NAME, TBL_NAME_STR) \
-    ENGINE_NODE_OVSDB(sb, "SB", TBL_NAME, TBL_NAME_STR);
+#define ENGINE_NODE_SB(TBL_NAME) \
+    ENGINE_NODE_OVSDB(sb, "SB", TBL_NAME, #TBL_NAME);
 
 /* Macro to define an engine node which represents a table of OVN NB DB */
-#define ENGINE_NODE_NB(TBL_NAME, TBL_NAME_STR) \
-    ENGINE_NODE_OVSDB(nb, "NB", TBL_NAME, TBL_NAME_STR);
+#define ENGINE_NODE_NB(TBL_NAME) \
+    ENGINE_NODE_OVSDB(nb, "NB", TBL_NAME, #TBL_NAME);
+
+/* Macro to define an engine node which represents a table of OVN BR DB */
+#define ENGINE_NODE_BR(TBL_NAME) \
+    ENGINE_NODE_OVSDB(ovnbr, "BR", TBL_NAME, #TBL_NAME);
+/* Macro to define an engine node which represents a table of OVN ISB DB */
+#define ENGINE_NODE_ICSB(TBL_NAME) \
+    ENGINE_NODE_OVSDB(icsb, "ICSB", TBL_NAME, #TBL_NAME);
+
+/* Macro to define an engine node which represents a table of OVN INB DB */
+#define ENGINE_NODE_ICNB(TBL_NAME) \
+    ENGINE_NODE_OVSDB(icnb, "ICNB", TBL_NAME, #TBL_NAME);
 
 /* Macro to define an engine node which represents a table of open_vswitch
  * DB */
-#define ENGINE_NODE_OVS(TBL_NAME, TBL_NAME_STR) \
-    ENGINE_NODE_OVSDB(ovs, "OVS", TBL_NAME, TBL_NAME_STR);
+#define ENGINE_NODE_OVS(TBL_NAME) \
+    ENGINE_NODE_OVSDB(ovs, "OVS", TBL_NAME, #TBL_NAME);
 
 #endif /* lib/inc-proc-eng.h */

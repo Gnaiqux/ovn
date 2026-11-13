@@ -17,7 +17,7 @@ m4_define([CACHE_NBDB],[
 m4_define([MEASURE_RECOMPUTE],[
     PERF_RECORD_START(Measure northd recompute)
     ovn-appctl -t northd/ovn-northd inc-engine/recompute
-    ovn-nbctl --wait=sb sync
+    check ovn-nbctl --wait=sb sync
     PERF_RECORD_STOP()
 ])
 
@@ -42,7 +42,7 @@ m4_define([BUILD_NBDB],[
         ovn-appctl -t ovn-nb/ovsdb-server ovsdb-server/remove-db OVN_Northbound
         ovn-appctl -t ovn-nb/ovsdb-server ovsdb-server/add-db ${at_suite_dir}/cached/${at_group}/ovn-nb.db
     fi
-    ovn-nbctl --wait=sb sync
+    check ovn-nbctl --wait=sb sync
     PERF_RECORD_STOP()
 
     MEASURE_RECOMPUTE()
@@ -85,18 +85,18 @@ m4_define([PERF_RECORD_STOPWATCH], [
 # Append a number of metrics to performance results
 #
 m4_define([PERF_RECORD_STOP], [
-    PERF_RECORD_STOPWATCH(ovnnb_db_run, ["Maximum"], [Maximum (NB in msec)])
-    PERF_RECORD_STOPWATCH(ovnnb_db_run, ["Short term average"], [Average (NB in msec)])
-    PERF_RECORD_STOPWATCH(ovnsb_db_run, ["Maximum"], [Maximum (SB in msec)])
-    PERF_RECORD_STOPWATCH(ovnsb_db_run, ["Short term average"], [Average (SB in msec)])
+    PERF_RECORD_STOPWATCH(northd, ["Maximum"], [Maximum (NB in msec)])
+    PERF_RECORD_STOPWATCH(northd, ["Short term average"], [Average (NB in msec)])
+    PERF_RECORD_STOPWATCH(sync_from_sb, ["Maximum"], [Maximum (SB in msec)])
+    PERF_RECORD_STOPWATCH(sync_from_sb, ["Short term average"], [Average (SB in msec)])
     PERF_RECORD_STOPWATCH(ovn-northd-loop, ["Maximum"], [Maximum (northd-loop in msec)])
     PERF_RECORD_STOPWATCH(ovn-northd-loop, ["Short term average"], [Average (northd-loop in msec)])
-    PERF_RECORD_STOPWATCH(build_lflows, ["Maximum"], [Maximum (lflows in msec)])
-    PERF_RECORD_STOPWATCH(build_lflows, ["Short term average"], [Average (lflows in msec)])
-    PERF_RECORD_STOPWATCH(port_group_run, ["Maximum"], [Maximum (port_group in msec)])
-    PERF_RECORD_STOPWATCH(port_group_run, ["Short term average"], [Average (port_group in msec)])
-    PERF_RECORD_STOPWATCH(sync_meters_run, ["Maximum"], [Maximum (sync_meters in msec)])
-    PERF_RECORD_STOPWATCH(sync_meters_run, ["Short term average"], [Average (sync_meters in msec)])
+    PERF_RECORD_STOPWATCH(lflow, ["Maximum"], [Maximum (lflows in msec)])
+    PERF_RECORD_STOPWATCH(lflow, ["Short term average"], [Average (lflows in msec)])
+    PERF_RECORD_STOPWATCH(port_group, ["Maximum"], [Maximum (port_group in msec)])
+    PERF_RECORD_STOPWATCH(port_group, ["Short term average"], [Average (port_group in msec)])
+    PERF_RECORD_STOPWATCH(sync_meters, ["Maximum"], [Maximum (sync_meters in msec)])
+    PERF_RECORD_STOPWATCH(sync_meters, ["Short term average"], [Average (sync_meters in msec)])
 
     ovn-appctl -t northd/ovn-northd stopwatch/reset
 ])
@@ -199,6 +199,8 @@ AT_SETUP([ovn-northd basic scale test -- 200 Hypervisors, 200 Logical Ports/Hype
 ovn_start
 
 BUILD_NBDB(OVN_BASIC_SCALE_CONFIG(200, 200))
+
+OVN_CLEANUP_NORTHD
 AT_CLEANUP
 ])
 
@@ -207,5 +209,7 @@ AT_SETUP([ovn-northd basic scale test -- 500 Hypervisors, 50 Logical Ports/Hyper
 ovn_start
 
 BUILD_NBDB(OVN_BASIC_SCALE_CONFIG(500, 50))
+
+OVN_CLEANUP_NORTHD
 AT_CLEANUP
 ])

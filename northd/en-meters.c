@@ -17,10 +17,8 @@
 #include <config.h>
 
 #include "openvswitch/vlog.h"
-#include "stopwatch.h"
 
 #include "en-meters.h"
-#include "lib/stopwatch-names.h"
 
 VLOG_DEFINE_THIS_MODULE(en_meters);
 
@@ -52,7 +50,7 @@ en_sync_meters_cleanup(void *data_)
     shash_destroy(&data->meter_groups);
 }
 
-void
+enum engine_node_state
 en_sync_meters_run(struct engine_node *node, void *data_)
 {
     struct sync_meters_data *data = data_;
@@ -68,15 +66,38 @@ en_sync_meters_run(struct engine_node *node, void *data_)
 
     const struct engine_context *eng_ctx = engine_get_context();
 
-    stopwatch_start(SYNC_METERS_RUN_STOPWATCH_NAME, time_msec());
-
     build_meter_groups(&data->meter_groups, nb_meter_table);
 
     sync_meters(eng_ctx->ovnsb_idl_txn, nb_meter_table, acl_table,
                 sb_meter_table, &data->meter_groups);
+    return EN_UPDATED;
+}
 
-    stopwatch_stop(SYNC_METERS_RUN_STOPWATCH_NAME, time_msec());
-    engine_set_node_state(node, EN_UPDATED);
+enum engine_input_handler_result
+sync_meters_nb_acl_handler(struct engine_node *node, void *data OVS_UNUSED)
+{
+    const struct nbrec_acl_table *acl_table =
+        EN_OVSDB_GET(engine_get_input("NB_acl", node));
+
+    const struct nbrec_acl *nb_acl;
+    NBREC_ACL_TABLE_FOR_EACH_TRACKED (nb_acl, acl_table) {
+        /* New or deleted ACL with meter and log needs to be recomputed. */
+        if (nbrec_acl_is_new(nb_acl) || nbrec_acl_is_deleted(nb_acl)) {
+            if (nb_acl->log && nb_acl->meter) {
+                return EN_UNHANDLED;
+            }
+
+            continue;
+        }
+
+        /* Addition or removal of meter requires recompute. */
+        if (nbrec_acl_is_updated(nb_acl, NBREC_ACL_COL_LOG) ||
+            nbrec_acl_is_updated(nb_acl, NBREC_ACL_COL_METER)) {
+            return EN_UNHANDLED;
+        }
+    }
+
+    return EN_HANDLED_UNCHANGED;
 }
 
 const struct nbrec_meter*

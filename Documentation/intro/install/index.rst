@@ -40,7 +40,6 @@ Installation from Source
    :maxdepth: 2
 
    general
-   windows
 
 Installation from Packages
 --------------------------
@@ -52,7 +51,6 @@ provided below.
 .. toctree::
    :maxdepth: 2
 
-   distributions
    debian
    fedora
 

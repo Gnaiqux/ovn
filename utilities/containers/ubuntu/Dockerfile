@@ -1,4 +1,4 @@
-FROM registry.hub.docker.com/library/ubuntu:22.04
+FROM registry.hub.docker.com/library/ubuntu:26.04
 
 ARG CONTAINERS_PATH
 
@@ -10,14 +10,18 @@ RUN apt update -y \
     apt install -y \
         automake \
         bc \
+        bsdextrautils \
         clang \
+        curl \
         ethtool \
         gcc \
         git \
+        gnu-coreutils \
         init \
         iproute2 \
         iputils-arping \
         iputils-ping \
+        isc-dhcp-client \
         isc-dhcp-server \
         kmod \
         libelf-dev \
@@ -32,52 +36,40 @@ RUN apt update -y \
         llvm-dev \
         ncat \
         net-tools \
+        nfdump \
+        nftables \
+        ninja-build \
         python3-dev \
         python3-pip \
         selinux-policy-dev \
         sudo \
         tcpdump \
+        tzdata \
         wget \
     && \
     apt autoremove \
     && \
     apt clean
 
-# Compile sparse from source
-WORKDIR /workspace/sparse
-
-RUN git clone git://git.kernel.org/pub/scm/devel/sparse/sparse.git \
-    /workspace/sparse \
-    && \
-    make -j4 PREFIX=/usr HAVE_LLVM= HAVE_SQLITE= install
-
-# Compile OpenBFDD from source
-WORKDIR /workspace/OpenBFDD
-
-COPY $CONTAINERS_PATH/openbfdd.patch /tmp/openbfdd.patch
-
-RUN git clone https://github.com/dyninc/OpenBFDD.git \
-    /workspace/OpenBFDD \
-    && \
-    git apply /tmp/openbfdd.patch \
-    && \
-    ./autogen.sh \
-    && \
-    ./configure --enable-silent-rules \
-    && \
-    make \
-    && \
-    make install
+# Replace tee with gnutee until uutils 0.13.0 lands in Ubuntu 26.04.
+RUN update-alternatives --install /usr/local/bin/tee \
+    tee "$(command -v gnutee)" 100
 
 WORKDIR /workspace
 
+COPY $CONTAINERS_PATH/openbfdd.patch /tmp/openbfdd.patch
+
 COPY $CONTAINERS_PATH/py-requirements.txt /tmp/py-requirements.txt
 
-# Update and install pip dependencies
-RUN python3 -m pip install --upgrade pip \
-    && \
-    python3 -m pip install wheel \
-    && \
-    python3 -m pip install -r /tmp/py-requirements.txt
+COPY $CONTAINERS_PATH/prepare.sh /tmp/prepare.sh
+
+# Ubuntu 24.04 marks the Python installation as externally managed, allow pip
+# to install the packages despite that.
+ENV PIP_BREAK_SYSTEM_PACKAGES 1
+
+# The Python Babel fails to detect timezone when it is set to UTC only.
+ENV TZ Etc/UTC
+
+RUN /tmp/prepare.sh
 
 CMD ["/sbin/init"]

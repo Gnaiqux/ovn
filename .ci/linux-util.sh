@@ -17,3 +17,61 @@ function free_up_disk_space_ubuntu()
                  /usr/local/share/boost/'
     sudo rm -rf $paths
 }
+
+function set_containers_apparmor_profile()
+{
+    local profile=$1
+
+    sed -i "s/^#apparmor_profile = \".*\"$/apparmor_profile = \"$profile\"/" \
+        /usr/share/containers/containers.conf
+}
+
+# On multiple occasions GitHub added things to /etc/hosts that are not
+# a correct syntax for this file causing test failures:
+#   https://github.com/actions/runner-images/issues/3353
+#   https://github.com/actions/runner-images/issues/12192
+# Just clearing those out, if any.
+function fix_etc_hosts()
+{
+    cp /etc/hosts ./hosts.bak
+    sed -E -n \
+      '/^[[:space:]]*(#.*|[0-9a-fA-F:.]+([[:space:]]+[a-zA-Z0-9.-]+)+|)$/p' \
+      ./hosts.bak | sudo tee /etc/hosts
+
+    diff -u ./hosts.bak /etc/hosts || true
+}
+
+# Workaround until https://github.com/actions/runner-images/issues/10015
+# is resolved in some way.
+function disable_apparmor()
+{
+    # https://bugs.launchpad.net/ubuntu/+source/apparmor/+bug/2093797
+    sudo aa-teardown || true
+    sudo systemctl disable --now apparmor.service
+    sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+}
+
+# XXX This should be removed when the following issue is fixed and the
+# correct crun version is packaged into the runner image.
+# https://github.com/actions/runner-images/issues/14473
+function fixup_crun()
+{
+    crun --version
+    local arch=$(dpkg --print-architecture)
+    sudo curl -L "https://github.com/containers/crun/releases/download/1.28/crun-1.28-linux-${arch}" \
+        -o /usr/bin/crun
+    sudo chmod +x /usr/bin/crun
+    echo "New crun version: "$(crun --version)
+}
+
+function sudo_preserve_env()
+{
+    sudo sh -c 'cat > /etc/sudoers.d/ovn-ci-env' << EOF
+# ovn-fake-multinode
+Defaults env_keep += "RUNC_CMD OS_IMAGE CENTRAL_IMAGE CHASSIS_IMAGE RELAY_IMAGE GW_IMAGE ENABLE_SSL"
+# ovn-ci
+Defaults env_keep += "ARCH CC DPDK LIBS OPTS TESTSUITE TEST_RANGE SANITIZERS UNSTABLE BASE_VERSION"
+EOF
+    sudo chmod 0440 /etc/sudoers.d/ovn-ci-env
+    sudo visudo -cf /etc/sudoers.d/ovn-ci-env
+}

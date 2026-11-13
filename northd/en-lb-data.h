@@ -82,6 +82,9 @@ struct tracked_lb_data {
 
     /* Indicates if any lb (in the tracked data) has 'routable' flag set. */
     bool has_routable_lb;
+
+    /* Indicates if any lb (in the tracked data) has 'distibuted' flag set. */
+    bool has_distributed_lb;
 };
 
 /* Datapath (logical switch) to lb/lbgrp association data. */
@@ -91,6 +94,9 @@ struct od_lb_data {
     struct uuidset *lbs;
     struct uuidset *lbgrps;
 };
+
+struct od_lb_data *find_od_lb_data(const struct hmap *od_lb_map,
+                                   const struct uuid *od_uuid);
 
 /* struct which maintains the data of the engine node lb_data. */
 struct ed_type_lb_data {
@@ -110,13 +116,17 @@ struct ed_type_lb_data {
 };
 
 void *en_lb_data_init(struct engine_node *, struct engine_arg *);
-void en_lb_data_run(struct engine_node *, void *data);
+enum engine_node_state en_lb_data_run(struct engine_node *, void *data);
 void en_lb_data_cleanup(void *data);
 void en_lb_data_clear_tracked_data(void *data);
 
-bool lb_data_load_balancer_handler(struct engine_node *, void *data);
-bool lb_data_load_balancer_group_handler(struct engine_node *, void *data);
-bool lb_data_logical_switch_handler(struct engine_node *, void *data);
-bool lb_data_logical_router_handler(struct engine_node *, void *data);
+enum engine_input_handler_result
+lb_data_load_balancer_handler(struct engine_node *, void *data);
+enum engine_input_handler_result
+lb_data_load_balancer_group_handler(struct engine_node *, void *data);
+enum engine_input_handler_result
+lb_data_synced_logical_switch_handler(struct engine_node *, void *data);
+enum engine_input_handler_result
+lb_data_synced_logical_router_handler(struct engine_node *, void *data);
 
 #endif /* end of EN_NORTHD_LB_DATA_H */

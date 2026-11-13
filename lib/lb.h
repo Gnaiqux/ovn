@@ -24,6 +24,7 @@
 #include "ovn-util.h"
 #include "sset.h"
 #include "uuid.h"
+#include "vec.h"
 
 struct uuid;
 
@@ -36,11 +37,9 @@ struct ovn_lb_vip {
     char *port_str;      /* Actual port string representation.  To be used
                           * in ovn-northd.
                           */
-    struct ovn_lb_backend *backends;
-    size_t n_backends;
-    bool template_backends; /* True if the backends are templates. False if
-                             * they're explicitly specified.
-                             */
+    bool template_vips;  /* True if the vips are templates. */
+    struct vector backends; /* Vector of struct ovn_lb_backend. */
+
     bool empty_backend_rej;
     int address_family;
 };

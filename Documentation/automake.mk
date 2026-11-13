@@ -8,11 +8,9 @@ DOC_SOURCE = \
 	Documentation/intro/install/index.rst \
 	Documentation/intro/install/debian.rst \
 	Documentation/intro/install/documentation.rst \
-	Documentation/intro/install/distributions.rst \
 	Documentation/intro/install/fedora.rst \
 	Documentation/intro/install/general.rst \
 	Documentation/intro/install/ovn-upgrades.rst \
-	Documentation/intro/install/windows.rst \
 	Documentation/tutorials/index.rst \
 	Documentation/tutorials/ovn-openstack.rst \
 	Documentation/tutorials/ovn-sandbox.rst \
@@ -25,18 +23,24 @@ DOC_SOURCE = \
 	Documentation/tutorials/ovn-interconnection.rst \
 	Documentation/topics/index.rst \
 	Documentation/topics/testing.rst \
+	Documentation/topics/test-development.rst \
 	Documentation/topics/high-availability.rst \
+	Documentation/topics/dynamic-routing/architecture.rst \
+	Documentation/topics/dynamic-routing/configuration-examples.rst \
+	Documentation/topics/dynamic-routing/index.rst \
+	Documentation/topics/incremental-processing/datapath-sync-graph.png \
+	Documentation/topics/incremental-processing/evpn-arp-graph.png \
+	Documentation/topics/incremental-processing/ic-graph.png \
+	Documentation/topics/incremental-processing/index.rst \
+	Documentation/topics/incremental-processing/incremental-processing.rst \
 	Documentation/topics/integration.rst \
-	Documentation/topics/ovn-news-2.8.rst \
 	Documentation/topics/role-based-access-control.rst \
 	Documentation/topics/vif-plug-providers/index.rst \
 	Documentation/topics/vif-plug-providers/vif-plug-providers.rst \
 	Documentation/howto/index.rst \
-	Documentation/howto/docker.rst \
 	Documentation/howto/firewalld.rst \
 	Documentation/howto/ipsec.rst \
 	Documentation/howto/ssl.rst \
-	Documentation/howto/openstack-containers.rst \
 	Documentation/ref/index.rst \
 	Documentation/faq/index.rst \
 	Documentation/faq/contributing.rst \
@@ -44,6 +48,7 @@ DOC_SOURCE = \
 	Documentation/internals/index.rst \
 	Documentation/internals/authors.rst \
 	Documentation/internals/bugs.rst \
+	Documentation/internals/charter.rst \
 	Documentation/internals/committer-emeritus-status.rst \
 	Documentation/internals/committer-grant-revocation.rst \
 	Documentation/internals/committer-responsibilities.rst \
@@ -56,11 +61,12 @@ DOC_SOURCE = \
 	Documentation/internals/security.rst \
 	Documentation/internals/contributing/index.rst \
 	Documentation/internals/contributing/backporting-patches.rst \
+	Documentation/internals/contributing/inclusive-language.rst \
 	Documentation/internals/contributing/coding-style.rst \
 	Documentation/internals/contributing/documentation-style.rst \
 	Documentation/internals/contributing/submitting-patches.rst \
 	Documentation/requirements.txt \
-	$(addprefix Documentation/ref/,$(RST_MANPAGES) $(RST_MANPAGES_NOINST))
+	$(addprefix Documentation/ref/,$(RST_MANPAGES))
 FLAKE8_PYFILES += Documentation/conf.py
 EXTRA_DIST += $(DOC_SOURCE)
 
@@ -103,12 +109,7 @@ endif
 # rules.
 
 # rST formatted manpages under Documentation/ref.
-RST_MANPAGES =
-
-# rST formatted manpages that we don't want to install because they
-# document stuff that only works with a build tree, not with an
-# installed OVS.
-RST_MANPAGES_NOINST = ovn-sim.1.rst
+RST_MANPAGES = ovn-logical-flows.7.rst
 
 # The GNU standards say that these variables should control
 # installation directories for manpages in each section.  Automake

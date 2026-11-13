@@ -23,14 +23,21 @@
 
 /* OVN includes. */
 #include "lib/ovn-util.h"
+#include "vec.h"
 
 struct sbrec_datapath_binding;
 struct sbrec_port_binding;
 struct sbrec_chassis;
+struct sbrec_chassis_table;
 struct ovsdb_idl_index;
 struct ovsrec_bridge;
 struct ovsrec_interface_table;
 struct sbrec_load_balancer;
+
+struct peer_ports {
+    const struct sbrec_port_binding *local;
+    const struct sbrec_port_binding *remote;
+};
 
 /* A logical datapath that has some relevance to this hypervisor.  A logical
  * datapath D is relevant to hypervisor H if:
@@ -53,13 +60,8 @@ struct local_datapath {
     /* The vtep port in this datapath, if any (at most one is allowed). */
     const struct sbrec_port_binding *vtep_port;
 
-    struct {
-        const struct sbrec_port_binding *local;
-        const struct sbrec_port_binding *remote;
-    } *peer_ports;
-
-    size_t n_peer_ports;
-    size_t n_allocated_peer_ports;
+    /* Vector of struct peer_ports. */
+    struct vector peer_ports;
 
     struct shash external_ports;
     struct shash multichassis_ports;
@@ -76,7 +78,8 @@ struct local_datapath *get_local_datapath_no_hash(
 bool
 need_add_peer_to_local(
     struct ovsdb_idl_index *sbrec_port_binding_by_name,
-    const struct sbrec_port_binding *,
+    const struct sbrec_port_binding *pb,
+    const struct sbrec_port_binding *peer,
     const struct sbrec_chassis *);
 void add_local_datapath(
     struct ovsdb_idl_index *sbrec_datapath_binding_by_key,
@@ -90,7 +93,8 @@ void add_local_datapath(
 void local_datapaths_destroy(struct hmap *local_datapaths);
 void local_datapath_destroy(struct local_datapath *ld);
 void add_local_datapath_peer_port(
-    const struct sbrec_port_binding *,
+    const struct sbrec_port_binding *pb,
+    const struct sbrec_port_binding *peer,
     const struct sbrec_chassis *,
     struct ovsdb_idl_index *sbrec_datapath_binding_by_key,
     struct ovsdb_idl_index *sbrec_port_binding_by_datapath,
@@ -131,6 +135,7 @@ struct tracked_datapath *tracked_datapath_find(
 void tracked_datapath_lport_add(const struct sbrec_port_binding *,
                                 enum en_tracked_resource_type,
                                 struct hmap *tracked_datapaths);
+void tracked_datapaths_clear(struct hmap *tracked_datapaths);
 void tracked_datapaths_destroy(struct hmap *tracked_datapaths);
 
 /* Maps from a chassis to the OpenFlow port number of the tunnel that can be
@@ -141,12 +146,25 @@ struct chassis_tunnel {
     ofp_port_t ofport;
     enum chassis_tunnel_type type;
     bool is_ipv6;
+    bool is_ramp_tunnel;
 };
 
+/* Flow-based tunnel that consolidates multiple endpoints into a single
+ * port. Array is indexed by tunnel type (VXLAN=0, GENEVE=1).
+ * The type is implicit from the array index, so not stored. */
+struct flow_based_tunnel {
+    ofp_port_t ofport;              /* Single port for all endpoints */
+    bool is_ipv6;
+    char *port_name;                /* e.g., "ovn-geneve" */
+};
+
+
 void local_nonvif_data_run(const struct ovsrec_bridge *br_int,
-                           const struct sbrec_chassis *,
+                           const struct sbrec_chassis *chassis,
+                           struct ovsdb_idl_index *sbrec_chassis_by_name,
                            struct simap *patch_ofports,
-                           struct hmap *chassis_tunnels);
+                           struct hmap *chassis_tunnels,
+                           struct flow_based_tunnel *flow_tunnels);
 
 bool local_nonvif_data_handle_ovs_iface_changes(
     const struct ovsrec_interface_table *);
@@ -161,6 +179,22 @@ bool get_chassis_tunnel_ofport(const struct hmap *chassis_tunnels,
                                ofp_port_t *ofport);
 
 void chassis_tunnels_destroy(struct hmap *chassis_tunnels);
+
+/* Flow-based tunnel management functions. */
+void flow_based_tunnels_init(struct flow_based_tunnel *);
+void flow_based_tunnels_destroy(struct flow_based_tunnel *);
+ofp_port_t get_flow_based_tunnel_port(
+    enum chassis_tunnel_type, const struct flow_based_tunnel *);
+
+/* Direct tunnel endpoint selection utilities. */
+enum chassis_tunnel_type select_preferred_tunnel_type(
+    const struct sbrec_chassis *local_chassis,
+    const struct sbrec_chassis *remote_chassis);
+const char *select_default_encap_ip(const struct sbrec_chassis *,
+                                    enum chassis_tunnel_type);
+const char *select_port_encap_ip(const struct sbrec_port_binding *,
+                                 enum chassis_tunnel_type);
+
 void local_datapath_memory_usage(struct simap *usage);
 void add_local_datapath_external_port(struct local_datapath *ld,
                                       char *logical_port, const void *data);
@@ -173,5 +207,7 @@ void remove_local_datapath_multichassis_port(struct local_datapath *ld,
                                              char *logical_port);
 bool lb_is_local(const struct sbrec_load_balancer *sbrec_lb,
                  const struct hmap *local_datapaths);
+void local_data_dump_peer_ports(struct hmap *local_datapaths,
+                                struct ds *peer_ports);
 
 #endif /* controller/local_data.h */

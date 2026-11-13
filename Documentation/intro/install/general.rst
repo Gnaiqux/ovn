@@ -39,18 +39,18 @@ repository, which you can clone into a directory named "ovn" with::
 
 Cloning the repository leaves the "main" branch initially checked
 out.  This is the right branch for general development.
-If, on the other hand, if you want to build a particular released
+If you want to build a particular released
 version, you can check it out by running a command such as the
 following from the "ovn" directory::
 
-    $ git checkout v20.09.0
+    $ git checkout v26.03.0
 
 The repository also has a branch for each release series.  For
-example, to obtain the latest fixes in the OVN 20.09.x release series,
+example, to obtain the latest fixes in the OVN 26.03.x release series,
 which might include bug fixes that have not yet been in any released
 version, you can check it out from the "ovn" directory with::
 
-    $ git checkout origin/branch-20.09
+    $ git checkout origin/branch-26.03
 
 If you do not want to use Git, you can also obtain tarballs for `OVN
 release versions <https://www.ovn.org/en/releases/>`, or download a
@@ -88,9 +88,6 @@ need the following software:
 
   - Clang 3.4 or later.
 
-  - MSVC 2013. Refer to :doc:`windows` for additional Windows build
-    instructions.
-
 - libssl, from OpenSSL, is optional but recommended if you plan to connect the
   OVN services to the OVN DB ovsdb-servers securely. If libssl is installed,
   then OVN will automatically build with support for it.
@@ -117,6 +114,11 @@ other than plain text, only if you have the following:
 
 - dot from graphviz (http://www.graphviz.org/).
 
+Certain OVN manpages are built from reStructuredText documents and
+require the following:
+
+- Sphinx (https://www.sphinx-doc.org/).
+
 If you are going to extensively modify OVN, consider installing the
 following to obtain better warnings:
 
@@ -129,8 +131,6 @@ following to obtain better warnings:
 
 - flake8 (for Python code)
 
-You may find the ovs-dev script found in ``ovs/utilities/ovs-dev.py`` useful.
-
 .. _general-install-reqs:
 
 Installation Requirements
@@ -141,8 +141,7 @@ To simply install and run OVN you require the following software:
 
 - Shared libraries compatible with those used for the build.
 
-On Linux you should ensure that ``/dev/urandom`` exists. To support TAP
-devices, you must also ensure that ``/dev/net/tun`` exists.
+On Linux you should ensure that ``/dev/urandom`` exists.
 
 .. _general-bootstrapping:
 
@@ -208,7 +207,7 @@ shared libraries instead::
 
     $ ./configure --enable-shared
 
-To use a specific C compiler for compiling Open vSwitch user programs, also
+To use a specific C compiler for compiling OVN user programs, also
 specify it on the configure command line, like so::
 
     $ ./configure CC=gcc-4.2
@@ -243,15 +242,8 @@ recommended to use ``-march=native`` settings::
     $ ./configure CFLAGS="-g -O2 -march=native"
 
 With this, GCC will detect the processor and automatically set appropriate
-flags for it. This should not be used if you are compiling OVS outside the
+flags for it. This should not be used if you are compiling OVN outside the
 target machine.
-
-.. note::
-  CFLAGS are not applied when building the Linux kernel module. Custom CFLAGS
-  for the kernel module are supplied using the ``EXTRA_CFLAGS`` variable when
-  running make. For example::
-
-      $ make EXTRA_CFLAGS="-Wno-error=date-time"
 
 If you are a developer and want to enable Address Sanitizer for debugging
 purposes, at about a 2x runtime cost, you can add
@@ -259,17 +251,6 @@ purposes, at about a 2x runtime cost, you can add
 example::
 
     $ ./configure CFLAGS="-g -O2 -fsanitize=address -fno-omit-frame-pointer -fno-common"
-
-To build the Linux kernel module, so that you can run the kernel-based switch,
-pass the location of the kernel build directory on ``--with-linux``. For
-example, to build for a running instance of Linux::
-
-    $ ./configure --with-linux=/lib/modules/$(uname -r)/build
-
-.. note::
-  If ``--with-linux`` requests building for an unsupported version of Linux,
-  then ``configure`` will fail with an error message. Refer to the
-  :doc:`/faq/index` for advice in that case.
 
 If you plan to do much OVN development, you might want to add
 ``--enable-Werror``, which adds the ``-Werror`` option to the compiler command
@@ -302,24 +283,27 @@ directory, e.g. to try out both GCC and Clang builds. For example::
     $ mkdir _gcc && (cd _gcc && ./configure CC=gcc)
     $ mkdir _clang && (cd _clang && ./configure CC=clang)
 
-Under certain loads the ovsdb-server and other components perform better when
-using the jemalloc memory allocator, instead of the glibc memory allocator. If
-you wish to link with jemalloc add it to LIBS::
+Under certain loads the OVN database servers and other components
+perform better when using the jemalloc memory allocator, instead of
+the glibc memory allocator.  If you wish to link with jemalloc add it
+to LIBS::
 
     $ ./configure LIBS=-ljemalloc
 
 Example usage::
+
     $ # Clone OVS repo
-    $cd /home/foo/ovs
-    $./boot.sh
-    $mkdir _gcc
-    $cd _gcc && ../configure && cd ..
-    $make -C _gcc
+    $ cd /home/foo/ovs
+    $ ./boot.sh
+    $ mkdir _gcc
+    $ cd _gcc && ../configure && cd ..
+    $ make -C _gcc
 
     $ # Clone OVN repo
-    $cd /home/foo/ovn
-    $./boot.sh
-    $./configure --with-ovs-source=/home/foo/ovs/ --with-ovs-build=/home/foo/ovs/_gcc
+    $ cd /home/foo/ovn
+    $ ./boot.sh
+    $ ./configure --with-ovs-source=/home/foo/ovs/ \
+        --with-ovs-build=/home/foo/ovs/_gcc
 
 It is expected to configure both Open vSwitch and OVN with the same prefix.
 
@@ -371,8 +355,9 @@ the daemons can be started by using the ovn-ctl utility.  This will take care
 to setup initial conditions, and start the daemons in the correct order.
 The ovn-ctl utility is located in '$(pkgdatadir)/scripts', and defaults to
 '/usr/local/share/ovn/scripts'.  ovn-ctl utility requires the 'ovs-lib'
-helper shell script which is present in '/usr/local/share/openvswitch/scripts'.
-So invoking ovn-ctl as "./ovn-ctl" will fail.
+helper shell script provided by Open vSwitch, which is typically present in
+'/usr/local/share/openvswitch/scripts'.  So invoking ovn-ctl as
+"./ovn-ctl" will fail unless Open vSwitch is properly installed.
 
 An example after install might be::
 
@@ -403,7 +388,7 @@ configure the Northbound and Southbound databases::
          ovn-sb.ovsschema
 
 Configure ovsdb-servers to use databases created above, to listen on a Unix
-domain socket and to use the SSL configuration in the database::
+domain socket and to use the SSL/TLS configuration in the database::
 
    $ sudo mkdir -p /usr/local/var/run/ovn
    $ sudo ovsdb-server /usr/local/etc/ovn/ovnnb_db.db --remote=punix:/usr/local/var/run/ovn/ovnnb_db.sock \
@@ -420,7 +405,7 @@ domain socket and to use the SSL configuration in the database::
         --pidfile=/usr/local/var/run/ovn/ovnsb-server.pid --detach --log-file=/usr/local/var/log/ovn/ovnsb-server.log
 
 .. note::
-  If you built OVN without SSL support, then omit ``--private-key``,
+  If you built OVN without SSL/TLS support, then omit ``--private-key``,
   ``--certificate``, and ``--bootstrap-ca-cert``.)
 
 Initialize the databases using ovn-nbctl and ovn-sbctl. This is only necessary
@@ -435,10 +420,16 @@ Unix domain socket::
 
     $ ovn-northd --pidfile --detach --log-file
 
+If your deployment uses OVN Interconnection (OVN IC), you also need to
+start the IC databases and daemon::
+
+    $ ovn-ctl start_ic_ovsdb
+    $ ovn-ctl start_ic
+
 Starting OVN Central services in containers
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-For OVN central node, we dont need to load ovs kernel modules on host.
+For OVN central node, we don't need to load ovs kernel modules on host.
 Hence, OVN central containers OS need not depend on host OS.
 
 Also we can leverage deploying entire OVN control plane in a pod spec for use
@@ -525,14 +516,12 @@ Start OVN containers using unix socket::
       <docker_repo>:<tag> ovn-northd
 
 .. note::
-    Current ovn central components comes up in docker image in a standalone
+    Current OVN central components come up in Docker image in a standalone
     and cluster mode with protocol tcp.
 
-    The debian docker file use ubuntu 16.04 as a base image for reference.
+    The Debian Dockerfile uses Ubuntu 24.04 as a base image for reference.
 
-    User can use any other base image for debian, e.g. u14.04, etc.
-
-    RHEL based docker support is now added with centos7 as a base image.
+    RHEL-based Docker support uses Fedora as a base image.
 
 Starting OVN host service
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -563,7 +552,7 @@ domain socket::
 Starting OVN host service in containers
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-For OVN host too, we dont need to load ovs kernel modules on host.
+For OVN host too, we don't need to load ovs kernel modules on host.
 Hence, OVN host container OS need not depend on host OS.
 
 Also we can leverage deploying OVN host in a pod spec for use cases like
@@ -571,7 +560,7 @@ OVN-kubernetes to manage OVS which can be running as a service on host or in
 container.
 
 Start ovsdb-server and ovs-vswitchd components as per
-http://docs.openvswitch.org/en/latest/intro/install/general/
+https://docs.openvswitch.org/en/latest/intro/install/general/
 
 start local ovn-controller with below command if ovs is also running in
 container::
@@ -606,4 +595,5 @@ When using ovn in container, exec to container to run above commands::
 Reporting Bugs
 --------------
 
-Report problems to bugs@openvswitch.org.
+Report problems to https://github.com/ovn-org/ovn/issues or
+discuss@openvswitch.org.

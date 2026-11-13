@@ -17,6 +17,18 @@
 #define OVN_ENCAPS_H 1
 
 #include <stdbool.h>
+#include "smap.h"
+
+/*
+ * Given there could be multiple tunnels with different IPs to the same
+ * chassis we annotate the external_ids:ovn-chassis-id in tunnel port with
+ * <chassis_name>@<remote IP>%<local IP>. The external_id key
+ * "ovn-chassis-id" is kept for backward compatibility.
+ *
+ * For flow-based tunnels, we use the special value "flow" to identify
+ * shared tunnel ports that handle dynamic endpoint resolution.
+ */
+#define OVN_TUNNEL_ID "ovn-chassis-id"
 
 struct ovsdb_idl;
 struct ovsdb_idl_txn;
@@ -30,13 +42,19 @@ struct sset;
 
 void encaps_register_ovs_idl(struct ovsdb_idl *);
 void encaps_run(struct ovsdb_idl_txn *ovs_idl_txn,
+                struct ovsdb_idl_txn *ovnsb_idl_txn,
                 const struct ovsrec_bridge *br_int,
                 const struct sbrec_chassis_table *,
                 const struct sbrec_chassis *,
                 const struct sbrec_sb_global *,
                 const struct ovsrec_open_vswitch_table *,
                 const struct sset *transport_zones,
-                const struct ovsrec_bridge_table *bridge_table);
+                const struct ovsrec_bridge_table *bridge_table,
+                bool is_ha_chassis_member);
+
+bool is_flow_based_tunnels_enabled(
+    const struct ovsrec_open_vswitch_table *ovs_table,
+    const struct sbrec_chassis *chassis);
 
 bool encaps_cleanup(struct ovsdb_idl_txn *ovs_idl_txn,
                     const struct ovsrec_bridge *br_int);
@@ -51,5 +69,11 @@ bool  encaps_tunnel_id_match(const char *tunnel_id, const char *chassis_id,
                              const char *local_encap_ip);
 
 void encaps_destroy(void);
+
+static inline bool
+is_ramp_tunnel(const struct smap *other_config)
+{
+    return smap_get_bool(other_config, "is-vtep", false);
+}
 
 #endif /* controller/encaps.h */

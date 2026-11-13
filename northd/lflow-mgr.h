@@ -24,19 +24,25 @@
 struct ovsdb_idl_txn;
 struct ovn_datapath;
 struct ovsdb_idl_row;
+struct ovn_lflow;
+struct uuidset;
 
 /* lflow map which stores the logical flows. */
-struct lflow_table;
+struct lflow_table {
+    struct hmap entries; /* hmap of lflows. */
+    struct hmap dp_groups[DP_MAX];
+    ssize_t max_seen_lflow_size;
+};
+
 struct lflow_table *lflow_table_alloc(void);
 void lflow_table_init(struct lflow_table *);
-void lflow_table_clear(struct lflow_table *);
+void lflow_table_clear(struct lflow_table *, bool);
 void lflow_table_destroy(struct lflow_table *);
 void lflow_table_expand(struct lflow_table *);
 void lflow_table_set_size(struct lflow_table *, size_t);
 void lflow_table_sync_to_sb(struct lflow_table *,
                             struct ovsdb_idl_txn *ovnsb_txn,
-                            const struct ovn_datapaths *ls_datapaths,
-                            const struct ovn_datapaths *lr_datapaths,
+                            const struct ovn_synced_datapaths dps[DP_MAX],
                             bool ovn_internal_version_changed,
                             const struct sbrec_logical_flow_table *,
                             const struct sbrec_logical_dp_group_table *);
@@ -52,97 +58,98 @@ struct lflow_ref;
 struct lflow_ref *lflow_ref_create(void);
 void lflow_ref_destroy(struct lflow_ref *);
 void lflow_ref_clear(struct lflow_ref *lflow_ref);
-void lflow_ref_unlink_lflows(struct lflow_ref *);
-bool lflow_ref_resync_flows(struct lflow_ref *,
-                            struct lflow_table *lflow_table,
-                            struct ovsdb_idl_txn *ovnsb_txn,
-                            const struct ovn_datapaths *ls_datapaths,
-                            const struct ovn_datapaths *lr_datapaths,
-                            bool ovn_internal_version_changed,
-                            const struct sbrec_logical_flow_table *,
-                            const struct sbrec_logical_dp_group_table *);
+void lflow_ref_unlink_lflows(struct lflow_ref *, struct lflow_table *);
+void lflow_ref_unlink_and_prune(struct lflow_ref *, struct lflow_table *,
+                                struct uuidset *);
+void lflow_table_delete_orphaned_sb_flows(
+        const struct sbrec_logical_flow_table *, struct uuidset *);
 bool lflow_ref_sync_lflows(struct lflow_ref *,
                            struct lflow_table *lflow_table,
                            struct ovsdb_idl_txn *ovnsb_txn,
-                           const struct ovn_datapaths *ls_datapaths,
-                           const struct ovn_datapaths *lr_datapaths,
+                           const struct ovn_synced_datapaths dps[DP_MAX],
                            bool ovn_internal_version_changed,
                            const struct sbrec_logical_flow_table *,
                            const struct sbrec_logical_dp_group_table *);
 
+struct lflow_table_add_args {
+    struct lflow_table *table;
+    const struct ovn_synced_datapath *sdp;
+    const unsigned long *dp_bitmap;
+    size_t dp_bitmap_len;
+    const struct ovn_stage *stage;
+    uint16_t priority;
+    const char *match;
+    const char *actions;
+    const char *io_port;
+    const char *ctrl_meter;
+    const struct ovsdb_idl_row *stage_hint;
+    const char *flow_desc;
+    struct lflow_ref *lflow_ref;
+    const char *where;
+    bool acl_ct_translation;
+};
 
-void lflow_table_add_lflow(struct lflow_table *, const struct ovn_datapath *,
-                           const unsigned long *dp_bitmap,
-                           size_t dp_bitmap_len, enum ovn_stage stage,
-                           uint16_t priority, const char *match,
-                           const char *actions, const char *io_port,
-                           const char *ctrl_meter,
-                           const struct ovsdb_idl_row *stage_hint,
-                           const char *where, struct lflow_ref *);
-void lflow_table_add_lflow_default_drop(struct lflow_table *,
-                                        const struct ovn_datapath *,
-                                        enum ovn_stage stage,
-                                        const char *where,
-                                        struct lflow_ref *);
+void lflow_table_add_lflow(struct lflow_table_add_args *args);
 
-/* Adds a row with the specified contents to the Logical_Flow table. */
-#define ovn_lflow_add_with_hint__(LFLOW_TABLE, OD, STAGE, PRIORITY, MATCH, \
-                                  ACTIONS, IN_OUT_PORT, CTRL_METER, \
-                                  STAGE_HINT, LFLOW_REF) \
-    lflow_table_add_lflow(LFLOW_TABLE, OD, NULL, 0, STAGE, PRIORITY, MATCH, \
-                          ACTIONS, IN_OUT_PORT, CTRL_METER, STAGE_HINT, \
-                          OVS_SOURCE_LOCATOR, LFLOW_REF)
-
-#define ovn_lflow_add_with_hint(LFLOW_TABLE, OD, STAGE, PRIORITY, MATCH, \
-                                ACTIONS, STAGE_HINT, LFLOW_REF) \
-    lflow_table_add_lflow(LFLOW_TABLE, OD, NULL, 0, STAGE, PRIORITY, MATCH, \
-                          ACTIONS, NULL, NULL, STAGE_HINT,  \
-                          OVS_SOURCE_LOCATOR, LFLOW_REF)
-
-#define ovn_lflow_add_with_dp_group(LFLOW_TABLE, DP_BITMAP, DP_BITMAP_LEN, \
-                                    STAGE, PRIORITY, MATCH, ACTIONS, \
-                                    STAGE_HINT, LFLOW_REF) \
-    lflow_table_add_lflow(LFLOW_TABLE, NULL, DP_BITMAP, DP_BITMAP_LEN, STAGE, \
-                          PRIORITY, MATCH, ACTIONS, NULL, NULL, STAGE_HINT, \
-                          OVS_SOURCE_LOCATOR, LFLOW_REF)
-
-#define ovn_lflow_add_default_drop(LFLOW_TABLE, OD, STAGE, LFLOW_REF)   \
-    lflow_table_add_lflow_default_drop(LFLOW_TABLE, OD, STAGE, \
-                                       OVS_SOURCE_LOCATOR, LFLOW_REF)
-
-
-/* This macro is similar to ovn_lflow_add_with_hint, except that it requires
- * the IN_OUT_PORT argument, which tells the lport name that appears in the
- * MATCH, which helps ovn-controller to bypass lflows parsing when the lport is
+#define WITH_HINT(HINT) .stage_hint = HINT
+#define WITH_CT_TRANSLATION(CT_TRANS) .acl_ct_translation = (CT_TRANS)
+/* The IN_OUT_PORT argument tells the lport name that appears in the MATCH,
+ * which helps ovn-controller to bypass lflows parsing when the lport is
  * not local to the chassis. The critiera of the lport to be added using this
  * argument:
  *
  * - For ingress pipeline, the lport that is used to match "inport".
  * - For egress pipeline, the lport that is used to match "outport".
  *
- * For now, only LS pipelines should use this macro.  */
-#define ovn_lflow_add_with_lport_and_hint(LFLOW_TABLE, OD, STAGE, PRIORITY, \
-                                          MATCH, ACTIONS, IN_OUT_PORT, \
-                                          STAGE_HINT, LFLOW_REF) \
-    lflow_table_add_lflow(LFLOW_TABLE, OD, NULL, 0, STAGE, PRIORITY, MATCH, \
-                          ACTIONS, IN_OUT_PORT, NULL, STAGE_HINT, \
-                          OVS_SOURCE_LOCATOR, LFLOW_REF)
+ * For now, only LS pipelines should use this argument
+ */
+#define WITH_IO_PORT(IO_PORT) .io_port = IO_PORT
+#define WITH_CTRL_METER(CTRL_METER) .ctrl_meter = CTRL_METER
+#define WITH_DESC(FLOW_DESC) .flow_desc = FLOW_DESC
+
+/* Adds a row with the specified contents to the Logical_Flow table. */
+#define ovn_lflow_add_default_drop(LFLOW_TABLE, OD, STAGE, LFLOW_REF, ...) \
+    ovn_lflow_add(LFLOW_TABLE, OD, STAGE, 0, "1", debug_drop_action(), \
+                  LFLOW_REF, __VA_ARGS__)
 
 #define ovn_lflow_add(LFLOW_TABLE, OD, STAGE, PRIORITY, MATCH, ACTIONS, \
-                      LFLOW_REF) \
-    lflow_table_add_lflow(LFLOW_TABLE, OD, NULL, 0, STAGE, PRIORITY, MATCH, \
-                          ACTIONS, NULL, NULL, NULL, OVS_SOURCE_LOCATOR, \
-                          LFLOW_REF)
+                      LFLOW_REF, ...) \
+    lflow_table_add_lflow( \
+        &(struct lflow_table_add_args) { \
+            .table = LFLOW_TABLE, \
+            .sdp = (OD)->sdp, \
+            .stage = STAGE, \
+            .priority = PRIORITY, \
+            .match = MATCH, \
+            .actions = ACTIONS, \
+            .lflow_ref = LFLOW_REF, \
+            .where = OVS_SOURCE_LOCATOR, \
+            __VA_ARGS__ \
+        } \
+    )
 
-#define ovn_lflow_metered(LFLOW_TABLE, OD, STAGE, PRIORITY, MATCH, ACTIONS, \
-                          CTRL_METER, LFLOW_REF) \
-    ovn_lflow_add_with_hint__(LFLOW_TABLE, OD, STAGE, PRIORITY, MATCH, \
-                              ACTIONS, NULL, CTRL_METER, NULL, LFLOW_REF)
+#define ovn_lflow_add_with_dp_group(LFLOW_TABLE, DP_BITMAP, DP_BITMAP_LEN, \
+                                    STAGE, PRIORITY, MATCH, ACTIONS, \
+                                    LFLOW_REF, ...) \
+    lflow_table_add_lflow( \
+        &(struct lflow_table_add_args) { \
+            .table = LFLOW_TABLE, \
+            .dp_bitmap = DP_BITMAP, \
+            .dp_bitmap_len = DP_BITMAP_LEN, \
+            .stage = STAGE, \
+            .priority = PRIORITY, \
+            .match = MATCH, \
+            .actions = ACTIONS, \
+            .lflow_ref = LFLOW_REF, \
+            .where = OVS_SOURCE_LOCATOR, \
+            __VA_ARGS__ \
+        } \
+    )
 
 struct sbrec_logical_dp_group;
 
 struct ovn_dp_group {
-    unsigned long *bitmap;
+    struct dynamic_bitmap bitmap;
     const struct sbrec_logical_dp_group *dp_group;
     struct uuid dpg_uuid;
     struct hmap_node node;
@@ -157,16 +164,15 @@ ovn_dp_groups_init(struct hmap *dp_groups)
 
 void ovn_dp_groups_clear(struct hmap *dp_groups);
 void ovn_dp_groups_destroy(struct hmap *dp_groups);
-struct ovn_dp_group *ovn_dp_group_get(struct hmap *dp_groups, size_t desired_n,
-                                      const unsigned long *desired_bitmap,
-                                      size_t bitmap_len);
+struct ovn_dp_group *ovn_dp_group_get(
+        struct hmap *dp_groups,
+        const struct dynamic_bitmap *desired_bitmap,
+        size_t bitmap_len);
 struct ovn_dp_group *ovn_dp_group_create(
     struct ovsdb_idl_txn *ovnsb_txn, struct hmap *dp_groups,
     struct sbrec_logical_dp_group *sb_group,
-    size_t desired_n, const unsigned long *desired_bitmap,
-    size_t bitmap_len, bool is_switch,
-    const struct ovn_datapaths *ls_datapaths,
-    const struct ovn_datapaths *lr_datapaths);
+    const struct dynamic_bitmap *desired_bitmap,
+    const struct ovn_synced_datapaths *datapaths);
 
 static inline void
 inc_ovn_dp_group_ref(struct ovn_dp_group *dpg)
@@ -181,7 +187,7 @@ dec_ovn_dp_group_ref(struct hmap *dp_groups, struct ovn_dp_group *dpg)
 
     if (!dpg->refcnt) {
         hmap_remove(dp_groups, &dpg->node);
-        free(dpg->bitmap);
+        dynamic_bitmap_free(&dpg->bitmap);
         free(dpg);
     }
 }

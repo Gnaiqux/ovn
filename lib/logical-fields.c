@@ -16,6 +16,7 @@
 #include <config.h>
 
 #include "openvswitch/shash.h"
+#include "ovn-util.h"
 #include "ovn/expr.h"
 #include "ovn/logical-fields.h"
 #include "ovs-thread.h"
@@ -29,11 +30,18 @@ const struct ovn_field ovn_fields[OVN_FIELD_N_IDS] = {
         OVN_ICMP4_FRAG_MTU,
         "icmp4.frag_mtu",
         2, 16,
+        true,
     }, {
         OVN_ICMP6_FRAG_MTU,
         "icmp6.frag_mtu",
         4, 32,
-    },
+        true,
+    }, {
+        OVN_ICMP4_INNER_IP4_SRC,
+        "icmp4.inner_ip4.src",
+        4, 32,
+        false,
+    }
 };
 
 static struct shash ovnfield_by_name;
@@ -71,6 +79,25 @@ ovn_init_symtab(struct shash *symtab)
      * doesn't yet support string fields that occupy less than a full OXM. */
     expr_symtab_add_string(symtab, "inport", MFF_LOG_INPORT, NULL);
     expr_symtab_add_string(symtab, "outport", MFF_LOG_OUTPORT, NULL);
+
+    /* Also register the inport/outport backing registers as numeric fields
+     * so that predicates can reference specific bits (e.g., the EVPN key
+     * indicator at bit 31). */
+    expr_symtab_add_field(symtab, "__inport", MFF_LOG_INPORT, NULL, false);
+    expr_symtab_add_field(symtab, "__outport", MFF_LOG_OUTPORT, NULL, false);
+
+    /* Define predicates to identify traffic from/to remote VTEPs so that
+     * northd can skip conntrack without hard-coding register indices. */
+    char vtep_pred[16];
+    snprintf(vtep_pred, sizeof vtep_pred, "__inport[%d]", OVN_EVPN_KEY_FLAG);
+    expr_symtab_add_predicate(symtab, "from_evpn_vtep", vtep_pred);
+    snprintf(vtep_pred, sizeof vtep_pred, "__outport[%d]", OVN_EVPN_KEY_FLAG);
+    expr_symtab_add_predicate(symtab, "to_evpn_vtep", vtep_pred);
+
+    /* The port isn't reserved along the pipeline it's just defined as symbol
+     * to support matching on string and moving between string registers. */
+    expr_symtab_add_string(symtab, "remote_outport",
+                           MFF_LOG_REMOTE_OUTPORT, NULL);
 
     /* Logical registers:
      *     128-bit xxregs
@@ -140,9 +167,26 @@ ovn_init_symtab(struct shash *symtab)
     snprintf(flags_str, sizeof flags_str, "flags[%d]", MLF_RX_FROM_TUNNEL_BIT);
     expr_symtab_add_subfield(symtab, "flags.tunnel_rx", NULL, flags_str);
     snprintf(flags_str, sizeof flags_str, "flags[%d]",
-             MLF_IGMP_IGMP_SNOOP_INJECT_BIT);
-    expr_symtab_add_subfield(symtab, "flags.igmp_loopback", NULL,
+             MLF_UNSNAT_NEW_BIT);
+    expr_symtab_add_subfield(symtab, "flags.unsnat_new", NULL,
                              flags_str);
+    snprintf(flags_str, sizeof flags_str, "flags[%d]",
+             MLF_UNSNAT_NOT_TRACKED_BIT);
+    expr_symtab_add_subfield(symtab, "flags.unsnat_not_tracked", NULL,
+                             flags_str);
+    snprintf(flags_str, sizeof flags_str, "flags[%d..%d]",
+             MLF_NETWORK_ID_START_BIT, MLF_NETWORK_ID_END_BIT);
+    expr_symtab_add_subfield(symtab, "flags.network_id", NULL, flags_str);
+
+    snprintf(flags_str, sizeof flags_str, "flags[%d]", MLF_FROM_CTRL_BIT);
+    expr_symtab_add_subfield(symtab, "flags.from_ctrl", NULL, flags_str);
+
+    snprintf(flags_str, sizeof flags_str, "flags[%d]",
+             MLF_IGMP_IGMP_SNOOP_INJECT_BIT);
+    expr_symtab_add_subfield(symtab, "flags.igmp_loopback", NULL, flags_str);
+
+    snprintf(flags_str, sizeof flags_str, "flags[%d]", MLF_PKT_SAMPLED_BIT);
+    expr_symtab_add_subfield(symtab, "flags.pkt_sampled", NULL, flags_str);
 
     /* Connection tracking state. */
     expr_symtab_add_field_scoped(symtab, "ct_mark", MFF_CT_MARK, NULL, false,
@@ -169,36 +213,58 @@ ovn_init_symtab(struct shash *symtab)
                                     OVN_CT_STR(OVN_CT_LB_FORCE_SNAT_BIT)
                                     "]",
                                     WR_CT_COMMIT);
+    expr_symtab_add_subfield_scoped(symtab, "ct_mark.obs_stage", NULL,
+                                    "ct_mark["
+                                    OVN_CT_STR(OVN_CT_OBS_STAGE_1ST_BIT) ".."
+                                    OVN_CT_STR(OVN_CT_OBS_STAGE_END_BIT)
+                                    "]",
+                                    WR_CT_COMMIT);
+    expr_symtab_add_subfield_scoped(symtab, "ct_mark.allow_established", NULL,
+                                    "ct_mark["
+                                    OVN_CT_STR(OVN_CT_ALLOW_ESTABLISHED_BIT)
+                                    "]",
+                                    WR_CT_COMMIT);
+    expr_symtab_add_subfield_scoped(symtab, "ct_mark.obs_collector_id", NULL,
+                                    "ct_mark[16..23]", WR_CT_COMMIT);
 
     expr_symtab_add_field_scoped(symtab, "ct_label", MFF_CT_LABEL, NULL,
                                  false, WR_CT_COMMIT);
-    expr_symtab_add_subfield_scoped(symtab, "ct_label.blocked", NULL,
-                                    "ct_label["
-                                        OVN_CT_STR(OVN_CT_BLOCKED_BIT)
-                                    "]",
-                                    WR_CT_COMMIT);
-    expr_symtab_add_subfield_scoped(symtab, "ct_label.natted", NULL,
-                                    "ct_label["
-                                        OVN_CT_STR(OVN_CT_NATTED_BIT)
-                                    "]",
-                                    WR_CT_COMMIT);
     expr_symtab_add_subfield_scoped(symtab, "ct_label.ecmp_reply_eth", NULL,
                                     "ct_label["
                                     OVN_CT_STR(OVN_CT_ECMP_ETH_1ST_BIT) ".."
                                     OVN_CT_STR(OVN_CT_ECMP_ETH_END_BIT) "]",
                                     WR_CT_COMMIT);
-    expr_symtab_add_subfield_scoped(symtab, "ct_label.ecmp_reply_port", NULL,
-                                    "ct_label[80..95]", WR_CT_COMMIT);
     expr_symtab_add_subfield_scoped(symtab, "ct_label.label", NULL,
                                     "ct_label[96..127]", WR_CT_COMMIT);
-    expr_symtab_add_subfield_scoped(symtab, "ct_label.skip_snat", NULL,
-                                    "ct_label["
-                                    OVN_CT_STR(OVN_CT_LB_SKIP_SNAT_BIT)
+    expr_symtab_add_subfield_scoped(symtab, "ct_label.obs_point_id", NULL,
+                                    "ct_label[96..127]", WR_CT_COMMIT);
+    expr_symtab_add_subfield_scoped(symtab, "ct_label.obs_unused", NULL,
+                                    "ct_label[0..95]", WR_CT_COMMIT);
+    expr_symtab_add_subfield_scoped(symtab, "ct_label.acl_id", NULL,
+                                    "ct_label[80..95]", WR_CT_COMMIT);
+    expr_symtab_add_subfield_scoped(symtab, "ct_label.nf",
+                                    NULL, "ct_label["
+                                        OVN_CT_STR(OVN_CT_NF_BIT)
                                     "]",
                                     WR_CT_COMMIT);
-    expr_symtab_add_subfield_scoped(symtab, "ct_label.force_snat", NULL,
+    expr_symtab_add_subfield_scoped(symtab,
+                                    "ct_label.nf_id", NULL,
                                     "ct_label["
-                                    OVN_CT_STR(OVN_CT_LB_FORCE_SNAT_BIT)
+                                        OVN_CT_STR(OVN_CT_NF_ID_1ST_BIT)
+                                        ".."
+                                        OVN_CT_STR(OVN_CT_NF_ID_END_BIT)
+                                    "]",
+                                    WR_CT_COMMIT);
+    expr_symtab_add_subfield_scoped(symtab, "ct_label.tun_if", NULL,
+                                    "ct_label["
+                                        OVN_CT_STR(OVN_CT_TUN_IF_BIT)
+                                    "]",
+                                    WR_CT_COMMIT);
+    expr_symtab_add_subfield_scoped(symtab, "ct_label.tun_if_id", NULL,
+                                    "ct_label["
+                                        OVN_CT_STR(OVN_CT_TUN_IF_1ST_BIT)
+                                        ".."
+                                        OVN_CT_STR(OVN_CT_TUN_IF_END_BIT)
                                     "]",
                                     WR_CT_COMMIT);
 
@@ -247,7 +313,7 @@ ovn_init_symtab(struct shash *symtab)
     expr_symtab_add_field(symtab, "icmp4.code", MFF_ICMPV4_CODE, "icmp4",
               false);
 
-    expr_symtab_add_predicate(symtab, "igmp", "ip4 && ip.proto == 2");
+    expr_symtab_add_predicate(symtab, "igmp", "ip4.mcast && ip.proto == 2");
 
     expr_symtab_add_field(symtab, "ip6.src", MFF_IPV6_SRC, "ip6", false);
     expr_symtab_add_field(symtab, "ip6.dst", MFF_IPV6_DST, "ip6", false);
@@ -255,8 +321,12 @@ ovn_init_symtab(struct shash *symtab)
 
     /* Predefined IPv6 multicast groups (RFC 4291, 2.7.1). */
     expr_symtab_add_predicate(symtab, "ip6.mcast_rsvd",
-                              "ip6.dst[116..127] == 0xff0 && "
-                              "ip6.dst[0..111] == 0x0");
+                              "ip6.dst == { "
+                                  "ff00::0, ff01::0, ff02::0, ff03::0, "
+                                  "ff04::0, ff05::0, ff06::0, ff07::0, "
+                                  "ff08::0, ff09::0, ff0a::0, ff0b::0, "
+                                  "ff0c::0, ff0d::0, ff0e::0, ff0f::0 "
+                               "}");
     expr_symtab_add_predicate(symtab, "ip6.mcast_all_nodes",
                               "ip6.dst == ff01::1 || ip6.dst == ff02::1");
     expr_symtab_add_predicate(symtab, "ip6.mcast_all_rtrs",
@@ -307,6 +377,9 @@ ovn_init_symtab(struct shash *symtab)
               "icmp6.type == {135, 136} && icmp6.code == 0 && ip.ttl == 255");
     expr_symtab_add_predicate(symtab, "nd_ns",
               "icmp6.type == 135 && icmp6.code == 0 && ip.ttl == 255");
+    expr_symtab_add_predicate(symtab, "nd_ns_mcast",
+              "ip6.mcast && icmp6.type == 135 && icmp6.code == 0 && "
+              "ip.ttl == 255");
     expr_symtab_add_predicate(symtab, "nd_na",
               "icmp6.type == 136 && icmp6.code == 0 && ip.ttl == 255");
     expr_symtab_add_predicate(symtab, "nd_rs",
@@ -321,11 +394,12 @@ ovn_init_symtab(struct shash *symtab)
      * (RFC 2710 and RFC 3810).
      */
     expr_symtab_add_predicate(symtab, "mldv1",
-                              "ip6.src == fe80::/10 && "
+                              "eth.mcastv6 && ip6.src == fe80::/10 && "
                               "icmp6.type == {130, 131, 132}");
     /* MLDv2 packets are sent to ff02::16 (RFC 3810, 5.2.14) */
     expr_symtab_add_predicate(symtab, "mldv2",
-                              "ip6.dst == ff02::16 && icmp6.type == 143");
+                              "eth.mcastv6 && ip6.dst == ff02::16 && "
+                              "icmp6.type == 143");
 
     expr_symtab_add_predicate(symtab, "tcp", "ip.proto == 6");
     expr_symtab_add_field(symtab, "tcp.src", MFF_TCP_SRC, "tcp", false);
@@ -344,6 +418,8 @@ ovn_init_symtab(struct shash *symtab)
 
     expr_symtab_add_ovn_field(symtab, "icmp4.frag_mtu", OVN_ICMP4_FRAG_MTU);
     expr_symtab_add_ovn_field(symtab, "icmp6.frag_mtu", OVN_ICMP6_FRAG_MTU);
+    expr_symtab_add_ovn_field(symtab, "icmp4.inner_ip4.src",
+                              OVN_ICMP4_INNER_IP4_SRC);
 }
 
 const char *
@@ -398,4 +474,71 @@ ovn_field_from_name(const char *name)
     ovn_init_ovnfields();
 
     return shash_find_data(&ovnfield_by_name, name);
+}
+
+/* Removes the symbol with 'name' from 'symtab', freeing its memory. */
+static void
+expr_symtab_remove(struct shash *symtab, const char *name)
+{
+    struct expr_symbol *symbol = shash_find_and_delete(symtab, name);
+    if (symbol) {
+        free(symbol->name);
+        free(symbol->prereqs);
+        free(symbol->predicate);
+        free(symbol);
+    }
+}
+
+/* Initialize a symbol table for ACL CT translation.
+ * This creates an alternative symbol table that maps L4 port fields
+ * (tcp/udp/sctp) to their connection tracking equivalents. This allows
+ * matching on all IP fragments (not just the first) by using CT state
+ * which is available for all fragments. */
+void
+ovn_init_acl_ct_symtab(struct shash *acl_symtab)
+{
+    /* Initialize with the standard symbol table. */
+    ovn_init_symtab(acl_symtab);
+
+    /* Remove the original tcp/udp/sctp symbols that we will override. */
+    expr_symtab_remove(acl_symtab, "tcp.src");
+    expr_symtab_remove(acl_symtab, "tcp.dst");
+    expr_symtab_remove(acl_symtab, "tcp");
+    expr_symtab_remove(acl_symtab, "udp.src");
+    expr_symtab_remove(acl_symtab, "udp.dst");
+    expr_symtab_remove(acl_symtab, "udp");
+    expr_symtab_remove(acl_symtab, "sctp.src");
+    expr_symtab_remove(acl_symtab, "sctp.dst");
+    expr_symtab_remove(acl_symtab, "sctp");
+
+    /* Add ct_proto field - CT original direction protocol. Used in the
+     * tcp/udp/sctp predicate expansions below. */
+    expr_symtab_add_field(acl_symtab, "ct_proto", MFF_CT_NW_PROTO,
+                          "ct.trk", false);
+
+    /* Override TCP protocol and port fields to use CT equivalents.
+     * When "tcp" is used as a predicate, it expands to "ct_proto == 6"
+     * instead of "ip.proto == 6". */
+    expr_symtab_add_predicate(acl_symtab, "tcp",
+                              "ct.trk && !ct.inv && ct_proto == 6");
+    expr_symtab_add_field(acl_symtab, "tcp.src", MFF_CT_TP_SRC,
+                          "tcp", false);
+    expr_symtab_add_field(acl_symtab, "tcp.dst", MFF_CT_TP_DST,
+                          "tcp", false);
+
+    /* Override UDP protocol and port fields */
+    expr_symtab_add_predicate(acl_symtab, "udp",
+                              "ct.trk && !ct.inv && ct_proto == 17");
+    expr_symtab_add_field(acl_symtab, "udp.src", MFF_CT_TP_SRC,
+                          "udp", false);
+    expr_symtab_add_field(acl_symtab, "udp.dst", MFF_CT_TP_DST,
+                          "udp", false);
+
+    /* Override SCTP protocol and port fields */
+    expr_symtab_add_predicate(acl_symtab, "sctp",
+                              "ct.trk && !ct.inv && ct_proto == 132");
+    expr_symtab_add_field(acl_symtab, "sctp.src", MFF_CT_TP_SRC,
+                          "sctp", false);
+    expr_symtab_add_field(acl_symtab, "sctp.dst", MFF_CT_TP_DST,
+                          "sctp", false);
 }

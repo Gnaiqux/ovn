@@ -76,12 +76,11 @@ AT_CHECK([ovn-sbctl -f csv -d bare --no-headings --columns ip,type list encap | 
 1.2.3.4,geneve
 ])
 
-AT_CHECK([ovn-sbctl chassis-add ch1 stt,geneve,vxlan 1.2.3.5])
+AT_CHECK([ovn-sbctl chassis-add ch1 geneve,vxlan 1.2.3.5])
 AT_CHECK([ovn-sbctl -f csv -d bare --no-headings --columns ip,type list encap | sort],
          [0], [dnl
 1.2.3.4,geneve
 1.2.3.5,geneve
-1.2.3.5,stt
 1.2.3.5,vxlan
 ])
 
@@ -89,19 +88,17 @@ AT_CHECK([ovn-sbctl chassis-del ch0])
 AT_CHECK([ovn-sbctl -f csv -d bare --no-headings --columns ip,type list encap | sort],
          [0], [dnl
 1.2.3.5,geneve
-1.2.3.5,stt
 1.2.3.5,vxlan
 ])
 
 AT_CHECK([ovn-sbctl chassis-add ch2 geneve 2.3.4.5])
 ch2_uuid=$(ovn-sbctl -d bare --no-headings --columns _uuid find chassis name=ch2)
-ovn-sbctl create Chassis_Private name=ch2 chassis=$ch2_uuid
+check_uuid ovn-sbctl create Chassis_Private name=ch2 chassis=$ch2_uuid
 check_row_count Chassis_Private 1
 
 AT_CHECK([ovn-sbctl -f csv -d bare --no-headings --columns ip,type list encap | sort],
          [0], [dnl
 1.2.3.5,geneve
-1.2.3.5,stt
 1.2.3.5,vxlan
 2.3.4.5,geneve
 ])
@@ -110,7 +107,6 @@ AT_CHECK([ovn-sbctl chassis-del ch2])
 AT_CHECK([ovn-sbctl -f csv -d bare --no-headings --columns ip,type list encap | sort],
          [0], [dnl
 1.2.3.5,geneve
-1.2.3.5,stt
 1.2.3.5,vxlan
 ])
 check_row_count Chassis_Private 0
@@ -126,13 +122,13 @@ OVN_SBCTL_TEST([ovn_sbctl_commands], [ovn-sbctl], [
 AT_CHECK([ovn-nbctl ls-add br-test])
 AT_CHECK([ovn-nbctl lsp-add br-test vif0])
 AT_CHECK([ovn-nbctl lsp-set-addresses vif0 f0:ab:cd:ef:01:02])
-AT_CHECK([ovn-sbctl chassis-add ch0 stt 1.2.3.5])
+AT_CHECK([ovn-sbctl chassis-add ch0 geneve 1.2.3.5])
 AT_CHECK([ovn-nbctl --wait=sb sync])
 AT_CHECK([ovn-sbctl lsp-bind vif0 ch0])
 
 AT_CHECK([ovn-sbctl show], [0], [dnl
 Chassis ch0
-    Encap stt
+    Encap geneve
         ip: "1.2.3.5"
         options: {csum="true"}
     Port_Binding vif0
@@ -145,7 +141,7 @@ AT_CHECK([ovn-sbctl lsp-bind vif1 ch0])
 
 AT_CHECK([ovn-sbctl show | sed 's/vif[[0-9]]/vif/'], [0], [dnl
 Chassis ch0
-    Encap stt
+    Encap geneve
         ip: "1.2.3.5"
         options: {csum="true"}
     Port_Binding vif
@@ -158,7 +154,7 @@ AT_CHECK([ovn-nbctl --wait=sb sync])
 
 AT_CHECK([ovn-sbctl show], [0], [dnl
 Chassis ch0
-    Encap stt
+    Encap geneve
         ip: "1.2.3.5"
         options: {csum="true"}
     Port_Binding vif0
@@ -183,6 +179,54 @@ mac                 : [[]]
 type                : vtep
 options             : {vtep_logical_switch=l0, vtep_physical_switch=p0}
 ])
+])
+
+dnl ---------------------------------------------------------------------
+
+OVN_SBCTL_TEST([ovn_sbctl_show_filter_option], [ovn-sbctl show filter option], [
+
+AT_CHECK([ovn-nbctl ls-add br-test])
+AT_CHECK([ovn-nbctl lsp-add br-test vif0])
+AT_CHECK([ovn-nbctl lsp-set-addresses vif0 f0:ab:cd:ef:01:02])
+AT_CHECK([ovn-sbctl chassis-add ch0 geneve 1.2.3.1])
+AT_CHECK([ovn-nbctl --wait=sb sync])
+AT_CHECK([ovn-sbctl lsp-bind vif0 ch0])
+
+AT_CHECK([ovn-sbctl show], [0], [dnl
+Chassis ch0
+    Encap geneve
+        ip: "1.2.3.1"
+        options: {csum="true"}
+    Port_Binding vif0
+])
+
+AT_CHECK([ovn-sbctl chassis-add ch2 geneve 1.2.3.2])
+AT_CHECK([ovn-sbctl chassis-add ch3 geneve 1.2.3.3])
+AT_CHECK([ovn-sbctl chassis-add ch4 vxlan 1.2.3.4])
+
+AT_CHECK([ovn-sbctl --filter='ch2,ch3' show | grep Chassis | sort], [0], [dnl
+Chassis ch2
+Chassis ch3
+])
+
+AT_CHECK([ovn-sbctl --filter='1.2.3.4,1.2.3.3' show | grep Chassis | sort], [0], [dnl
+Chassis ch3
+Chassis ch4
+])
+
+AT_CHECK([ovn-sbctl --filter='Encap(vxlan)' show | grep -E '(Chassis|Encap)' | sort], [0], [dnl
+    Encap vxlan
+Chassis ch0
+Chassis ch2
+Chassis ch3
+Chassis ch4
+])
+
+AT_CHECK([ovn-sbctl --filter='Encap(vxlan),ch4' show | grep -E '(Chassis|Encap)' | sort], [0], [dnl
+    Encap vxlan
+Chassis ch4
+])
+
 ])
 
 dnl ---------------------------------------------------------------------
@@ -243,6 +287,8 @@ $ingress_lflows
 # add another datapath
 check ovn-nbctl --wait=sb ls-add count-test2
 
+wait_column 2 Datapath_Binding tunnel_key external_ids:name=count-test2
+
 # check total logical flows in 2 datapathes
 AT_CHECK_UNQUOTED([ovn-sbctl count-flows | grep "flows =" | awk 'NF>1{print $NF}'], [0], [dnl
 $(($total_lflows * 2))
@@ -259,9 +305,20 @@ AT_CHECK_UNQUOTED([ovn-sbctl count-flows count-test | grep Total | grep ingress 
 $ingress_lflows
 ])
 
+# check total logical flows in a specific datapath using NB UUID instead of name.
+count_test_uuid=$(fetch_column nb:Logical_Switch _uuid name=count-test)
+AT_CHECK_UNQUOTED([ovn-sbctl count-flows $count_test_uuid | grep "flows =" | awk 'NF>1{print $NF}'], [0], [dnl
+$total_lflows
+])
+AT_CHECK_UNQUOTED([ovn-sbctl count-flows $count_test_uuid | grep Total | grep egress | awk 'NF>1{print $NF}'], [0], [dnl
+$egress_lflows
+])
+AT_CHECK_UNQUOTED([ovn-sbctl count-flows $count_test_uuid | grep Total | grep ingress | awk 'NF>1{print $NF}'], [0], [dnl
+$ingress_lflows
+])
+
 # check nonexistent datapath
 AT_CHECK([ovn-sbctl count-flows wrongDatapath], [0], [dnl
 Total number of logical flows = 0
 ])
 ])
-

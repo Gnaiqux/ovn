@@ -1,0 +1,664 @@
+/*
+ * Copyright (c) 2025 Canonical, Ltd.
+ * Copyright (c) 2025, STACKIT GmbH & Co. KG
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at:
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <config.h>
+
+#include <errno.h>
+#include <inttypes.h>
+#include <net/if.h>
+#include <netinet/in.h>
+
+#include "netlink-socket.h"
+#include "openvswitch/hmap.h"
+#include "hmapx.h"
+#include "openvswitch/ofpbuf.h"
+#include "openvswitch/vlog.h"
+#include "ovn-util.h"
+#include "route-table.h"
+#include "route.h"
+#include "vec.h"
+
+#include "nexthop-exchange.h"
+#include "route-exchange-netlink.h"
+
+VLOG_DEFINE_THIS_MODULE(route_exchange_netlink);
+
+#define NETNL_REQ_BUFFER_SIZE 128
+
+static void re_nl_encode_nexthop(struct ofpbuf *, bool dst_is_ipv4,
+                                 const struct in6_addr *);
+
+int
+re_nl_create_vrf(const char *ifname, uint32_t table_id)
+{
+    if (!TABLE_ID_VALID(table_id)) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+        VLOG_WARN_RL(&rl,
+                     "attempt to create VRF using invalid table id %"PRIu32,
+                     table_id);
+        return EINVAL;
+    }
+
+    size_t linkinfo_off, infodata_off;
+    struct ifinfomsg *ifinfo;
+    int err;
+
+    struct ofpbuf request;
+    uint8_t request_stub[NETNL_REQ_BUFFER_SIZE];
+    ofpbuf_use_stub(&request, request_stub, sizeof(request_stub));
+
+    nl_msg_put_nlmsghdr(&request, 0, RTM_NEWLINK,
+                        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+    ifinfo = ofpbuf_put_zeros(&request, sizeof *ifinfo);
+    nl_msg_put_string(&request, IFLA_IFNAME, ifname);
+
+    ifinfo->ifi_change = ifinfo->ifi_flags = IFF_UP;
+    linkinfo_off = nl_msg_start_nested(&request, IFLA_LINKINFO);
+    nl_msg_put_string(&request, IFLA_INFO_KIND, "vrf");
+    infodata_off = nl_msg_start_nested(&request, IFLA_INFO_DATA);
+    nl_msg_put_u32(&request, IFLA_VRF_TABLE, table_id);
+    nl_msg_end_nested(&request, infodata_off);
+    nl_msg_end_nested(&request, linkinfo_off);
+
+    err = nl_transact(NETLINK_ROUTE, &request, NULL);
+
+    ofpbuf_uninit(&request);
+    return err;
+}
+
+int
+re_nl_delete_vrf(const char *ifname)
+{
+    struct ifinfomsg *ifinfo;
+    int err;
+
+    struct ofpbuf request;
+    uint8_t request_stub[NETNL_REQ_BUFFER_SIZE];
+    ofpbuf_use_stub(&request, request_stub, sizeof(request_stub));
+
+    nl_msg_put_nlmsghdr(&request, 0, RTM_DELLINK, NLM_F_REQUEST | NLM_F_ACK);
+    ifinfo = ofpbuf_put_zeros(&request, sizeof *ifinfo);
+    nl_msg_put_string(&request, IFLA_IFNAME, ifname);
+    err = nl_transact(NETLINK_ROUTE, &request, NULL);
+
+    ofpbuf_uninit(&request);
+    return err;
+}
+
+void
+re_route_format(struct ds *ds, uint32_t table_id, const struct in6_addr *dst,
+                unsigned int plen, const struct in6_addr *nexthop, int err)
+{
+    ds_put_format(ds, "table_id=%"PRIu32" dst=", table_id);
+    ipv6_format_mapped(dst, ds);
+    ds_put_format(ds, " plen=%u nexthop=", plen);
+    if (ipv6_is_zero(nexthop)) {
+        ds_put_cstr(ds, "(blackhole)");
+    } else {
+        ipv6_format_mapped(nexthop, ds);
+    }
+
+    if (err) {
+        ds_put_format(ds, " failed: %s", ovs_strerror(err));
+    }
+}
+
+static int
+modify_route(uint32_t type, uint32_t flags_arg, uint32_t table_id,
+             const struct advertise_route_entry *re)
+{
+    uint32_t flags = NLM_F_REQUEST | NLM_F_ACK;
+    bool is_ipv4 = IN6_IS_ADDR_V4MAPPED(&re->addr);
+    bool nexthop_unspec = ipv6_is_zero(&re->nexthop);
+    struct rtmsg *rt;
+    int err;
+
+    flags |= flags_arg;
+
+    struct ofpbuf request;
+    uint8_t request_stub[NETNL_REQ_BUFFER_SIZE];
+    ofpbuf_use_stub(&request, request_stub, sizeof(request_stub));
+
+    nl_msg_put_nlmsghdr(&request, 0, type, flags);
+    rt = ofpbuf_put_zeros(&request, sizeof *rt);
+    rt->rtm_family = is_ipv4 ? AF_INET : AF_INET6;
+    rt->rtm_table = RT_TABLE_UNSPEC; /* RTA_TABLE attribute allows id > 256 */
+    /* Manage only OVN routes */
+    rt->rtm_protocol = RTPROT_OVN;
+    rt->rtm_type = nexthop_unspec ? RTN_BLACKHOLE : RTN_UNICAST;
+    rt->rtm_scope = RT_SCOPE_UNIVERSE;
+    rt->rtm_dst_len = re->plen;
+
+    nl_msg_put_u32(&request, RTA_TABLE, table_id);
+    nl_msg_put_u32(&request, RTA_PRIORITY, re->priority);
+
+    if (is_ipv4) {
+        nl_msg_put_be32(&request, RTA_DST,
+                        in6_addr_get_mapped_ipv4(&re->addr));
+    } else {
+        nl_msg_put_in6_addr(&request, RTA_DST, &re->addr);
+    }
+
+    if (!nexthop_unspec) {
+        re_nl_encode_nexthop(&request, is_ipv4, &re->nexthop);
+    }
+
+    if (VLOG_IS_DBG_ENABLED()) {
+        struct ds msg = DS_EMPTY_INITIALIZER;
+
+        re_route_format(&msg, table_id, &re->addr, re->plen, &re->nexthop, 0);
+        VLOG_DBG("%s route %s", type == RTM_DELROUTE ? "Removing" : "Adding",
+                 ds_cstr(&msg));
+        ds_destroy(&msg);
+    }
+
+    err = nl_transact(NETLINK_ROUTE, &request, NULL);
+
+    ofpbuf_uninit(&request);
+    return err;
+}
+
+int
+re_nl_add_route(uint32_t table_id, const struct advertise_route_entry *re)
+{
+    if (!TABLE_ID_VALID(table_id)) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+        VLOG_WARN_RL(&rl,
+                     "attempt to add route using invalid table id %"PRIu32,
+                     table_id);
+        return EINVAL;
+    }
+
+    return modify_route(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, table_id, re);
+}
+
+int
+re_nl_delete_route(uint32_t table_id, const struct advertise_route_entry *re)
+{
+    if (!TABLE_ID_VALID(table_id)) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+        VLOG_WARN_RL(&rl,
+                     "attempt to delete route using invalid table id %"PRIu32,
+                     table_id);
+        return EINVAL;
+    }
+
+    return modify_route(RTM_DELROUTE, 0, table_id, re);
+}
+
+/* Returns a self contained copy of the route 'rd' reported by a message of
+ * type 'nlmsg_type'.  The caller takes ownership of it. */
+struct ovn_route_msg *
+ovn_route_msg_from_route_data(uint16_t nlmsg_type,
+                              const struct route_data *rd)
+{
+    size_t n_nexthops = ovs_list_size(&rd->nexthops);
+    struct ovn_route_msg *msg =
+        xzalloc(sizeof *msg + n_nexthops * sizeof msg->nexthops[0]);
+
+    *msg = (struct ovn_route_msg) {
+        .nlmsg_type = nlmsg_type,
+        .table_id = rd->rta_table_id,
+        .prefix = rd->rta_dst,
+        .plen = rd->rtm_dst_len,
+        .protocol = rd->rtm_protocol,
+        .priority = rd->rta_priority,
+        .nhid = rd->rta_nhid,
+        .n_nexthops = n_nexthops,
+    };
+
+    struct ovn_route_nexthop *nh = msg->nexthops;
+    const struct route_data_nexthop *rdnh;
+    LIST_FOR_EACH (rdnh, nexthop_node, &rd->nexthops) {
+        nh->addr = rdnh->addr;
+        memcpy(nh->ifname, rdnh->ifname, IFNAMSIZ);
+        nh++;
+    }
+
+    return msg;
+}
+
+void
+ovn_route_msg_format(struct ds *ds, const struct ovn_route_msg *msg)
+{
+    ds_put_format(ds, "table_id=%"PRIu32" dst=", msg->table_id);
+    ipv6_format_mapped(&msg->prefix, ds);
+    ds_put_format(ds, " plen=%u proto=%u priority=%"PRIu32,
+                  msg->plen, msg->protocol, msg->priority);
+
+    if (msg->nhid) {
+        ds_put_format(ds, " nhid=%"PRIu32, msg->nhid);
+        return;
+    }
+
+    for (size_t i = 0; i < msg->n_nexthops; i++) {
+        const struct ovn_route_nexthop *nh = &msg->nexthops[i];
+
+        ds_put_cstr(ds, " nexthop=");
+        ipv6_format_mapped(&nh->addr, ds);
+        if (nh->ifname[0]) {
+            ds_put_format(ds, ",dev=%s", nh->ifname);
+        }
+    }
+}
+
+/* Returns true if 'msg' describes a route OVN may learn: one installed into
+ * its table by a dynamic routing protocol, rather than by OVN itself or by a
+ * user.  Protocol values above RTPROT_STATIC are the ones used by the dynamic
+ * routing protocols. */
+static bool
+route_is_learn_relevant(const struct ovn_route_msg *msg)
+{
+    return msg->protocol != RTPROT_OVN
+           && msg->protocol > RTPROT_STATIC
+           && !prefix_is_link_local(&msg->prefix, msg->plen);
+}
+
+/* Two routes for one prefix may differ only by their metric, so it is part of
+ * a route's identity. */
+static uint32_t
+cached_route_hash(const struct ovn_route_msg *msg)
+{
+    uint32_t hash = hash_bytes(&msg->prefix, sizeof msg->prefix, 0);
+
+    hash = hash_int(msg->plen, hash);
+    return hash_int(msg->priority, hash);
+}
+
+static struct re_nl_cached_route *
+cached_route_find(const struct hmap *routes, const struct ovn_route_msg *msg)
+{
+    struct re_nl_cached_route *cr;
+    HMAP_FOR_EACH_WITH_HASH (cr, node, cached_route_hash(msg), routes) {
+        if (cr->msg->plen == msg->plen
+            && cr->msg->priority == msg->priority
+            && ipv6_addr_equals(&cr->msg->prefix, &msg->prefix)) {
+            return cr;
+        }
+    }
+
+    return NULL;
+}
+
+/* Applies the change 'msg' to the routes cached for its table: a route
+ * reported as added replaces the one it has the identity of, a route reported
+ * as removed drops it.  Changes to routes OVN does not learn from are ignored.
+ *
+ * Returns true if 'routes' changed. */
+bool
+re_nl_cached_routes_apply(struct hmap *routes, const struct ovn_route_msg *msg)
+{
+    if (!route_is_learn_relevant(msg)) {
+        return false;
+    }
+
+    struct re_nl_cached_route *cr = cached_route_find(routes, msg);
+
+    if (msg->nlmsg_type == RTM_DELROUTE) {
+        if (!cr) {
+            return false;
+        }
+
+        hmap_remove(routes, &cr->node);
+        free(cr->msg);
+        free(cr);
+        return true;
+    }
+
+    if (cr) {
+        size_t size = ovn_route_msg_size(msg);
+        if (size == ovn_route_msg_size(cr->msg)
+            && !memcmp(cr->msg, msg, size)) {
+            return false;
+        }
+
+        free(cr->msg);
+        cr->msg = ovn_route_msg_clone(msg);
+        return true;
+    }
+
+    cr = xmalloc(sizeof *cr);
+    cr->msg = ovn_route_msg_clone(msg);
+    hmap_insert(routes, &cr->node, cached_route_hash(msg));
+
+    return true;
+}
+
+void
+re_nl_cached_routes_clear(struct hmap *routes)
+{
+    struct re_nl_cached_route *cr;
+    HMAP_FOR_EACH_POP (cr, node, routes) {
+        free(cr->msg);
+        free(cr);
+    }
+}
+
+/* Appends a learned route for the prefix in 'msg' reachable through the leaf
+ * nexthop object 'nhe' to 'learned_routes'. */
+static void
+learn_route_via_nexthop(const struct nexthop_entry *nhe,
+                        const struct ovn_route_msg *msg,
+                        struct vector *learned_routes)
+{
+    if (ipv6_is_zero(&nhe->addr)) {
+        /* Blackhole next hop, or an address on the local link.  As we just
+         * want to learn remote routes we do not need it. */
+        return;
+    }
+
+    struct re_nl_received_route_node rr = (struct re_nl_received_route_node) {
+        .prefix = msg->prefix,
+        .plen = msg->plen,
+        .nexthop = nhe->addr,
+    };
+    ovs_strlcpy(rr.ifname, nhe->ifname, sizeof rr.ifname);
+
+    vector_push(learned_routes, &rr);
+}
+
+/* Resolves the kernel nexthop object identified by 'id' against 'nexthops'
+ * and appends a learned route for the prefix in 'msg' to 'learned_routes' for
+ * each usable next hop.  A nexthop group yields one learned route per
+ * member.
+ *
+ * Every nexthop id the route depends on is added to 'referenced_nhids', even
+ * the ones that cannot be resolved right now, so that the caller knows which
+ * changes to the kernel nexthop table may affect this route. */
+static void
+learn_routes_via_nexthop_id(const struct hmap *nexthops, uint32_t id,
+                            const struct ovn_route_msg *msg,
+                            struct vector *learned_routes,
+                            struct hmap *referenced_nhids)
+{
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+
+    nexthop_ids_add(referenced_nhids, id);
+
+    const struct nexthop_entry *nhe = nexthop_entry_find(nexthops, id);
+    if (!nhe) {
+        VLOG_DBG_RL(&rl, "could not resolve nexthop id %"PRIu32, id);
+        return;
+    }
+
+    if (!nhe->n_grps) {
+        learn_route_via_nexthop(nhe, msg, learned_routes);
+        return;
+    }
+
+    for (size_t i = 0; i < nhe->n_grps; i++) {
+        const struct nexthop_grp_entry *grp = &nhe->grps[i];
+
+        /* Replacing a member does not change the group itself, so the route
+         * depends on the members just as much as on the group. */
+        nexthop_ids_add(referenced_nhids, grp->id);
+
+        /* The kernel does not allow a nexthop group to contain other groups,
+         * so a single level of indirection is all we have to follow. */
+        if (!grp->gateway) {
+            VLOG_DBG_RL(&rl, "could not resolve member %"PRIu32" of nexthop "
+                        "group %"PRIu32, grp->id, id);
+            continue;
+        }
+
+        learn_route_via_nexthop(grp->gateway, msg, learned_routes);
+    }
+}
+
+void
+re_nl_resolve_route(const struct ovn_route_msg *msg,
+                    const struct hmap *nexthops,
+                    struct vector *learned_routes,
+                    struct hmap *referenced_nhids)
+{
+    if (msg->nhid) {
+        /* The next hop(s) are not encoded in the route itself, they are
+         * described by a separate kernel nexthop object. */
+        learn_routes_via_nexthop_id(nexthops, msg->nhid, msg, learned_routes,
+                                    referenced_nhids);
+        return;
+    }
+
+    for (size_t i = 0; i < msg->n_nexthops; i++) {
+        const struct ovn_route_nexthop *nh = &msg->nexthops[i];
+
+        if (ipv6_is_zero(&nh->addr)) {
+            /* This is most likely an address on the local link.  As we just
+             * want to learn remote routes we do not need it. */
+            continue;
+        }
+
+        struct re_nl_received_route_node rr;
+        rr = (struct re_nl_received_route_node) {
+            .prefix = msg->prefix,
+            .plen = msg->plen,
+            .nexthop = nh->addr,
+        };
+        ovs_strlcpy(rr.ifname, nh->ifname, sizeof rr.ifname);
+
+        vector_push(learned_routes, &rr);
+    }
+}
+
+struct route_msg_handle_data {
+    struct hmapx *routes_to_advertise;
+    struct vector *stale_routes;
+    /* Vector of "const struct hmap *", each holding advertise_route_entry
+     * nodes for a datapath sharing this routing table. */
+    const struct vector *route_tables;
+
+    /* Routes of the table OVN may learn from (struct re_nl_cached_route),
+     * rebuilt from the dump.  NULL if the caller does not learn routes. */
+    struct hmap *learned_routes;
+};
+
+static void
+handle_route_msg(const struct route_table_msg *msg,
+                 void *data,
+                 uint32_t table_id)
+{
+    struct route_msg_handle_data *handle_data = data;
+    const struct route_data *rd = &msg->rd;
+    struct advertise_route_entry *ar;
+
+    if (table_id != rd->rta_table_id) {
+        /* We do not have the NLM_F_DUMP_FILTERED info here, so check if the
+         * reported table_id matches the requested one.
+         */
+        return;
+    }
+
+    /* This route is not from us, so it is one we may learn. */
+    if (rd->rtm_protocol != RTPROT_OVN) {
+        if (!handle_data->learned_routes) {
+            return;
+        }
+
+        struct ovn_route_msg *route_msg =
+            ovn_route_msg_from_route_data(RTM_NEWROUTE, rd);
+        re_nl_cached_routes_apply(handle_data->learned_routes, route_msg);
+        free(route_msg);
+        return;
+    }
+
+    const struct advertise_route_entry re =
+            advertise_route_from_route_data(rd);
+    if (handle_data->routes_to_advertise) {
+        const struct hmap *routes;
+        VECTOR_FOR_EACH (handle_data->route_tables, routes) {
+            ar = advertise_route_find(re.priority, &re.addr, re.plen,
+                                      &re.nexthop, routes);
+            if (ar) {
+                hmapx_find_and_delete(handle_data->routes_to_advertise, ar);
+                return;
+            }
+        }
+    }
+
+    if (handle_data->stale_routes) {
+        vector_push(handle_data->stale_routes, &re);
+    }
+}
+
+static int
+re_nl_delete_stale_routes(uint32_t table_id, const struct vector *stale_routes)
+{
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+    struct ds ds = DS_EMPTY_INITIALIZER;
+    int ret = 0;
+
+    const struct advertise_route_entry *re;
+    VECTOR_FOR_EACH_PTR (stale_routes, re) {
+        int err = re_nl_delete_route(table_id, re);
+        if (err) {
+            re_route_format(&ds, table_id, &re->addr,
+                            re->plen, &re->nexthop, err);
+            VLOG_WARN_RL(&rl, "Delete route %s", ds_cstr(&ds));
+            ds_clear(&ds);
+            if (!ret) {
+                ret = err;
+            }
+        }
+    }
+
+    ds_destroy(&ds);
+    return ret;
+}
+
+static void
+re_nl_encode_nexthop(struct ofpbuf *request, bool dst_is_ipv4,
+                     const struct in6_addr *nexthop)
+{
+    bool nh_is_ipv4 = IN6_IS_ADDR_V4MAPPED(nexthop);
+    size_t len = nh_is_ipv4 ? sizeof(ovs_be32) : sizeof(struct in6_addr);
+
+    ovs_be32 nexthop4 = in6_addr_get_mapped_ipv4(nexthop);
+    void *nl_attr_dst = nh_is_ipv4 ? (void *) &nexthop4 : (void *) nexthop;
+
+    if (dst_is_ipv4 != nh_is_ipv4) {
+        struct rtvia *via = nl_msg_put_unspec_uninit(request, RTA_VIA,
+                                                     sizeof *via + len);
+        via->rtvia_family = nh_is_ipv4 ? AF_INET : AF_INET6;
+        memcpy(via->rtvia_addr, nl_attr_dst, len);
+    } else {
+        nl_msg_put_unspec(request, RTA_GATEWAY, nl_attr_dst, len);
+    }
+}
+
+int
+re_nl_sync_routes(uint32_t table_id, const struct vector *route_tables,
+                  struct hmap *learned_routes)
+{
+    struct hmapx routes_to_advertise = HMAPX_INITIALIZER(&routes_to_advertise);
+    struct vector stale_routes =
+        VECTOR_EMPTY_INITIALIZER(struct advertise_route_entry);
+    struct advertise_route_entry *ar;
+
+    /* Equivalent routes may be advertised by multiple datapaths sharing this
+     * routing table.  Only keep the occurrence from the first table that has
+     * it, so each route is installed in the kernel exactly once and
+     * handle_route_msg() can stop at the first match as well. */
+    size_t n_prev = 0;
+    const struct hmap *routes;
+    VECTOR_FOR_EACH (route_tables, routes) {
+        HMAP_FOR_EACH (ar, node, routes) {
+            bool duplicate = false;
+            for (size_t i = 0; i < n_prev; i++) {
+                const struct hmap *prev = vector_get(route_tables, i,
+                                                     const struct hmap *);
+                if (advertise_route_find(ar->priority, &ar->addr, ar->plen,
+                                         &ar->nexthop, prev)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                hmapx_add(&routes_to_advertise, ar);
+            }
+        }
+        n_prev++;
+    }
+
+    if (learned_routes) {
+        /* The dump below tells us about every route of the table, so whatever
+         * we knew about it is replaced. */
+        re_nl_cached_routes_clear(learned_routes);
+    }
+
+    /* Remove routes from the system that are not in any of the route tables
+     * and remove entries from routes_to_advertise that match routes already
+     * installed in the system. */
+    struct route_msg_handle_data data = {
+        .route_tables = route_tables,
+        .routes_to_advertise = &routes_to_advertise,
+        .learned_routes = learned_routes,
+        .stale_routes = &stale_routes,
+    };
+    route_table_dump_one_table(table_id, AF_INET, handle_route_msg, &data);
+    route_table_dump_one_table(table_id, AF_INET6, handle_route_msg, &data);
+
+    int ret = re_nl_delete_stale_routes(table_id, &stale_routes);
+
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+    struct ds ds = DS_EMPTY_INITIALIZER;
+
+    /* Add any remaining routes in the routes_to_advertise hmapx to the
+     * system routing table. */
+    struct hmapx_node *hn;
+    HMAPX_FOR_EACH (hn, &routes_to_advertise) {
+        ar = hn->data;
+        int err = re_nl_add_route(table_id, ar);
+        if (err) {
+            re_route_format(&ds, table_id, &ar->addr, ar->plen,
+                            &ar->nexthop, err);
+            VLOG_WARN_RL(&rl, "Add route %s", ds_cstr(&ds));
+            ds_clear(&ds);
+            if (!ret) {
+                /* Report the first error value to the caller. */
+                ret = err;
+            }
+        }
+    }
+
+    hmapx_destroy(&routes_to_advertise);
+    vector_destroy(&stale_routes);
+    ds_destroy(&ds);
+
+    return ret;
+}
+
+int
+re_nl_cleanup_routes(uint32_t table_id)
+{
+    struct vector stale_routes =
+        VECTOR_EMPTY_INITIALIZER(struct advertise_route_entry);
+    /* Remove routes from the system that are not in the host_routes hmap and
+     * remove entries from host_routes hmap that match routes already installed
+     * in the system. */
+    struct route_msg_handle_data data = {
+        .routes_to_advertise = NULL,
+        .learned_routes = NULL,
+        .stale_routes = &stale_routes,
+    };
+    route_table_dump_one_table(table_id, AF_INET, handle_route_msg, &data);
+    route_table_dump_one_table(table_id, AF_INET6, handle_route_msg, &data);
+
+    int ret = re_nl_delete_stale_routes(table_id, &stale_routes);
+    vector_destroy(&stale_routes);
+
+    return ret;
+}

@@ -27,7 +27,6 @@
 #include "lib/uuidset.h"
 #include "openvswitch/util.h"
 #include "openvswitch/vlog.h"
-#include "stopwatch.h"
 
 /* OVN includes */
 #include "en-lb-data.h"
@@ -39,7 +38,6 @@
 #include "lib/ovn-nb-idl.h"
 #include "lib/ovn-sb-idl.h"
 #include "lib/ovn-util.h"
-#include "lib/stopwatch-names.h"
 #include "lflow-mgr.h"
 #include "northd.h"
 
@@ -49,10 +47,8 @@ VLOG_DEFINE_THIS_MODULE(en_lr_stateful);
 static void lr_stateful_table_init(struct lr_stateful_table *);
 static void lr_stateful_table_clear(struct lr_stateful_table *);
 static void lr_stateful_table_destroy(struct lr_stateful_table *);
-static struct lr_stateful_record *lr_stateful_table_find_(
-    const struct lr_stateful_table *, const struct nbrec_logical_router *);
-static struct lr_stateful_record *lr_stateful_table_find_by_index_(
-    const struct lr_stateful_table *table, size_t od_index);
+static struct lr_stateful_record *lr_stateful_table_find_by_uuid_(
+    const struct lr_stateful_table *table, struct uuid nb_uuid);
 
 static void lr_stateful_table_build(struct lr_stateful_table *,
                                     const struct lr_nat_table *,
@@ -82,6 +78,11 @@ static void remove_lrouter_lb_reachable_ips(struct lr_stateful_record *,
                                             enum lb_neighbor_responder_mode,
                                             const struct sset *lb_ips_v4,
                                             const struct sset *lb_ips_v6);
+static void update_lrouter_lb_adv_ips(struct lr_stateful_record *,
+                                      bool advertise,
+                                      const struct sset *lb_ips_v4,
+                                      const struct sset *lb_ips_v6);
+static bool lr_stateful_rebuild_vip_nats(struct lr_stateful_record *);
 
 /* 'lr_stateful' engine node manages the NB logical router LB data.
  */
@@ -92,6 +93,7 @@ en_lr_stateful_init(struct engine_node *node OVS_UNUSED,
     struct ed_type_lr_stateful *data = xzalloc(sizeof *data);
     lr_stateful_table_init(&data->table);
     hmapx_init(&data->trk_data.crupdated);
+    hmapx_init(&data->trk_data.deleted);
     return data;
 }
 
@@ -101,6 +103,7 @@ en_lr_stateful_cleanup(void *data_)
     struct ed_type_lr_stateful *data = data_;
     lr_stateful_table_destroy(&data->table);
     hmapx_destroy(&data->trk_data.crupdated);
+    hmapx_destroy(&data->trk_data.deleted);
 }
 
 void
@@ -109,15 +112,19 @@ en_lr_stateful_clear_tracked_data(void *data_)
     struct ed_type_lr_stateful *data = data_;
 
     hmapx_clear(&data->trk_data.crupdated);
+    struct hmapx_node *hmapx_node;
+    HMAPX_FOR_EACH_SAFE (hmapx_node, &data->trk_data.deleted) {
+        lr_stateful_record_destroy(hmapx_node->data);
+        hmapx_delete(&data->trk_data.deleted, hmapx_node);
+    }
+    data->trk_data.vip_nats_changed = false;
 }
 
-void
+enum engine_node_state
 en_lr_stateful_run(struct engine_node *node, void *data_)
 {
     struct lr_stateful_input input_data = lr_stateful_get_input_data(node);
     struct ed_type_lr_stateful *data = data_;
-
-    stopwatch_start(LR_STATEFUL_RUN_STOPWATCH_NAME, time_msec());
 
     lr_stateful_table_clear(&data->table);
     lr_stateful_table_build(&data->table, input_data.lr_nats,
@@ -125,26 +132,21 @@ en_lr_stateful_run(struct engine_node *node, void *data_)
                             input_data.lb_datapaths_map,
                             input_data.lbgrp_datapaths_map);
 
-    stopwatch_stop(LR_STATEFUL_RUN_STOPWATCH_NAME, time_msec());
-    engine_set_node_state(node, EN_UPDATED);
+    return EN_UPDATED;
 }
 
-bool
+enum engine_input_handler_result
 lr_stateful_northd_handler(struct engine_node *node, void *data OVS_UNUSED)
 {
     struct northd_data *northd_data = engine_get_input_data("northd", node);
     if (!northd_has_tracked_data(&northd_data->trk_data)) {
-        return false;
+        return EN_UNHANDLED;
     }
 
     /* This node uses the below data from the en_northd engine node.
      * See (lr_stateful_get_input_data())
      *   1. northd_data->lr_datapaths
      *      This data gets updated when a logical router is created or deleted.
-     *      northd engine node presently falls back to full recompute when
-     *      this happens and so does this node.
-     *      Note: When we add I-P to the created/deleted logical routers, we
-     *      need to revisit this handler.
      *
      *      This node also accesses the router ports of the logical router
      *      (od->ports).  When these logical router ports gets updated,
@@ -161,15 +163,15 @@ lr_stateful_northd_handler(struct engine_node *node, void *data OVS_UNUSED)
      * and (3) if any.
      *
      * */
-    return true;
+    return EN_HANDLED_UNCHANGED;
 }
 
-bool
+enum engine_input_handler_result
 lr_stateful_lb_data_handler(struct engine_node *node, void *data_)
 {
     struct ed_type_lb_data *lb_data = engine_get_input_data("lb_data", node);
     if (!lb_data->tracked) {
-        return false;
+        return EN_UNHANDLED;
     }
 
     struct lr_stateful_input input_data = lr_stateful_get_input_data(node);
@@ -183,10 +185,10 @@ lr_stateful_lb_data_handler(struct engine_node *node, void *data_)
         ovs_assert(od);
 
         struct lr_stateful_record *lr_stateful_rec =
-            lr_stateful_table_find_(&data->table, od->nbr);
+            lr_stateful_table_find_by_uuid_(&data->table, od->key);
         if (!lr_stateful_rec) {
-            const struct lr_nat_record *lrnat_rec = lr_nat_table_find_by_index(
-                input_data.lr_nats, od->index);
+            const struct lr_nat_record *lrnat_rec = lr_nat_table_find_by_uuid(
+                input_data.lr_nats, od->key);
             ovs_assert(lrnat_rec);
 
             lr_stateful_rec =
@@ -196,6 +198,10 @@ lr_stateful_lb_data_handler(struct engine_node *node, void *data_)
 
             /* Add the lr_stateful_rec rec to the tracking data. */
             hmapx_add(&data->trk_data.crupdated, lr_stateful_rec);
+
+            if (!sset_is_empty(&lr_stateful_rec->vip_nats)) {
+                data->trk_data.vip_nats_changed = true;
+            }
             continue;
         }
 
@@ -231,6 +237,8 @@ lr_stateful_lb_data_handler(struct engine_node *node, void *data_)
             }
         }
 
+        lr_stateful_rec->has_distributed_lb = od->is_distributed;
+
         /* Add the lr_stateful_rec rec to the tracking data. */
         hmapx_add(&data->trk_data.crupdated, lr_stateful_rec);
     }
@@ -240,18 +248,21 @@ lr_stateful_lb_data_handler(struct engine_node *node, void *data_)
         const struct uuid *lb_uuid = &clb->lb->nlb->header_.uuid;
         const struct ovn_northd_lb *lb = clb->lb;
 
+        bool advertise = lb->nlb
+            ? smap_get_bool(&lb->nlb->options,
+                            "dynamic-routing-advertise", true)
+            : true;
         const struct ovn_lb_datapaths *lb_dps = ovn_lb_datapaths_find(
             input_data.lb_datapaths_map, lb_uuid);
         ovs_assert(lb_dps);
 
         size_t index;
-        BITMAP_FOR_EACH_1 (index, ods_size(input_data.lr_datapaths),
-                           lb_dps->nb_lr_map) {
+        DYNAMIC_BITMAP_FOR_EACH_1 (index, &lb_dps->nb_lr_map) {
             const struct ovn_datapath *od =
                 ovn_datapaths_find_by_index(input_data.lr_datapaths, index);
 
             struct lr_stateful_record *lr_stateful_rec =
-                lr_stateful_table_find_(&data->table, od->nbr);
+                lr_stateful_table_find_by_uuid_(&data->table, od->key);
             ovs_assert(lr_stateful_rec);
 
             /* Update the od->lb_ips with the deleted and inserted
@@ -259,13 +270,16 @@ lr_stateful_lb_data_handler(struct engine_node *node, void *data_)
             remove_ips_from_lb_ip_set(lr_stateful_rec->lb_ips, lb->routable,
                                       &clb->deleted_vips_v4,
                                       &clb->deleted_vips_v6);
-            add_ips_to_lb_ip_set(lr_stateful_rec->lb_ips, lb->routable,
+            add_ips_to_lb_ip_set(lr_stateful_rec->lb_ips,
+                                 lb->routable, advertise,
                                  &clb->inserted_vips_v4,
                                  &clb->inserted_vips_v6);
 
             remove_lrouter_lb_reachable_ips(lr_stateful_rec, lb->neigh_mode,
                                             &clb->deleted_vips_v4,
                                             &clb->deleted_vips_v6);
+            update_lrouter_lb_adv_ips(lr_stateful_rec, advertise,
+                                      &lb->ips_v4, &lb->ips_v6);
             add_neigh_ips_to_lrouter(lr_stateful_rec, od, lb->neigh_mode,
                                      &clb->inserted_vips_v4,
                                      &clb->inserted_vips_v6);
@@ -291,10 +305,10 @@ lr_stateful_lb_data_handler(struct engine_node *node, void *data_)
             const struct ovn_lb_datapaths *lb_dps = ovn_lb_datapaths_find(
                 input_data.lb_datapaths_map, lb_uuid);
             ovs_assert(lb_dps);
-            for (size_t i = 0; i < lbgrp_dps->n_lr; i++) {
-                const struct ovn_datapath *od = lbgrp_dps->lr[i];
+            struct ovn_datapath *od;
+            VECTOR_FOR_EACH (&lbgrp_dps->lr, od) {
                 struct lr_stateful_record *lr_stateful_rec =
-                    lr_stateful_table_find_(&data->table, od->nbr);
+                    lr_stateful_table_find_by_uuid_(&data->table, od->key);
                 ovs_assert(lr_stateful_rec);
                 /* Add the lb_ips of lb_dps to the lr lb data. */
                 build_lrouter_lb_ips(lr_stateful_rec->lb_ips, lb_dps->lb);
@@ -313,31 +327,46 @@ lr_stateful_lb_data_handler(struct engine_node *node, void *data_)
 
         HMAPX_FOR_EACH (hmapx_node, &data->trk_data.crupdated) {
             struct lr_stateful_record *lr_stateful_rec = hmapx_node->data;
+            if (lr_stateful_rebuild_vip_nats(lr_stateful_rec)) {
+                data->trk_data.vip_nats_changed = true;
+            }
             const struct ovn_datapath *od =
                 ovn_datapaths_find_by_index(input_data.lr_datapaths,
                                             lr_stateful_rec->lr_index);
             lr_stateful_rec->has_lb_vip = od_has_lb_vip(od);
+            lr_stateful_rec->has_distributed_lb = od->is_distributed;
         }
 
-        engine_set_node_state(node, EN_UPDATED);
+        return EN_HANDLED_UPDATED;
     }
 
-    return true;
+    return EN_HANDLED_UNCHANGED;
 }
 
-bool
+enum engine_input_handler_result
 lr_stateful_lr_nat_handler(struct engine_node *node, void *data_)
 {
     struct ed_type_lr_nat_data *lr_nat_data =
         engine_get_input_data("lr_nat", node);
 
     if (!lr_nat_has_tracked_data(&lr_nat_data->trk_data)) {
-        return false;
+        return EN_UNHANDLED;
     }
 
     struct lr_stateful_input input_data = lr_stateful_get_input_data(node);
     struct ed_type_lr_stateful *data = data_;
     struct hmapx_node *hmapx_node;
+
+    HMAPX_FOR_EACH (hmapx_node, &lr_nat_data->trk_data.deleted) {
+        struct lr_nat_record *lr_nat_rec = hmapx_node->data;
+        struct lr_stateful_record *lr_stateful_rec =
+            lr_stateful_table_find_by_uuid_(&data->table,
+                                             lr_nat_rec->nbr_uuid);
+        if (lr_stateful_rec) {
+            hmap_remove(&data->table.entries, &lr_stateful_rec->key_node);
+            hmapx_add(&data->trk_data.deleted, lr_stateful_rec);
+        }
+    }
 
     HMAPX_FOR_EACH (hmapx_node, &lr_nat_data->trk_data.crupdated) {
         const struct lr_nat_record *lrnat_rec = hmapx_node->data;
@@ -345,12 +374,19 @@ lr_stateful_lr_nat_handler(struct engine_node *node, void *data_)
                 ovn_datapaths_find_by_index(input_data.lr_datapaths,
                                             lrnat_rec->lr_index);
         struct lr_stateful_record *lr_stateful_rec =
-            lr_stateful_table_find_(&data->table, od->nbr);
+            lr_stateful_table_find_by_uuid_(&data->table, od->key);
         if (!lr_stateful_rec) {
             lr_stateful_rec =
                 lr_stateful_record_create(&data->table, lrnat_rec, od,
                                           input_data.lb_datapaths_map,
                                           input_data.lbgrp_datapaths_map);
+            if (!sset_is_empty(&lr_stateful_rec->vip_nats)) {
+                data->trk_data.vip_nats_changed = true;
+            }
+        } else {
+            if (lr_stateful_rebuild_vip_nats(lr_stateful_rec)) {
+                data->trk_data.vip_nats_changed = true;
+            }
         }
 
         /* Add the lr_stateful_rec rec to the tracking data. */
@@ -358,17 +394,17 @@ lr_stateful_lr_nat_handler(struct engine_node *node, void *data_)
     }
 
     if (lr_stateful_has_tracked_data(&data->trk_data)) {
-        engine_set_node_state(node, EN_UPDATED);
+        return EN_HANDLED_UPDATED;
     }
 
-    return true;
+    return EN_HANDLED_UNCHANGED;
 }
 
 const struct lr_stateful_record *
-lr_stateful_table_find_by_index(const struct lr_stateful_table *table,
-                                   size_t od_index)
+lr_stateful_table_find_by_uuid(const struct lr_stateful_table *table,
+                                   struct uuid nbr_uuid)
 {
-    return lr_stateful_table_find_by_index_(table, od_index);
+    return lr_stateful_table_find_by_uuid_(table, nbr_uuid);
 }
 
 /* static functions. */
@@ -394,9 +430,6 @@ lr_stateful_table_clear(struct lr_stateful_table *table)
     HMAP_FOR_EACH_POP (lr_stateful_rec, key_node, &table->entries) {
         lr_stateful_record_destroy(lr_stateful_rec);
     }
-
-    free(table->array);
-    table->array = NULL;
 }
 
 static void
@@ -406,8 +439,6 @@ lr_stateful_table_build(struct lr_stateful_table *table,
                         const struct hmap *lb_datapaths_map,
                         const struct hmap *lbgrp_datapaths_map)
 {
-    table->array = xrealloc(table->array,
-                            ods_size(lr_datapaths) * sizeof *table->array);
     const struct lr_nat_record *lrnat_rec;
     LR_NAT_TABLE_FOR_EACH (lrnat_rec, lr_nats) {
         const struct ovn_datapath *od =
@@ -418,26 +449,17 @@ lr_stateful_table_build(struct lr_stateful_table *table,
 }
 
 static struct lr_stateful_record *
-lr_stateful_table_find_(const struct lr_stateful_table *table,
-                        const struct nbrec_logical_router *nbr)
+lr_stateful_table_find_by_uuid_(const struct lr_stateful_table *table,
+                                struct uuid nbr_uuid)
 {
     struct lr_stateful_record *lr_stateful_rec;
-
     HMAP_FOR_EACH_WITH_HASH (lr_stateful_rec, key_node,
-                             uuid_hash(&nbr->header_.uuid), &table->entries) {
-        if (uuid_equals(&lr_stateful_rec->nbr_uuid, &nbr->header_.uuid)) {
+                             uuid_hash(&nbr_uuid), &table->entries) {
+        if (uuid_equals(&lr_stateful_rec->nbr_uuid, &nbr_uuid)) {
             return lr_stateful_rec;
         }
     }
     return NULL;
-}
-
-static struct lr_stateful_record *
-lr_stateful_table_find_by_index_(const struct lr_stateful_table *table,
-                                 size_t od_index)
-{
-    ovs_assert(od_index <= hmap_count(&table->entries));
-    return table->array[od_index];
 }
 
 static struct lr_stateful_record *
@@ -451,7 +473,7 @@ lr_stateful_record_create(struct lr_stateful_table *table,
         xzalloc(sizeof *lr_stateful_rec);
     lr_stateful_rec->nbr_uuid = od->nbr->header_.uuid;
     lr_stateful_rec->lrnat_rec = lrnat_rec;
-    lr_stateful_rec->lr_index = od->index;
+    lr_stateful_rec->lr_index = od->sdp->index;
     lr_stateful_rec->lflow_ref = lflow_ref_create();
 
 
@@ -509,24 +531,17 @@ lr_stateful_record_create(struct lr_stateful_table *table,
         build_lrouter_lb_reachable_ips(lr_stateful_rec, od, lb_dps->lb);
     }
 
+    sset_init(&lr_stateful_rec->vip_nats);
+
+    if (nbr->n_nat) {
+        lr_stateful_rebuild_vip_nats(lr_stateful_rec);
+    }
+
     lr_stateful_rec->has_lb_vip = od_has_lb_vip(od);
+    lr_stateful_rec->has_distributed_lb = od->is_distributed;
 
     hmap_insert(&table->entries, &lr_stateful_rec->key_node,
                 uuid_hash(&lr_stateful_rec->nbr_uuid));
-
-    table->array[od->index] = lr_stateful_rec;
-
-    /* Load balancers are not supported (yet) if a logical router has multiple
-     * distributed gateway port.  Log a warning. */
-    if (lr_stateful_rec->has_lb_vip && lr_has_multiple_gw_ports(od)) {
-        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
-        VLOG_WARN_RL(&rl, "Load-balancers are configured on logical "
-                     "router %s, which has %"PRIuSIZE" distributed "
-                     "gateway ports. Load-balancer is not supported "
-                     "yet when there is more than one distributed "
-                     "gateway port on the router.",
-                     od->nbr->name, od->n_l3dgw_ports);
-    }
 
     return lr_stateful_rec;
 }
@@ -535,6 +550,7 @@ static void
 lr_stateful_record_destroy(struct lr_stateful_record *lr_stateful_rec)
 {
     ovn_lb_ip_set_destroy(lr_stateful_rec->lb_ips);
+    sset_destroy(&lr_stateful_rec->vip_nats);
     lflow_ref_destroy(lr_stateful_rec->lflow_ref);
     free(lr_stateful_rec);
 }
@@ -648,4 +664,58 @@ remove_lrouter_lb_reachable_ips(struct lr_stateful_record *lr_stateful_rec,
         sset_find_and_delete(&lr_stateful_rec->lb_ips->ips_v6_reachable,
                              ip_address);
     }
+}
+
+static void
+update_lrouter_lb_adv_ips(struct lr_stateful_record *lr_stateful_rec,
+                          bool advertise,
+                          const struct sset *lb_ips_v4,
+                          const struct sset *lb_ips_v6)
+{
+    const char *ip_address;
+    SSET_FOR_EACH (ip_address, lb_ips_v4) {
+        if (advertise) {
+            sset_add(&lr_stateful_rec->lb_ips->ips_v4_adv, ip_address);
+        } else {
+            sset_find_and_delete(&lr_stateful_rec->lb_ips->ips_v4_adv,
+                                 ip_address);
+        }
+    }
+    SSET_FOR_EACH (ip_address, lb_ips_v6) {
+        if (advertise) {
+            sset_add(&lr_stateful_rec->lb_ips->ips_v6_adv, ip_address);
+        } else {
+            sset_find_and_delete(&lr_stateful_rec->lb_ips->ips_v6_adv,
+                                 ip_address);
+        }
+    }
+}
+
+static bool
+lr_stateful_rebuild_vip_nats(struct lr_stateful_record *lr_stateful_rec)
+{
+    struct sset old_vip_nats = SSET_INITIALIZER(&old_vip_nats);
+    sset_swap(&lr_stateful_rec->vip_nats, &old_vip_nats);
+
+    const char *external_ip;
+    SSET_FOR_EACH (external_ip, &lr_stateful_rec->lrnat_rec->external_ips) {
+        bool is_vip_nat = false;
+        if (addr_is_ipv6(external_ip)) {
+            is_vip_nat = sset_contains(&lr_stateful_rec->lb_ips->ips_v6,
+                                       external_ip);
+        } else {
+            is_vip_nat = sset_contains(&lr_stateful_rec->lb_ips->ips_v4,
+                                       external_ip);
+        }
+
+        if (is_vip_nat) {
+            sset_add(&lr_stateful_rec->vip_nats, external_ip);
+        }
+    }
+
+    bool vip_nats_changed = !sset_equals(&lr_stateful_rec->vip_nats,
+                                         &old_vip_nats);
+    sset_destroy(&old_vip_nats);
+
+    return vip_nats_changed;
 }

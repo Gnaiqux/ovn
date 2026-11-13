@@ -47,8 +47,11 @@
 #include "unixctl.h"
 #include "util.h"
 #include "random.h"
+#include "vec.h"
 
 VLOG_DEFINE_THIS_MODULE(ovntrace);
+
+static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
 
 /* --db: The database server to contact. */
 static const char *db;
@@ -103,7 +106,6 @@ int
 main(int argc, char *argv[])
 {
     ovn_set_program_name(argv[0]);
-    service_start(&argc, &argv);
     fatal_ignore_sigpipe();
     vlog_set_levels_from_string_assert("reconnect:warn");
 
@@ -195,7 +197,7 @@ parse_ct_option(const char *state_s_)
         ovs_fatal(0, "%s", ds_cstr(&ds));
     }
     if (!validate_ct_state(state, &ds)) {
-        VLOG_WARN("%s", ds_cstr(&ds));
+        VLOG_WARN_RL(&rl, "%s", ds_cstr(&ds));
     }
     ds_destroy(&ds);
 
@@ -429,8 +431,7 @@ struct ovntrace_datapath {
 
     struct ovs_list mcgroups;   /* Contains "struct ovntrace_mcgroup"s. */
 
-    struct ovntrace_flow **flows;
-    size_t n_flows, allocated_flows;
+    struct vector flows; /* Vector of struct ovntrace_flow *. */
 
     struct hmap mac_bindings;   /* Contains "struct ovntrace_mac_binding"s. */
     struct hmap fdbs;   /* Contains "struct ovntrace_fdb"s. */
@@ -553,7 +554,8 @@ ovntrace_datapath_find_by_name(const char *name)
         if (uuid_is_partial_match(&dp->sb_uuid, name) >= 4 ||
             uuid_is_partial_match(&dp->nb_uuid, name) >= 4) {
             if (match) {
-                VLOG_WARN("name \"%s\" matches multiple datapaths", name);
+                VLOG_WARN_RL(&rl, "name \"%s\" matches multiple datapaths",
+                             name);
                 return NULL;
             }
             match = dp;
@@ -582,6 +584,20 @@ ovntrace_port_find_by_key(const struct ovntrace_datapath *dp,
     SHASH_FOR_EACH (node, &ports) {
         const struct ovntrace_port *port = node->data;
         if (port->dp == dp && port->tunnel_key == tunnel_key) {
+            return port;
+        }
+    }
+    return NULL;
+}
+
+static const struct ovntrace_port *
+ovntrace_port_find_by_name(const struct ovntrace_datapath *dp,
+                           const char *name)
+{
+    const struct shash_node *node;
+    SHASH_FOR_EACH (node, &ports) {
+        const struct ovntrace_port *port = node->data;
+        if (port->dp == dp && !strcmp(port->name, name)) {
             return port;
         }
     }
@@ -689,8 +705,7 @@ read_datapaths(void)
         const struct smap *ids = &sbdb->external_ids;
 
         dp->sb_uuid = sbdb->header_.uuid;
-        if (!smap_get_uuid(ids, "logical-switch", &dp->nb_uuid) &&
-            !smap_get_uuid(ids, "logical-router", &dp->nb_uuid)) {
+        if (!datapath_get_nb_uuid(sbdb, &dp->nb_uuid)) {
             dp->nb_uuid = dp->sb_uuid;
         }
 
@@ -705,6 +720,7 @@ read_datapaths(void)
                              : shorten_uuid(dp->name2 ? dp->name2 : dp->name));
 
         dp->tunnel_key = sbdb->tunnel_key;
+        dp->flows = VECTOR_EMPTY_INITIALIZER(struct ovntrace_flow *);
 
         ovs_list_init(&dp->mcgroups);
         hmap_init(&dp->mac_bindings);
@@ -723,13 +739,13 @@ read_ports(void)
         struct ovntrace_datapath *dp
             = ovntrace_datapath_find_by_sb_uuid(&sbpb->datapath->header_.uuid);
         if (!dp) {
-            VLOG_WARN("logical port %s missing datapath", port_name);
+            VLOG_WARN_RL(&rl, "logical port %s missing datapath", port_name);
             continue;
         }
 
         struct ovntrace_port *port = xzalloc(sizeof *port);
         if (!shash_add_once(&ports, port_name, port)) {
-            VLOG_WARN("duplicate logical port name %s", port_name);
+            VLOG_WARN_RL(&rl, "duplicate logical port name %s", port_name);
             free(port);
             continue;
         }
@@ -774,11 +790,9 @@ read_ports(void)
         for (size_t i = 0; i < sbpb->n_port_security; i++) {
             if (!extract_lsp_addresses(sbpb->port_security[i],
                                         &port->ps_addrs[port->n_ps_addrs])) {
-                static struct vlog_rate_limit rl
-                    = VLOG_RATE_LIMIT_INIT(1, 1);
-                VLOG_INFO_RL(&rl, "invalid syntax '%s' in port "
-                            "security. No MAC address found",
-                            sbpb->port_security[i]);
+                VLOG_WARN_RL(&rl, "invalid syntax '%s' in port "
+                             "security. No MAC address found",
+                             sbpb->port_security[i]);
                 continue;
             }
             port->n_ps_addrs++;
@@ -823,8 +837,8 @@ read_mcgroups(void)
         struct ovntrace_datapath *dp
             = ovntrace_datapath_find_by_sb_uuid(&sbmg->datapath->header_.uuid);
         if (!dp) {
-            VLOG_WARN("logical multicast group %s missing datapath",
-                      sbmg->name);
+            VLOG_WARN_RL(&rl, "logical multicast group %s missing datapath",
+                         sbmg->name);
             continue;
         }
 
@@ -838,14 +852,14 @@ read_mcgroups(void)
             const char *port_name = sbmg->ports[i]->logical_port;
             struct ovntrace_port *p = shash_find_data(&ports, port_name);
             if (!p) {
-                VLOG_WARN("missing port %s", port_name);
+                VLOG_WARN_RL(&rl, "missing port %s", port_name);
                 continue;
             }
             if (!uuid_equals(&sbmg->ports[i]->datapath->header_.uuid,
                              &p->dp->sb_uuid)) {
-                VLOG_WARN("multicast group %s in datapath %s contains "
-                          "port %s outside that datapath",
-                          mcgroup->name, mcgroup->dp->name, port_name);
+                VLOG_WARN_RL(&rl, "multicast group %s in datapath %s contains "
+                             "port %s outside that datapath",
+                             mcgroup->name, mcgroup->dp->name, port_name);
                 continue;
             }
             mcgroup->ports[mcgroup->n_ports++] = p;
@@ -899,7 +913,7 @@ ovntrace_is_chassis_resident(const void *aux OVS_UNUSED,
         return true;
     }
 
-    VLOG_WARN("%s: unknown logical port\n", port_name);
+    VLOG_WARN_RL(&rl, "%s: unknown logical port\n", port_name);
     return false;
 }
 
@@ -967,49 +981,58 @@ parse_lflow_for_datapath(const struct sbrec_logical_flow *sblf,
         struct ovntrace_datapath *dp
             = ovntrace_datapath_find_by_sb_uuid(&sbdb->header_.uuid);
         if (!dp) {
-            VLOG_WARN("logical flow missing datapath");
+            VLOG_WARN_RL(&rl, "logical flow missing datapath");
             return;
         }
 
         char *error;
+        struct lex_str match_s;
+        if (!lexer_parse_template_string(&match_s, sblf->match,
+                                         &template_vars, NULL)) {
+            VLOG_WARN_RL(&rl, "%s: parsing expression failed", sblf->match);
+        }
         struct expr *match;
-        struct lex_str match_s = lexer_parse_template_string(sblf->match,
-                                                             &template_vars,
-                                                             NULL);
         match = expr_parse_string(lex_str_get(&match_s), &symtab,
                                   &address_sets, &port_groups, NULL, NULL,
                                   dp->tunnel_key, &error);
         lex_str_free(&match_s);
         if (error) {
-            VLOG_WARN("%s: parsing expression failed (%s)",
-                      sblf->match, error);
+            VLOG_WARN_RL(&rl, "%s: parsing expression failed (%s)",
+                         sblf->match, error);
             expr_destroy(match);
             free(error);
             return;
         }
 
+        bool ingress = !strcmp(sblf->pipeline, "ingress");
         struct ovnact_parse_params pp = {
             .symtab = &symtab,
             .dhcp_opts = &dhcp_opts,
             .dhcpv6_opts = &dhcpv6_opts,
             .nd_ra_opts = &nd_ra_opts,
             .controller_event_opts = &event_opts,
-            .pipeline = (!strcmp(sblf->pipeline, "ingress")
-                         ? OVNACT_P_INGRESS
-                         : OVNACT_P_EGRESS),
-            .n_tables = LOG_PIPELINE_LEN,
+            .pipeline = ingress ? OVNACT_P_INGRESS
+                                : OVNACT_P_EGRESS,
+            .n_tables = ingress ? LOG_PIPELINE_INGRESS_LEN
+                                : LOG_PIPELINE_EGRESS_LEN,
             .cur_ltable = sblf->table_id,
         };
         uint64_t stub[1024 / 8];
         struct ofpbuf ovnacts = OFPBUF_STUB_INITIALIZER(stub);
         struct expr *prereqs;
-        struct lex_str actions_s =
-            lexer_parse_template_string(sblf->actions, &template_vars, NULL);
+        struct lex_str actions_s;
+        if (!lexer_parse_template_string(&actions_s, sblf->actions,
+                                         &template_vars, NULL)) {
+            VLOG_WARN_RL(&rl, "%s: parsing actions failed", sblf->actions);
+            expr_destroy(match);
+            return;
+        }
         error = ovnacts_parse_string(lex_str_get(&actions_s), &pp, &ovnacts,
                                      &prereqs);
         lex_str_free(&actions_s);
         if (error) {
-            VLOG_WARN("%s: parsing actions failed (%s)", sblf->actions, error);
+            VLOG_WARN_RL(&rl, "%s: parsing actions failed (%s)", sblf->actions,
+                         error);
             free(error);
             expr_destroy(match);
             return;
@@ -1018,7 +1041,7 @@ parse_lflow_for_datapath(const struct sbrec_logical_flow *sblf,
         match = expr_combine(EXPR_T_AND, match, prereqs);
         match = expr_annotate(match, &symtab, &error);
         if (error) {
-            VLOG_WARN("match annotation failed (%s)", error);
+            VLOG_WARN_RL(&rl, "match annotation failed (%s)", error);
             free(error);
             expr_destroy(match);
             ovnacts_free(ovnacts.data, ovnacts.size);
@@ -1048,11 +1071,7 @@ parse_lflow_for_datapath(const struct sbrec_logical_flow *sblf,
         flow->ovnacts_len = ovnacts.size;
         flow->ovnacts = ofpbuf_steal_data(&ovnacts);
 
-        if (dp->n_flows >= dp->allocated_flows) {
-            dp->flows = x2nrealloc(dp->flows, &dp->allocated_flows,
-                                   sizeof *dp->flows);
-        }
-        dp->flows[dp->n_flows++] = flow;
+        vector_push(&dp->flows, &flow);
 }
 
 static void
@@ -1075,13 +1094,13 @@ read_flows(void)
             missing_datapath = false;
         }
         if (missing_datapath) {
-            VLOG_WARN("logical flow missing datapath");
+            VLOG_WARN_RL(&rl, "logical flow missing datapath");
         }
     }
 
-    const struct ovntrace_datapath *dp;
+    struct ovntrace_datapath *dp;
     HMAP_FOR_EACH (dp, sb_uuid_node, &datapaths) {
-        qsort(dp->flows, dp->n_flows, sizeof *dp->flows, compare_flow);
+        vector_qsort(&dp->flows, compare_flow);
     }
 }
 
@@ -1116,24 +1135,25 @@ read_mac_bindings(void)
         const struct ovntrace_port *port = shash_find_data(
             &ports, sbmb->logical_port);
         if (!port) {
-            VLOG_WARN("missing port %s", sbmb->logical_port);
+            VLOG_WARN_RL(&rl, "missing port %s", sbmb->logical_port);
             continue;
         }
 
         if (!uuid_equals(&port->dp->sb_uuid, &sbmb->datapath->header_.uuid)) {
-            VLOG_WARN("port %s is in wrong datapath", sbmb->logical_port);
+            VLOG_WARN_RL(&rl, "port %s is in wrong datapath",
+                         sbmb->logical_port);
             continue;
         }
 
         struct in6_addr ip6;
         if (!ip46_parse(sbmb->ip, &ip6)) {
-            VLOG_WARN("%s: bad IP address", sbmb->ip);
+            VLOG_WARN_RL(&rl, "%s: bad IP address", sbmb->ip);
             continue;
         }
 
         struct eth_addr mac;
         if (!eth_addr_from_string(sbmb->mac, &mac)) {
-            VLOG_WARN("%s: bad Ethernet address", sbmb->mac);
+            VLOG_WARN_RL(&rl, "%s: bad Ethernet address", sbmb->mac);
             continue;
         }
 
@@ -1153,7 +1173,7 @@ read_fdbs(void)
     SBREC_FDB_FOR_EACH (fdb, ovnsb_idl) {
         struct eth_addr mac;
         if (!eth_addr_from_string(fdb->mac, &mac)) {
-            VLOG_WARN("%s: bad Ethernet address", fdb->mac);
+            VLOG_WARN_RL(&rl, "%s: bad Ethernet address", fdb->mac);
             continue;
         }
 
@@ -1200,7 +1220,7 @@ ovntrace_port_lookup_by_name(const char *name)
 
         if (port->name2 && !strcmp(port->name2, name)) {
             if (match) {
-                VLOG_WARN("name \"%s\" matches multiple ports", name);
+                VLOG_WARN_RL(&rl, "name \"%s\" matches multiple ports", name);
                 return NULL;
             }
             match = port;
@@ -1216,7 +1236,8 @@ ovntrace_port_lookup_by_name(const char *name)
                 || (uuid_from_string(&name_uuid, port->name)
                     && uuid_is_partial_match(&name_uuid, name))) {
                 if (match && match != port) {
-                    VLOG_WARN("name \"%s\" matches multiple ports", name);
+                    VLOG_WARN_RL(&rl, "name \"%s\" matches multiple ports",
+                                 name);
                     return NULL;
                 }
                 match = port;
@@ -1260,7 +1281,7 @@ ovntrace_lookup_port(const void *dp_, const char *port_name,
         return true;
     }
 
-    VLOG_WARN("%s: unknown logical port", port_name);
+    VLOG_WARN_RL(&rl, "%s: unknown logical port", port_name);
     return false;
 }
 
@@ -1269,8 +1290,8 @@ ovntrace_flow_lookup(const struct ovntrace_datapath *dp,
                      const struct flow *uflow,
                      uint8_t table_id, enum ovnact_pipeline pipeline)
 {
-    for (size_t i = 0; i < dp->n_flows; i++) {
-        const struct ovntrace_flow *flow = dp->flows[i];
+    const struct ovntrace_flow *flow;
+    VECTOR_FOR_EACH (&dp->flows, flow) {
         if (flow->pipeline == pipeline &&
             flow->table_id == table_id &&
             expr_evaluate(flow->match, uflow, ovntrace_lookup_port, dp)) {
@@ -1284,8 +1305,8 @@ static char *
 ovntrace_stage_name(const struct ovntrace_datapath *dp,
                     uint8_t table_id, enum ovnact_pipeline pipeline)
 {
-    for (size_t i = 0; i < dp->n_flows; i++) {
-        const struct ovntrace_flow *flow = dp->flows[i];
+    const struct ovntrace_flow *flow;
+    VECTOR_FOR_EACH (&dp->flows, flow) {
         if (flow->pipeline == pipeline && flow->table_id == table_id) {
             return xstrdup(flow->stage_name);;
         }
@@ -1602,12 +1623,8 @@ execute_pop(const struct ovnact_push_pop *p, struct ofpbuf *stack,
     const void *src = nx_stack_pop(stack, &src_bytes);
     if (src) {
         union mf_subvalue sv;
-        uint8_t dst_bytes = DIV_ROUND_UP(sf.n_bits, 8);
+        memset(&sv, 0, sizeof sv);
 
-        if (src_bytes < dst_bytes) {
-            memset(&sv.u8[sizeof sv - dst_bytes], 0,
-                   dst_bytes - src_bytes);
-        }
         memcpy(&sv.u8[sizeof sv - src_bytes], src, src_bytes);
         mf_write_subfield_flow(&sf, &sv, uflow);
         mf_format_subvalue(&sv, &s);
@@ -1678,7 +1695,7 @@ execute_output(const struct ovntrace_datapath *dp, struct flow *uflow,
     }
 
     struct flow egress_uflow = *uflow;
-    for (int i = 0; i < FLOW_N_REGS; i++) {
+    for (int i = 0; i < OVN_FLOW_N_REGS_SUPPORTED; i++) {
         if (i != MFF_LOG_INPORT - MFF_REG0 &&
             i != MFF_LOG_OUTPORT - MFF_REG0) {
             egress_uflow.regs[i] = 0;
@@ -2226,6 +2243,39 @@ execute_lookup_mac_bind_ip(const struct ovnact_lookup_mac_bind_ip *bind,
 }
 
 static void
+execute_chk_evpn_arp(const struct ovnact_chk_evpn_arp *chk,
+                     const struct ovntrace_datapath *dp OVS_UNUSED,
+                     struct flow *uflow,
+                     struct ovs_list *super)
+{
+    /* Get IP address. */
+    struct mf_subfield ip_sf = expr_resolve_field(&chk->ip);
+    ovs_assert(ip_sf.n_bits == 32 || ip_sf.n_bits == 128);
+    union mf_subvalue ip_sv;
+    mf_read_subfield(&ip_sf, uflow, &ip_sv);
+    struct in6_addr ip = (ip_sf.n_bits == 32
+                          ? in6_addr_mapped_ipv4(ip_sv.ipv4)
+                          : ip_sv.ipv6);
+
+    struct ds ip_s = DS_EMPTY_INITIALIZER;
+    ipv6_format_mapped(&ip, &ip_s);
+
+    /* EVPN entries only exist in ovn-controller's OpenFlow tables
+     * (OFTABLE_EVPN_ARP_LOOKUP), not in the SB database, so
+     * ovn-trace cannot resolve them.  Report the miss and set
+     * the result to 0. */
+    ovntrace_node_append(super, OVNTRACE_NODE_ACTION,
+                         "/* EVPN ARP lookup for %s: "
+                         "not available in trace. */", ds_cstr(&ip_s));
+    ds_destroy(&ip_s);
+
+    /* Set the result bit to 0 (miss). */
+    struct mf_subfield dst = expr_resolve_field(&chk->dst);
+    union mf_subvalue sv = { .u8_val = 0 };
+    mf_write_subfield_flow(&dst, &sv, uflow);
+}
+
+static void
 execute_lookup_fdb(const struct ovnact_lookup_fdb *lookup_fdb,
                    const struct ovntrace_datapath *dp,
                    struct flow *uflow,
@@ -2426,6 +2476,24 @@ execute_dns_lookup(const struct ovnact_result *dl, struct flow *uflow,
                          "*** dns_lookup action not implemented");
 }
 
+/* Populate CT fields from the flow corresponding counterpart. */
+static void
+populate_ct_fields(struct flow *ct_flow, struct flow *original_flow)
+{
+    ct_flow->ct_nw_proto = original_flow->nw_proto;
+    /* L3 */
+    if (original_flow->dl_type == htons(ETH_TYPE_IP)) {
+        ct_flow->ct_nw_src = original_flow->nw_src;
+        ct_flow->ct_nw_dst = original_flow->nw_dst;
+    } else if (original_flow->dl_type == htons(ETH_TYPE_IPV6)) {
+        ct_flow->ct_ipv6_src = original_flow->ipv6_src;
+        ct_flow->ct_ipv6_dst = original_flow->ipv6_dst;
+    }
+    /* L4 */
+    ct_flow->ct_tp_src = original_flow->tp_src;
+    ct_flow->ct_tp_dst = original_flow->tp_dst;
+}
+
 static void
 execute_ct_next(const struct ovnact_ct_next *ct_next,
                 const struct ovntrace_datapath *dp, struct flow *uflow,
@@ -2447,6 +2515,8 @@ execute_ct_next(const struct ovnact_ct_next *ct_next,
     /* Trace the actions in the next table. */
     struct flow ct_flow = *uflow;
     ct_flow.ct_state = state;
+    populate_ct_fields(&ct_flow, uflow);
+
     trace__(dp, &ct_flow, ct_next->ltable, pipeline, &node->subs);
 
     /* Upon return, we will trace the actions following the ct action in the
@@ -2511,6 +2581,8 @@ execute_ct_nat(const struct ovnact_ct_nat *ct_nat,
         super, OVNTRACE_NODE_TRANSFORMATION, "%s", ds_cstr(&s));
     ds_destroy(&s);
 
+    populate_ct_fields(&ct_flow, uflow);
+
     /* Trace the actions in the next table. */
     trace__(dp, &ct_flow, ct_nat->ltable, pipeline, &node->subs);
 
@@ -2534,6 +2606,8 @@ ct_commit_to_zone__(const struct ovnact_ct_commit_to_zone *ct_nat,
 
     struct ovntrace_node *node = ovntrace_node_append(
         super, OVNTRACE_NODE_TRANSFORMATION, "%s", ds_cstr(action));
+
+    populate_ct_fields(&ct_flow, uflow);
 
     /* Trace the actions in the next table. */
     trace__(dp, &ct_flow, ct_nat->ltable, pipeline, &node->subs);
@@ -2582,7 +2656,7 @@ execute_ct_lb(const struct ovnact_ct_lb *ct_lb,
     if (family != AF_UNSPEC) {
         const struct ovnact_ct_lb_dst *dst = NULL;
         if (ct_lb->n_dsts) {
-            /* For ct_lb with addresses, choose one of the addresses. */
+            /* For ct_lb_* with addresses, choose one of the addresses. */
             int n = 0;
             for (int i = 0; i < ct_lb->n_dsts; i++) {
                 const struct ovnact_ct_lb_dst *d = &ct_lb->dsts[i];
@@ -2612,7 +2686,7 @@ execute_ct_lb(const struct ovnact_ct_lb *ct_lb,
                                      "(use --lb-dst)");
             }
         } else if (lb_dst.family == family) {
-            /* For ct_lb without addresses, use user-specified address. */
+            /* For ct_lb_* without addresses, use user-specified address. */
             dst = &lb_dst;
         }
 
@@ -2633,11 +2707,17 @@ execute_ct_lb(const struct ovnact_ct_lb *ct_lb,
         ct_lb_flow.ct_state |= next_ct_state(&comment);
     }
 
+    const char *action_type =
+        ct_lb->ovnact.type == OVNACT_CT_LB_MARK
+                              ? "ct_lb_mark"
+                              : "ct_lb_mark_local";
     struct ovntrace_node *node = ovntrace_node_append(
-        super, OVNTRACE_NODE_TRANSFORMATION, "%s%s",
-        ct_lb->ovnact.type == OVNACT_CT_LB_MARK ? "ct_lb_mark" : "ct_lb",
+        super, OVNTRACE_NODE_TRANSFORMATION, "%s%s", action_type,
         ds_cstr_ro(&comment));
     ds_destroy(&comment);
+
+    populate_ct_fields(&ct_lb_flow, uflow);
+
     trace__(dp, &ct_lb_flow, ct_lb->ltable, pipeline, &node->subs);
 }
 
@@ -2713,6 +2793,12 @@ execute_ovnfield_load(const struct ovnact_load *load,
         ovntrace_node_append(super, OVNTRACE_NODE_MODIFY,
                              "icmp6.frag_mtu = %u",
                              ntohs(load->imm.value.be16_int));
+        break;
+    }
+    case OVN_ICMP4_INNER_IP4_SRC: {
+        ovntrace_node_append(super, OVNTRACE_NODE_MODIFY,
+                             "icmp4.inner_ip4.src = "IP_FMT,
+                             IP_ARGS(load->imm.value.be32_int));
         break;
     }
     case OVN_FIELD_N_IDS:
@@ -3114,6 +3200,91 @@ execute_check_out_port_sec(const struct ovnact_result *dl,
 }
 
 static void
+execute_ct_save_state(const struct ovnact_result *dl, struct flow *uflow,
+                      struct ovs_list *super)
+{
+    struct mf_subfield sf = expr_resolve_field(&dl->dst);
+    union mf_subvalue sv = {
+        .u8_val = uflow->ct_state & CS_TRACKED ? uflow->ct_state : 0,
+    };
+    mf_write_subfield_flow(&sf, &sv, uflow);
+
+    struct ds s = DS_EMPTY_INITIALIZER;
+    expr_field_format(&dl->dst, &s);
+    ovntrace_node_append(super, OVNTRACE_NODE_ACTION, "/* %s = %"PRIu8"; */",
+                         ds_cstr(&s), sv.u8_val);
+    ds_destroy(&s);
+}
+
+static void
+execute_nf_lookup_orig_inport(const struct ovnact_nf_lookup *nf_lookup,
+                              struct flow *uflow, struct ovs_list *super)
+{
+    struct mf_subfield dst = expr_resolve_field(&nf_lookup->dst);
+    union mf_subvalue sv = { .u8_val = 0 };
+    mf_write_subfield_flow(&dst, &sv, uflow);
+    ovntrace_node_append(super, OVNTRACE_NODE_ACTION,
+                         "/* Assumed nf_lookup_orig_inport miss. */");
+}
+
+static void
+execute_ct_orig_tp_dst(const struct ovnact_result *res, struct flow *uflow,
+                       struct ovs_list *super)
+{
+    /* For ovn-trace, we simulate ct_tp_dst() by returning the current
+     * packet's destination port. */
+    struct mf_subfield sf = expr_resolve_field(&res->dst);
+    union mf_subvalue sv = { .be16_int = uflow->tp_dst };
+    mf_write_subfield_flow(&sf, &sv, uflow);
+
+    struct ds s = DS_EMPTY_INITIALIZER;
+    expr_field_format(&res->dst, &s);
+    ovntrace_node_append(super, OVNTRACE_NODE_MODIFY, "%s = %"PRIu16,
+                         ds_cstr(&s), ntohs(uflow->tp_dst));
+    ds_destroy(&s);
+}
+
+static void
+execute_ct_orig_proto(const struct ovnact_result *res, struct flow *uflow,
+                      struct ovs_list *super)
+{
+    /* For ovn-trace, we simulate ct_proto() by returning the current
+     * packet's protocol. */
+    struct mf_subfield sf = expr_resolve_field(&res->dst);
+    union mf_subvalue sv = { .u8_val = uflow->nw_proto };
+    mf_write_subfield_flow(&sf, &sv, uflow);
+
+    struct ds s = DS_EMPTY_INITIALIZER;
+    expr_field_format(&res->dst, &s);
+    ovntrace_node_append(super, OVNTRACE_NODE_MODIFY, "%s = %"PRIu8,
+                         ds_cstr(&s), uflow->nw_proto);
+    ds_destroy(&s);
+}
+
+static void
+execute_mirror(const struct ovnact_mirror *mirror,
+               const struct ovntrace_datapath *dp,
+               struct flow *uflow, struct ovs_list *super)
+{
+    const struct ovntrace_port *port;
+    struct flow cloned_flow = *uflow;
+    port = ovntrace_port_find_by_name(dp, mirror->port);
+
+    if (port) {
+        struct ovntrace_node *node = ovntrace_node_append(super,
+            OVNTRACE_NODE_TRANSFORMATION, "clone");
+
+        cloned_flow.regs[MFF_LOG_INPORT - MFF_REG0] = 0;
+        cloned_flow.regs[MFF_LOG_OUTPORT - MFF_REG0] = port->tunnel_key;
+
+        trace__(dp, &cloned_flow, 0, OVNACT_P_EGRESS, &node->subs);
+    } else {
+        ovntrace_node_append(super, OVNTRACE_NODE_ERROR,
+        "/* omitting output because no taget port found. */");
+    }
+}
+
+static void
 trace_actions(const struct ovnact *ovnacts, size_t ovnacts_len,
               const struct ovntrace_datapath *dp, struct flow *uflow,
               uint8_t table_id, enum ovnact_pipeline pipeline,
@@ -3206,13 +3377,15 @@ trace_actions(const struct ovnact *ovnacts, size_t ovnacts_len,
                            pipeline, super);
             break;
 
-        case OVNACT_CT_LB:
-            execute_ct_lb(ovnact_get_CT_LB(a), dp, uflow, pipeline, super);
-            break;
-
         case OVNACT_CT_LB_MARK:
             execute_ct_lb(ovnact_get_CT_LB_MARK(a), dp, uflow, pipeline,
                           super);
+            break;
+
+        case OVNACT_CT_LB_MARK_LOCAL:
+            /* Treat all ports as local. */
+            execute_ct_lb(ovnact_get_CT_LB_MARK_LOCAL(a), dp, uflow,
+                          pipeline, super);
             break;
 
         case OVNACT_SELECT:
@@ -3308,7 +3481,7 @@ trace_actions(const struct ovnact *ovnacts, size_t ovnacts_len,
             break;
 
         case OVNACT_PUT_ND_RA_OPTS:
-            execute_put_nd_ra_opts(ovnact_get_PUT_DHCPV6_OPTS(a),
+            execute_put_nd_ra_opts(ovnact_get_PUT_ND_RA_OPTS(a),
                                    "put_nd_ra_opts", uflow, super);
             break;
 
@@ -3420,6 +3593,12 @@ trace_actions(const struct ovnact *ovnacts, size_t ovnacts_len,
             execute_get_fdb(ovnact_get_GET_FDB(a), dp, uflow);
             break;
 
+        case OVNACT_GET_REMOTE_FDB:
+            ovntrace_node_append(super, OVNTRACE_NODE_OUTPUT,
+                                 "/* The remote FDB table is different"
+                                 " per each chassis. */");
+            break;
+
         case OVNACT_LOOKUP_FDB:
             execute_lookup_fdb(ovnact_get_LOOKUP_FDB(a), dp, uflow, super);
             break;
@@ -3433,12 +3612,11 @@ trace_actions(const struct ovnact *ovnacts, size_t ovnacts_len,
             execute_check_out_port_sec(ovnact_get_CHECK_OUT_PORT_SEC(a),
                                        dp, uflow);
             break;
-        case OVNACT_COMMIT_ECMP_NH:
+
+        case OVNACT_MIRROR:
+            execute_mirror(ovnact_get_MIRROR(a), dp, uflow, super);
             break;
-        case OVNACT_CHK_ECMP_NH_MAC:
-            break;
-        case OVNACT_CHK_ECMP_NH:
-            break;
+
         case OVNACT_COMMIT_LB_AFF:
             break;
         case OVNACT_CHK_LB_AFF:
@@ -3446,6 +3624,34 @@ trace_actions(const struct ovnact *ovnacts, size_t ovnacts_len,
         case OVNACT_SAMPLE:
             break;
         case OVNACT_MAC_CACHE_USE:
+            break;
+        case OVNACT_CT_ORIG_NW_DST:
+            break;
+        case OVNACT_CT_ORIG_IP6_DST:
+            break;
+        case OVNACT_CT_ORIG_TP_DST:
+            execute_ct_orig_tp_dst(ovnact_get_CT_ORIG_TP_DST(a), uflow, super);
+            break;
+        case OVNACT_CT_ORIG_PROTO:
+            execute_ct_orig_proto(ovnact_get_CT_ORIG_PROTO(a), uflow, super);
+            break;
+        case OVNACT_FLOOD_REMOTE:
+            ovntrace_node_append(super, OVNTRACE_NODE_OUTPUT,
+                                 "/* Flood to all remote chassis */");
+            break;
+        case OVNACT_CT_STATE_SAVE:
+            execute_ct_save_state(ovnact_get_CT_STATE_SAVE(a), uflow, super);
+            break;
+        case OVNACT_CHK_EVPN_ARP:
+            execute_chk_evpn_arp(ovnact_get_CHK_EVPN_ARP(a), dp, uflow,
+                                 super);
+            break;
+        case OVNACT_NF_LEARN_ORIG_INPORT:
+            /* Nothing to do for tracing. */
+            break;
+        case OVNACT_NF_LOOKUP_ORIG_INPORT:
+            execute_nf_lookup_orig_inport(
+                ovnact_get_NF_LOOKUP_ORIG_INPORT(a), uflow, super);
             break;
         }
     }
@@ -3482,8 +3688,8 @@ trace_openflow(const struct ovntrace_flow *f, struct ovs_list *super)
         ovntrace_node_append(super, OVNTRACE_NODE_ERROR,
                              "*** error obtaining flow stats (%s)",
                              ovs_strerror(error));
-        VLOG_WARN("%s: error obtaining flow stats (%s)",
-                  ovs, ovs_strerror(error));
+        VLOG_WARN_RL(&rl, "%s: error obtaining flow stats (%s)",
+                     ovs, ovs_strerror(error));
         return;
     }
 
@@ -3577,8 +3783,11 @@ trace_parse(const char *dp_s, const char *flow_s,
          *
          * First make sure that the expression parses. */
         char *error;
-        struct lex_str flow_exp_s =
-            lexer_parse_template_string(flow_s, &template_vars, NULL);
+        struct lex_str flow_exp_s;
+        if (!lexer_parse_template_string(&flow_exp_s, flow_s,
+                                         &template_vars, NULL)) {
+            return xasprintf("failed to parse flow expression \"%s\"", flow_s);
+        }
         struct expr *e = expr_parse_string(lex_str_get(&flow_exp_s), &symtab,
                                            &address_sets, &port_groups, NULL,
                                            NULL, 0, &error);
@@ -3607,8 +3816,11 @@ trace_parse(const char *dp_s, const char *flow_s,
         free(port_name);
     }
 
-    struct lex_str flow_exp_s =
-        lexer_parse_template_string(flow_s, &template_vars, NULL);
+    struct lex_str flow_exp_s;
+    if (!lexer_parse_template_string(&flow_exp_s, flow_s,
+                                     &template_vars, NULL)) {
+        return xasprintf("failed to parse flow expression \"%s\"", flow_s);
+    }
     char *error = expr_parse_microflow(lex_str_get(&flow_exp_s), &symtab,
                                        &address_sets, &port_groups,
                                        ovntrace_lookup_port, *dpp, uflow);
@@ -3645,7 +3857,8 @@ trace(const char *dp_s, const char *flow_s)
     if (ovs) {
         int retval = vconn_open_block(ovs, 1 << OFP15_VERSION, 0, -1, &vconn);
         if (retval) {
-            VLOG_WARN("%s: connection failed (%s)", ovs, ovs_strerror(retval));
+            VLOG_WARN_RL(&rl, "%s: connection failed (%s)",
+                         ovs, ovs_strerror(retval));
         }
     }
 

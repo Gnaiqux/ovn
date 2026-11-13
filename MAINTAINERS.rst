@@ -41,20 +41,18 @@ This is the current list of active OVN committers:
 
    * - Name
      - Email
+   * - Aleš Musil
+     - amusil@redhat.com
    * - Dumitru Ceara
      - dceara@redhat.com
-   * - Gurucharan Shetty
-     - guru@ovn.org
    * - Han Zhou
      - hzhou@ovn.org
-   * - Justin Pettit
-     - jpettit@ovn.org
    * - Leonid Ryzhyk
      - lryzhyk@vmware.com
    * - Mark Michelson
      - mmichels@redhat.com
    * - Numan Siddique
-     - nusddiq@redhat.com
+     - numans@ovn.org
 
 The project also maintains a list of Emeritus Committers (or Maintainers).
 More information about Emeritus Committers can be found here:
@@ -67,6 +65,10 @@ More information about Emeritus Committers can be found here:
      - Email
    * - Ben Pfaff
      - blp@ovn.org
+   * - Gurucharan Shetty
+     - guru@ovn.org
+   * - Justin Pettit
+     - jpettit@ovn.org
    * - Russell Bryant
      - russell@ovn.org
 

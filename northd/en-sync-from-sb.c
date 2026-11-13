@@ -27,9 +27,6 @@
 #include "lib/ovn-nb-idl.h"
 #include "lib/ovn-sb-idl.h"
 #include "lib/ovn-util.h"
-#include "stopwatch.h"
-#include "lib/stopwatch-names.h"
-#include "timeval.h"
 #include "northd.h"
 
 #include "openvswitch/vlog.h"
@@ -43,7 +40,7 @@ en_sync_from_sb_init(struct engine_node *node OVS_UNUSED,
     return NULL;
 }
 
-void
+enum engine_node_state
 en_sync_from_sb_run(struct engine_node *node, void *data OVS_UNUSED)
 {
     const struct engine_context *eng_ctx = engine_get_context();
@@ -53,14 +50,20 @@ en_sync_from_sb_run(struct engine_node *node, void *data OVS_UNUSED)
         EN_OVSDB_GET(engine_get_input("SB_port_binding", node));
     const struct sbrec_ha_chassis_group_table *sb_ha_ch_grp_table =
         EN_OVSDB_GET(engine_get_input("SB_ha_chassis_group", node));
-    stopwatch_start(OVNSB_DB_RUN_STOPWATCH_NAME, time_msec());
-    ovnsb_db_run(eng_ctx->ovnnb_idl_txn, eng_ctx->ovnsb_idl_txn,
+    struct ovsdb_idl_index *sbrec_service_monitor_by_service_type =
+        engine_ovsdb_node_get_index(
+            engine_get_input("SB_service_monitor", node),
+            "sbrec_service_monitor_by_service_type");
+
+    ovnsb_db_run(eng_ctx->ovnsb_idl_txn,
                  sb_pb_table, sb_ha_ch_grp_table,
+                 sbrec_service_monitor_by_service_type,
                  &nd->ls_ports, &nd->lr_ports);
-    stopwatch_stop(OVNSB_DB_RUN_STOPWATCH_NAME, time_msec());
+
+    return EN_UNCHANGED;
 }
 
-bool
+enum engine_input_handler_result
 sync_from_sb_northd_handler(struct engine_node *node,
                             void *data OVS_UNUSED)
 {
@@ -72,9 +75,9 @@ sync_from_sb_northd_handler(struct engine_node *node,
          * cares about is the "up" column of LSP, which is considered
          * write-only to this node, so it is safe to ignore the change. (The
          * real change matters to this node is always from the SB DB.) */
-        return true;
+        return EN_HANDLED_UNCHANGED;
     }
-    return false;
+    return EN_UNHANDLED;
 }
 
 void

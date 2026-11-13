@@ -19,6 +19,7 @@
 #include "dirs.h"
 #include "latch.h"
 #include "lflow.h"
+#include "lib/vec.h"
 #include "mac-cache.h"
 #include "openvswitch/ofp-errors.h"
 #include "openvswitch/ofp-flow.h"
@@ -33,12 +34,19 @@
 #include "seq.h"
 #include "socket-util.h"
 #include "statctrl.h"
+#include "stopwatch.h"
+#include "uuidset.h"
 
 VLOG_DEFINE_THIS_MODULE(statctrl);
+
+#define STATS_VEC_CAPACITY_THRESHOLD 1024
+#define STATS_DRAIN_INTERVAL 3000
+#define STATS_MIN_BATCH_SIZE 500
 
 enum stat_type {
     STATS_MAC_BINDING = 0,
     STATS_FDB,
+    STATS_MAC_BINDING_PROBE,
     STATS_MAX,
 };
 
@@ -51,42 +59,55 @@ struct stats_node {
     int64_t next_request_timestamp;
     /* Request delay in ms. */
     uint64_t request_delay;
-    /* List of processed statistics. */
-    struct ovs_list stats_list;
-    /* Function to clean up the node.
-     * This function runs in main thread. */
-    void (*destroy)(struct ovs_list *stats_list);
+    /* Vector of processed statistics. */
+    struct vector stats;
+    /* UUIDs whose timestamps should be updated. */
+    struct uuidset pending;
+    /* Timestamp when the next batch should be drained. */
+    int64_t next_drain_timestamp;
     /* Function to process the response and store it in the list.
      * This function runs in statctrl thread locked behind mutex. */
-    void (*process_flow_stats)(struct ovs_list *stats_list,
+    void (*process_flow_stats)(struct vector *stats,
                                struct ofputil_flow_stats *ofp_stats);
     /* Function to process the parsed stats.
      * This function runs in main thread locked behind mutex. */
-    void (*run)(struct ovs_list *stats_list, uint64_t *req_delay, void *data);
+    void (*run)(struct vector *stats, uint64_t *req_delay, void *data,
+                struct uuidset *pending, long long timewall_now);
+    /* Function to drain a batch of pending timestamp updates. */
+    void (*drain)(struct ovsdb_idl_txn *txn, struct uuidset *pending,
+                  size_t batch_size, long long timewall_now);
+    /* Name of the stats node. */
+    const char *name;
 };
 
-#define STATS_NODE(NAME, REQUEST, DESTROY, PROCESS, RUN)                   \
-    statctrl_ctx.nodes[STATS_##NAME] = (struct stats_node) {               \
-        .request = REQUEST,                                                \
-        .xid = 0,                                                          \
-        .next_request_timestamp = INT64_MAX,                               \
-        .request_delay = 0,                                                \
-        .stats_list =                                                      \
-            OVS_LIST_INITIALIZER(                                          \
-                &statctrl_ctx.nodes[STATS_##NAME].stats_list),             \
-        .destroy = DESTROY,                                                \
-        .process_flow_stats = PROCESS,                                     \
-        .run = RUN                                                         \
-    };
+#define STATS_NODE(NAME, REQUEST, STAT_TYPE, PROCESS, RUN, DRAIN)          \
+    do {                                                                   \
+        statctrl_ctx.nodes[STATS_##NAME] = (struct stats_node) {           \
+            .request = REQUEST,                                            \
+            .xid = 0,                                                      \
+            .next_request_timestamp = INT64_MAX,                           \
+            .request_delay = 0,                                            \
+            .stats = VECTOR_EMPTY_INITIALIZER(STAT_TYPE),                  \
+            .next_drain_timestamp = INT64_MAX,                             \
+            .process_flow_stats = PROCESS,                                 \
+            .run = RUN,                                                    \
+            .drain = DRAIN,                                                \
+            .name = OVS_STRINGIZE(stats_##NAME),                           \
+        };                                                                 \
+        uuidset_init(&statctrl_ctx.nodes[STATS_##NAME].pending);           \
+        stopwatch_create(OVS_STRINGIZE(stats_##NAME), SW_MS);              \
+    } while (0)
 
 struct statctrl_ctx {
-    char *br_int;
+    /* OpenFlow connection to the switch. */
+    struct rconn *swconn;
 
     pthread_t thread;
     struct latch exit_latch;
 
     struct seq *thread_seq;
     struct seq *main_seq;
+    uint64_t new_main_seq;
 
     struct stats_node nodes[STATS_MAX];
 };
@@ -95,8 +116,6 @@ static struct statctrl_ctx statctrl_ctx;
 static struct ovs_mutex mutex;
 
 static void *statctrl_thread_handler(void *arg);
-static void statctrl_rconn_setup(struct rconn *swconn, char *conn_target)
-    OVS_REQUIRES(mutex);
 static void statctrl_handle_rconn_msg(struct rconn *swconn,
                                       struct statctrl_ctx *ctx,
                                       struct ofpbuf *msg);
@@ -109,8 +128,6 @@ static void statctrl_send_request(struct rconn *swconn,
                                   struct statctrl_ctx *ctx)
     OVS_REQUIRES(mutex);
 static void statctrl_notify_main_thread(struct statctrl_ctx *ctx);
-static void statctrl_set_conn_target(const char *br_int_name)
-    OVS_REQUIRES(mutex);
 static void statctrl_wait_next_request(struct statctrl_ctx *ctx)
     OVS_REQUIRES(mutex);
 static bool statctrl_update_next_request_timestamp(struct stats_node *node,
@@ -121,11 +138,12 @@ static bool statctrl_update_next_request_timestamp(struct stats_node *node,
 void
 statctrl_init(void)
 {
-    statctrl_ctx.br_int = NULL;
+    statctrl_ctx.swconn = rconn_create(0, 0, DSCP_DEFAULT, 1 << OFP15_VERSION);
     latch_init(&statctrl_ctx.exit_latch);
     ovs_mutex_init(&mutex);
     statctrl_ctx.thread_seq = seq_create();
     statctrl_ctx.main_seq = seq_create();
+    statctrl_ctx.new_main_seq = seq_read(statctrl_ctx.main_seq);
 
     /* Definition of all stat nodes. */
     struct ofputil_flow_stats_request mac_binding_request = {
@@ -135,8 +153,9 @@ statctrl_init(void)
             .out_group = OFPG_ANY,
             .table_id = OFTABLE_MAC_CACHE_USE,
     };
-    STATS_NODE(MAC_BINDING, mac_binding_request, mac_cache_stats_destroy,
-               mac_binding_stats_process_flow_stats, mac_binding_stats_run);
+    STATS_NODE(MAC_BINDING, mac_binding_request, struct mac_cache_stats,
+               mac_binding_stats_process_flow_stats, mac_binding_stats_run,
+               mac_binding_stats_drain);
 
     struct ofputil_flow_stats_request fdb_request = {
             .cookie = htonll(0),
@@ -145,8 +164,21 @@ statctrl_init(void)
             .out_group = OFPG_ANY,
             .table_id = OFTABLE_LOOKUP_FDB,
     };
-    STATS_NODE(FDB, fdb_request, mac_cache_stats_destroy,
-               fdb_stats_process_flow_stats, fdb_stats_run);
+    STATS_NODE(FDB, fdb_request, struct mac_cache_stats,
+               fdb_stats_process_flow_stats, fdb_stats_run,
+               fdb_stats_drain);
+
+    struct ofputil_flow_stats_request mac_binding_probe_request = {
+            .cookie = htonll(0),
+            .cookie_mask = htonll(0),
+            .out_port = OFPP_ANY,
+            .out_group = OFPG_ANY,
+            .table_id = OFTABLE_MAC_BINDING,
+    };
+    STATS_NODE(MAC_BINDING_PROBE, mac_binding_probe_request,
+               struct mac_cache_stats,
+               mac_binding_probe_stats_process_flow_stats,
+               mac_binding_probe_stats_run, NULL);
 
     statctrl_ctx.thread = ovs_thread_create("ovn_statctrl",
                                             statctrl_thread_handler,
@@ -155,26 +187,88 @@ statctrl_init(void)
 
 void
 statctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
+             struct ovsdb_idl_index *sbrec_port_binding_by_name,
+             const struct sbrec_chassis *chassis,
              struct mac_cache_data *mac_cache_data)
 {
     if (!ovnsb_idl_txn) {
         return;
     }
 
-    void *node_data[STATS_MAX] = {mac_cache_data, mac_cache_data};
+    struct mac_binding_probe_data mac_binding_probe_data = {
+        .cache_data = mac_cache_data,
+        .mac_binding_pending = &statctrl_ctx.nodes[STATS_MAC_BINDING].pending,
+        .sbrec_port_binding_by_name = sbrec_port_binding_by_name,
+        .swconn = statctrl_ctx.swconn,
+        .chassis = chassis,
+    };
+
+    void *node_data[STATS_MAX] = {
+        [STATS_MAC_BINDING] = mac_cache_data,
+        [STATS_FDB] = mac_cache_data,
+        [STATS_MAC_BINDING_PROBE] = &mac_binding_probe_data,
+    };
 
     bool schedule_updated = false;
     long long now = time_msec();
+    long long timewall_now = time_wall_msec();
 
     ovs_mutex_lock(&mutex);
+    statctrl_ctx.new_main_seq = seq_read(statctrl_ctx.main_seq);
     for (size_t i = 0; i < STATS_MAX; i++) {
         struct stats_node *node = &statctrl_ctx.nodes[i];
         uint64_t prev_delay = node->request_delay;
+        size_t prev_pending_count = uuidset_count(&node->pending);
 
-        node->run(&node->stats_list, &node->request_delay, node_data[i]);
+        stopwatch_start(node->name, time_msec());
+        node->run(&node->stats, &node->request_delay, node_data[i],
+                  &node->pending, timewall_now);
+        now = time_msec();
+        vector_clear(&node->stats);
+        if (vector_capacity(&node->stats) >= STATS_VEC_CAPACITY_THRESHOLD) {
+            VLOG_DBG("The statistics vector for node '%s' capacity "
+                     "(%"PRIuSIZE") is over threshold.", node->name,
+                     vector_capacity(&node->stats));
+            vector_shrink_to_fit(&node->stats);
+        }
+        stopwatch_stop(node->name, time_msec());
 
         schedule_updated |=
                 statctrl_update_next_request_timestamp(node, now, prev_delay);
+
+        if (!node->drain) {
+            continue;
+        }
+
+        size_t pending_count = uuidset_count(&node->pending);
+        if (pending_count != prev_pending_count && pending_count &&
+            node->next_drain_timestamp == INT64_MAX) {
+            node->next_drain_timestamp = now;
+        }
+
+        if (now < node->next_drain_timestamp) {
+            continue;
+        }
+
+        /* Distribute pending updates over the remaining fixed drain intervals
+         * before the next statistics request, subject to the minimum batch
+         * size. */
+        uint64_t slots = 1;
+        if (node->next_request_timestamp != INT64_MAX &&
+            node->next_request_timestamp > now) {
+            slots = MAX((node->next_request_timestamp - now)
+                        / STATS_DRAIN_INTERVAL, 1);
+        }
+        size_t batch_size = MAX(STATS_MIN_BATCH_SIZE,
+                                (pending_count / slots) + 1);
+
+        stopwatch_start(node->name, time_msec());
+        node->drain(ovnsb_idl_txn, &node->pending, batch_size,
+                    timewall_now);
+        node->next_drain_timestamp = uuidset_is_empty(&node->pending)
+                                     ? INT64_MAX
+                                     : now + STATS_DRAIN_INTERVAL;
+        stopwatch_stop(node->name, time_msec());
     }
     ovs_mutex_unlock(&mutex);
 
@@ -184,11 +278,14 @@ statctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
 }
 
 void
-statctrl_update(const char *br_int_name)
+statctrl_update_swconn(const char *target, int probe_interval)
 {
-    ovs_mutex_lock(&mutex);
-    statctrl_set_conn_target(br_int_name);
-    ovs_mutex_unlock(&mutex);
+    if (ovn_update_swconn_at(statctrl_ctx.swconn, target,
+                             probe_interval, "statctrl")) {
+        /* Notify statctrl thread that integration bridge
+         * target is set/changed. */
+        seq_change(statctrl_ctx.thread_seq);
+    }
 }
 
 void
@@ -201,12 +298,14 @@ statctrl_wait(struct ovsdb_idl_txn *ovnsb_idl_txn)
     ovs_mutex_lock(&mutex);
     for (size_t i = 0; i < STATS_MAX; i++) {
         struct stats_node *node = &statctrl_ctx.nodes[i];
-        if (!ovs_list_is_empty(&node->stats_list)) {
+        if (!vector_is_empty(&node->stats)) {
             poll_immediate_wake();
         }
+        if (node->next_drain_timestamp != INT64_MAX) {
+            poll_timer_wait_until(node->next_drain_timestamp);
+        }
     }
-    int64_t new_seq = seq_read(statctrl_ctx.main_seq);
-    seq_wait(statctrl_ctx.main_seq, new_seq);
+    seq_wait(statctrl_ctx.main_seq, statctrl_ctx.new_main_seq);
     ovs_mutex_unlock(&mutex);
 }
 
@@ -216,13 +315,14 @@ statctrl_destroy(void)
     latch_set(&statctrl_ctx.exit_latch);
     pthread_join(statctrl_ctx.thread, NULL);
     latch_destroy(&statctrl_ctx.exit_latch);
-    free(statctrl_ctx.br_int);
+    rconn_destroy(statctrl_ctx.swconn);
     seq_destroy(statctrl_ctx.thread_seq);
     seq_destroy(statctrl_ctx.main_seq);
 
     for (size_t i = 0; i < STATS_MAX; i++) {
         struct stats_node *node = &statctrl_ctx.nodes[i];
-        node->destroy(&node->stats_list);
+        vector_destroy(&node->stats);
+        uuidset_destroy(&node->pending);
     }
 }
 
@@ -232,14 +332,9 @@ statctrl_thread_handler(void *arg)
     struct statctrl_ctx *ctx = arg;
 
     /* OpenFlow connection to the switch. */
-    struct rconn *swconn = rconn_create(0, 0, DSCP_DEFAULT,
-                                        1 << OFP15_VERSION);
+    struct rconn *swconn = ctx->swconn;
 
     while (!latch_is_set(&ctx->exit_latch)) {
-        ovs_mutex_lock(&mutex);
-        statctrl_rconn_setup(swconn, ctx->br_int);
-        ovs_mutex_unlock(&mutex);
-
         rconn_run(swconn);
         uint64_t new_seq = seq_read(ctx->thread_seq);
 
@@ -272,27 +367,7 @@ statctrl_thread_handler(void *arg)
         poll_block();
     }
 
-    rconn_destroy(swconn);
     return NULL;
-}
-
-static void
-statctrl_rconn_setup(struct rconn *swconn, char *br_int)
-    OVS_REQUIRES(mutex)
-{
-    if (!br_int) {
-        rconn_disconnect(swconn);
-        return;
-    }
-
-    char *conn_target = xasprintf("unix:%s/%s.mgmt", ovs_rundir(), br_int);
-
-    if (strcmp(conn_target, rconn_get_target(swconn))) {
-        VLOG_INFO("%s: connecting to switch", conn_target);
-        rconn_connect(swconn, conn_target, conn_target);
-    }
-
-    free(conn_target);
 }
 
 static void
@@ -357,7 +432,7 @@ statctrl_decode_statistics_reply(struct stats_node *node, struct ofpbuf *msg)
             break;
         }
 
-        node->process_flow_stats(&node->stats_list, &fs);
+        node->process_flow_stats(&node->stats, &fs);
     }
 
     ofpbuf_uninit(&ofpacts);
@@ -392,27 +467,10 @@ static void
 statctrl_notify_main_thread(struct statctrl_ctx *ctx)
 {
     for (size_t i = 0; i < STATS_MAX; i++) {
-        if (!ovs_list_is_empty(&ctx->nodes[i].stats_list)) {
+        if (!vector_is_empty(&ctx->nodes[i].stats)) {
             seq_change(ctx->main_seq);
             return;
         }
-    }
-}
-
-static void
-statctrl_set_conn_target(const char *br_int_name)
-    OVS_REQUIRES(mutex)
-{
-    if (!br_int_name) {
-        return;
-    }
-
-
-    if (!statctrl_ctx.br_int || strcmp(statctrl_ctx.br_int, br_int_name)) {
-        free(statctrl_ctx.br_int);
-        statctrl_ctx.br_int = xstrdup(br_int_name);
-        /* Notify statctrl thread that integration bridge is set/changed. */
-        seq_change(statctrl_ctx.thread_seq);
     }
 }
 

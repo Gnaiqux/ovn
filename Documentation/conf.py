@@ -106,8 +106,8 @@ html_static_path = ['_static']
 # One entry per manual page. List of tuples
 # (source start file, name, description, authors, manual section).
 _man_pages = [
-    ('ovn-sim.1',
-     u'Open Virtual Network simulator environment'),
+    ('ovn-logical-flows.7',
+     u'OVN logical flow table reference'),
 ]
 
 # Generate list of (path, name, description, [author, ...], section)

@@ -7,6 +7,13 @@
 m4_define([M_NS_EXEC],
     [podman exec $1 ip netns exec $2 $3])
 
+# M_NS_DAEMONIZE([fake_node],[namespace],[command],[pidfile])
+m4_define([M_NS_DAEMONIZE],
+    [podman exec $1 ip netns exec $2 $3 & echo $! > $4
+     echo "kill \`cat $4\` 2>/dev/null" >> cleanup
+    ]
+)
+
 # M_NS_CHECK_EXEC([fake_node], [namespace], [command], other_params...)
 #
 # Wrapper for AT_CHECK that executes 'command' inside 'fake_node''s namespace'.
@@ -14,6 +21,138 @@ m4_define([M_NS_EXEC],
 m4_define([M_NS_CHECK_EXEC],
     [ AT_CHECK([M_NS_EXEC([$1], [$2], [$3])], m4_shift(m4_shift(m4_shift($@)))) ]
 )
+
+# M_DAEMONIZE([fake_node],[command],[pidfile])
+m4_define([M_DAEMONIZE],
+    [podman exec $1 $2 & echo $! > $3
+     echo "kill \`cat $3\`" >> cleanup
+    ]
+)
+
+# M_START_TCPDUMP([fake_node], [params], [name])
+#
+# Helper to properly start tcpdump and wait for the startup.
+# The tcpdump output is available in <name>.tcpdump file.
+m4_define([M_START_TCPDUMP],
+    [
+     podman exec $1 tcpdump -l $2 >$3.tcpdump 2>$3.stderr &
+     echo "podman exec $1 ps -ef | grep -v grep | grep tcpdump && podman exec $1 killall tcpdump" >> cleanup
+     OVS_WAIT_UNTIL([grep -q "listening" $3.stderr])
+    ]
+)
+
+m4_define([M_START_TCPDUMPS_RECURSIVE_], [
+     m4_if(m4_eval($# >= 3), [1], [dnl
+        names="$names $3"
+        echo "Running podman exec $1 tcpdump -l $2 >$3.tcpdump 2>$3.stderr"
+        podman exec $1 tcpdump -l $2 >$3.tcpdump 2>$3.stderr &
+        echo "podman exec $1 ps -ef | grep -v grep | grep tcpdump && podman exec $1 killall tcpdump" >> cleanup
+        M_START_TCPDUMPS_RECURSIVE_(m4_shift(m4_shift(m4_shift($@))))
+        ])
+    ]
+)
+
+# M_START_TCPDUMPS([fake node1], [params1], [name1],
+#                  [fake node2], [params2], [name2], ...)
+# Start multiple tcpdump. Useful to speed up when many tcpdump
+# must be started as waiting for "listening" takes usually 1 second.
+m4_define([M_START_TCPDUMPS],
+    [
+     names=""
+     M_START_TCPDUMPS_RECURSIVE_($@)
+     for name in $names; do
+         OVS_WAIT_UNTIL([grep -q "listening" ${name}.stderr])
+     done
+    ]
+)
+
+# M_FORMAT_CT([ip-addr])
+#
+# Strip content from the piped input which would differ from test to test
+# and limit the output to the rows containing 'ip-addr'.
+#
+m4_define([M_FORMAT_CT],
+    [[grep -F "dst=$1," | sed -e 's/id=[0-9]*/id=<cleared>/g' -e 's/state=[0-9_A-Z]*/state=<cleared>/g' | sort | uniq | sed -e 's/zone=[[0-9]]*/zone=<cleared>/' -e 's/mark=[[0-9]]*/mark=<cleared>/' ]])
+
+# OVN_CURL([CURL_ARGS])
+#
+# Execute curl with version-agnostic -w output formatting.
+# On unsuccessful connections, output also contains "Connected to () port -1" and the http
+# code (e.g. 000) from the -w format, but those are harmless as failure detection uses grep.
+m4_define([OVN_CURL], [curl -s -S -o /dev/null -w "Connected to %{remote_ip} (%{remote_ip}) port %{remote_port}\n%{http_code}\n" $1 2>&1 | sed "s/^200$/200 OK/"])
+
+# CHECK_VRF()
+#
+# Perform a requirements check for running VRF tests.
+#
+m4_define([CHECK_VRF],
+[
+    rc=0
+    modprobe vrf || rc=$?
+    AT_SKIP_IF([test $rc -ne 0])
+    on_exit 'modprobe -r vrf'
+])
+
+# OVN_ROUTE_EQUAL_([fake_node], [ns], [vrf], [string to compare])
+#
+# Will dump all v4 routes in the mentioned vrf. Trailing spaces will be removed
+# and "proto 84" is converted to "proto ovn" for compatibility.
+m4_define([OVN_ROUTE_EQUAL_],
+  [
+    if test -n "$2"; then
+        ns_prefix="ip netns exec $2"
+    else
+        ns_prefix=""
+    fi
+    prefix="podman exec $1 $ns_prefix"
+    OVS_WAIT_UNTIL_EQUAL([$prefix ip route list vrf $3 | \
+        sed -e 's|[[[[:space:]]]]*$||g' -e 's|proto 84|proto ovn|' | \
+        sed -e 's|nhid [[0-9]]* ||g'], [$4])
+  ]
+)
+
+# OVN_ROUTE_EQUAL([fake_node], [vrf], [string to compare])
+#
+# Will dump all v4 routes in the mentioned vrf. Trailing spaces will be removed
+# and "proto 84" is converted to "proto ovn" for compatibility.
+m4_define([OVN_ROUTE_EQUAL], [OVN_ROUTE_EQUAL_([$1], [], [$2], [$3])])
+
+# NS_OVN_ROUTE_EQUAL([fake_node], [ns], [vrf], [string to compare])
+#
+# Will dump all v4 routes in the mentioned vrf. Trailing spaces will be removed
+# and "proto 84" is converted to "proto ovn" for compatibility.
+m4_define([NS_OVN_ROUTE_EQUAL], [OVN_ROUTE_EQUAL_([$1], [$2], [$3], [$4])])
+
+# OVN_ROUTE_V6_EQUAL_([fake_node], [ns], [vrf], [string to compare])
+#
+# Will dump all v6 routes in the mentioned vrf. Trailing spaces will be removed
+# and "proto 84" is converted to "proto ovn" for compatibility.
+m4_define([OVN_ROUTE_V6_EQUAL_],
+  [
+    if test -n "$2"; then
+        ns_prefix="ip netns exec $2"
+    else
+        ns_prefix=""
+    fi
+    prefix="podman exec $1 $ns_prefix"
+    OVS_WAIT_UNTIL_EQUAL([$prefix ip -6 route list vrf $3 | \
+        grep -v anycast | grep -v multicast | \
+        sed -e 's|[[[[:space:]]]]*$||g' -e 's|proto 84|proto ovn|' | \
+        sed -e 's|nhid [[0-9]]* ||g'], [$4])
+  ]
+)
+
+# OVN_ROUTE_V6_EQUAL([fake_node], [vrf], [string to compare])
+#
+# Will dump all v6 routes in the mentioned vrf. Trailing spaces will be removed
+# and "proto 84" is converted to "proto ovn" for compatibility.
+m4_define([OVN_ROUTE_V6_EQUAL], [OVN_ROUTE_V6_EQUAL_([$1], [], [$2], [$3])])
+
+# NS_OVN_ROUTE_V6_EQUAL([fake_node], [ns], [vrf], [string to compare])
+#
+# Will dump all v6 routes in the mentioned vrf. Trailing spaces will be removed
+# and "proto 84" is converted to "proto ovn" for compatibility.
+m4_define([NS_OVN_ROUTE_V6_EQUAL], [OVN_ROUTE_V6_EQUAL_([$1], [$2], [$3], [$4])])
 
 OVS_START_SHELL_HELPERS
 
@@ -24,30 +163,207 @@ m_as() {
 }
 
 m_central_as () {
-    podman exec ovn-central "$@"
-}
-
-check_fake_multinode_setup() {
-    check m_as ovn-central ovn-nbctl --wait=sb sync
-    AT_CHECK([m_as ovn-chassis-1 ovn-appctl -t ovn-controller version], [0], [ignore])
-    AT_CHECK([m_as ovn-chassis-2 ovn-appctl -t ovn-controller version], [0], [ignore])
-    AT_CHECK([m_as ovn-gw-1 ovn-appctl -t ovn-controller version], [0], [ignore])
-    AT_CHECK([m_as ovn-gw-1 ovn-appctl -t ovn-controller version], [0], [ignore])
-}
-
-cleanup_multinode_resources() {
-    m_as ovn-central rm -f /etc/ovn/ovnnb_db.db
-    m_as ovn-central /usr/share/ovn/scripts/ovn-ctl restart_northd
-    check m_as ovn-central ovn-nbctl --wait=sb sync
-    for c in ovn-chassis-1 ovn-chassis-2 ovn-gw-1
-    do
-        m_as $c ovs-vsctl del-br br-int
-        m_as $c ip --all netns delete
-    done
+    podman exec ovn-central-az1 "$@"
 }
 
 multinode_nbctl () {
-    m_as ovn-central ovn-nbctl "$@"
+    m_as ovn-central-az1 ovn-nbctl "$@"
+}
+
+multinode_sbctl () {
+    m_as ovn-central-az1 ovn-sbctl "$@"
+}
+
+check_fake_multinode_setup_by_nodes() {
+    check m_as ovn-central-az1 ovn-nbctl --wait=sb sync
+    for c; do
+        AT_CHECK([m_as $c ovn-appctl -t ovn-controller version], [0], [ignore])
+    done
+
+    # Check $ENABLE_SSL variable, and use SSL if unset (default) or not set to "no".
+    if [[ "$ENABLE_SSL" != "no" ]]; then
+        REMOTE_PROT=ssl
+        SSL_CERTS_PATH=/opt/ovn
+        CONTROLLER_SSL_ARGS="--ovn-controller-ssl-key=${SSL_CERTS_PATH}/ovn-privkey.pem \
+                             --ovn-controller-ssl-cert=${SSL_CERTS_PATH}/ovn-cert.pem \
+                             --ovn-controller-ssl-ca-cert=${SSL_CERTS_PATH}/pki/switchca/cacert.pem"
+        NORTHD_SSL_ARGS="--ovn-nb-db-ssl-key=${SSL_CERTS_PATH}/ovn-privkey.pem \
+              --ovn-nb-db-ssl-cert=${SSL_CERTS_PATH}/ovn-cert.pem \
+              --ovn-nb-db-ssl-ca-cert=${SSL_CERTS_PATH}/pki/switchca/cacert.pem \
+              --ovn-sb-db-ssl-key=${SSL_CERTS_PATH}/ovn-privkey.pem \
+              --ovn-sb-db-ssl-cert=${SSL_CERTS_PATH}/ovn-cert.pem \
+              --ovn-sb-db-ssl-ca-cert=${SSL_CERTS_PATH}/pki/switchca/cacert.pem \
+              --ovn-northd-ssl-key=${SSL_CERTS_PATH}/ovn-privkey.pem \
+              --ovn-northd-ssl-cert=${SSL_CERTS_PATH}/ovn-cert.pem \
+              --ovn-northd-ssl-ca-cert=${SSL_CERTS_PATH}/pki/switchca/cacert.pem"
+    else
+        REMOTE_PROT=tcp
+        CONTROLLER_SSL_ARGS=""
+        NORTHD_SSL_ARGS=""
+    fi
+        export CONTROLLER_SSL_ARGS
+        export NORTHD_SSL_ARGS
+        export REMOTE_PROT
+}
+
+save_logs_and_db() {
+    c=$1
+    # Note that on_exit commands are executed in reverse order during cleanup.
+    on_exit "podman cp $c:/tmp/ovn/. ${c}"
+    on_exit "podman cp $c:/tmp/openvswitch/. ${c}"
+    on_exit "podman exec $c cp -r /var/log/ovn/ /tmp/"
+    on_exit "podman exec $c cp -r /var/log/openvswitch/ /tmp/"
+    on_exit "podman exec $c cp -r /etc/ovn/ /tmp/"
+    on_exit "podman exec $c cp -r /etc/openvswitch/ /tmp/"
+}
+
+check_fake_multinode_setup() {
+    check_fake_multinode_setup_by_nodes                         \
+        ovn-chassis-1 ovn-chassis-2 ovn-chassis-3 ovn-chassis-4 \
+        ovn-gw-1 ovn-gw-2 ovn-gw-3 ovn-gw-4
+
+    for c in ovn-chassis-1 ovn-chassis-2 ovn-chassis-3 ovn-chassis-4 \
+             ovn-gw-1 ovn-gw-2 ovn-gw-3 ovn-gw-4; do
+        mkdir $c
+        on_exit "m_as $c ovs-vsctl list Interface > ${c}/interfaces.txt || true"
+        on_exit "m_as $c ovs-vsctl show > ${c}/ovs.txt || true"
+        on_exit "m_as $c ovs-ofctl dump-flows br-int > ${c}/flow.txt || true"
+        on_exit "m_as $c ovs-vsctl get open . external_ids > ${c}/extids.txt || true"
+        save_logs_and_db $c
+    done
+
+    mkdir ovn-central-az1
+    save_logs_and_db ovn-central-az1
+}
+
+cleanup_multinode_resources_by_nodes() {
+    m_as ovn-central-az1 rm -f /etc/ovn/ovnnb_db.db
+    m_as ovn-central-az1 /usr/share/ovn/scripts/ovn-ctl restart_northd
+
+    m_as ovn-central-az1 rm -f /etc/ovn/ovn_ic_nb_db.db
+    m_as ovn-central-az1 rm -f /etc/ovn/ovn_ic_sb_db.db
+    m_as ovn-central-az1 /usr/share/ovn/scripts/ovn-ctl \
+        --db-ic-nb-create-insecure-remote=yes \
+        --db-ic-sb-create-insecure-remote=yes \
+        restart_ic_ovsdb
+
+    m_as ovn-central-az1 ovn-nbctl set NB_Global . name=ovn-central-az1
+    check m_as ovn-central-az1 ovn-nbctl --wait=sb sync
+    for c; do
+        m_as $c ovs-vsctl del-br br-int
+        m_as $c ip --all netns delete
+        # Deleting br-int & nb.db deleted patch ports such as patch-br-int-to-public1-ln
+        # but not the patch ports attached to br-ex such as patch-public1-ln-to-br-int.
+        for i in $(m_as $c ovs-vsctl --bare --columns name list port | grep patch); do
+            m_as $c ovs-vsctl del-port $i;
+        done
+
+        # Bring down and then up the eth1 interface.
+        # It's possible that previous test runs may have some cached routes
+        # which could affect the other tests.
+        m_as $c ip link set eth1 down
+        m_as $c ip link set eth1 up
+    done
+}
+
+cleanup_multinode_resources() {
+    cleanup_multinode_resources_by_nodes                        \
+        ovn-chassis-1 ovn-chassis-2 ovn-chassis-3 ovn-chassis-4 \
+        ovn-gw-1 ovn-gw-2 ovn-gw-3 ovn-gw-4
+}
+
+# multinode_cleanup_northd NODE
+#
+# Removes previously set nothd on specified node
+multinode_cleanup_northd() {
+    c=$1
+    # Cleanup existing one
+    m_as $c /usr/share/ovn/scripts/ovn-ctl stop_northd
+    m_as $c sh -c "rm -f /etc/ovn/*.db"
+}
+
+# multinode_setup_northd NODE
+#
+# Sets up northd on specified node.
+multinode_setup_northd() {
+    c=$1
+
+    multinode_cleanup_northd $c
+
+    echo "Using ${NORTHD_SSL_ARGS} for northd".
+    m_as $c /usr/share/ovn/scripts/ovn-ctl start_northd ${NORTHD_SSL_ARGS}
+    m_as $c ovn-nbctl set-connection p${REMOTE_PROT}:6641
+    m_as $c ovn-sbctl set-connection p${REMOTE_PROT}:6642
+}
+
+# multinode_setup_controller NODE ENCAP_IP REMOTE_IP [ENCAP_TYPE]
+#
+# Sets up controller on specified node.
+multinode_setup_controller() {
+    c=$1
+    encap_ip=$3
+    remote_ip=$4
+    encap_type=${5:-"geneve"}
+
+    # Get info from eth1
+    local eth1_ip=""
+    if m_as $c ovs-vsctl list-ports br-ex | grep -qx eth1; then
+        eth1_ip=$(m_as $c ip -4 -o addr show eth1 | awk '{print $4}')
+    fi
+
+    # Cleanup existing one
+    m_as $c /usr/share/openvswitch/scripts/ovs-ctl stop
+    m_as $c /usr/share/ovn/scripts/ovn-ctl stop_controller
+    m_as $c sh -c "rm -f /etc/openvswitch/*.db"
+
+    m_as $c /usr/share/openvswitch/scripts/ovs-ctl start --system-id=$c
+    echo "Using ${CONTROLLER_SSL_ARGS} for ovn-controller".
+    m_as $c /usr/share/ovn/scripts/ovn-ctl start_controller ${CONTROLLER_SSL_ARGS}
+
+    m_as $c ovs-vsctl set open . external_ids:ovn-encap-ip=$encap_ip
+    m_as $c ovs-vsctl set open . external-ids:ovn-encap-type=$encap_type
+    m_as $c ovs-vsctl set open . external-ids:ovn-remote=${REMOTE_PROT}:$remote_ip:6642
+    m_as $c ovs-vsctl set open . external-ids:ovn-openflow-probe-interval=60
+    m_as $c ovs-vsctl set open . external-ids:ovn-remote-probe-interval=180000
+    m_as $c ovs-vsctl set open . external-ids:ovn-bridge-datapath-type=system
+
+    # Add back br-ex which was removed when removing ovs conf.db
+    m_as $c ovs-vsctl --if-exists del-br br-ex
+    m_as $c ovs-vsctl add-br br-ex
+    # Add eth1 back
+    if [[ -n "$eth1_ip" ]]; then
+        m_as $c ovs-vsctl add-port br-ex eth1 -- set interface eth1 type=internal
+        m_as $c ip addr add $eth1_ip dev eth1
+        m_as $c ip link set eth1 up
+    fi
+    m_as $c ip link set eth2 down
+    m_as $c ovs-vsctl add-port br-ex eth2
+    m_as $c ip link set eth2 up
+}
+
+# multinode_cleanup_ic NODE
+#
+# Cleans up ovn-ic on specified node.
+multinode_cleanup_ic() {
+    c=$1
+    # Cleanup existing one
+    m_as $c /usr/share/ovn/scripts/ovn-ctl stop_ic
+}
+
+# multinode_setup_ic NODE IC_DB_IP
+#
+# Sets up ovn_ic on specified node.
+multinode_setup_ic() {
+    c=$1
+    remote=$2
+
+    m_as $c /usr/share/ovn/scripts/ovn-ctl stop_ic
+
+    check m_as $c ovn-nbctl set NB_Global . name=$c
+    m_as $c ovs-vsctl set open_vswitch . external_ids:ovn-is-interconn=true
+    m_as $c /usr/share/ovn/scripts/ovn-ctl start_ic \
+        --ovn-ic-nb-db=tcp:$remote:6645 \
+        --ovn-ic-sb-db=tcp:$remote:6646
 }
 
 # m_count_rows TABLE [CONDITION...]
@@ -66,7 +382,7 @@ m_count_rows() {
 m_check_row_count() {
     local db=$(parse_db $1) table=$(parse_table $1); shift
     local count=$1; shift
-    local found=$(m_count_rows $c $db:$table "$@")
+    local found=$(m_count_rows $db:$table "$@")
     echo
     echo "Checking for $count rows in $db $table${1+ with $*}... found $found"
     if test "$count" != "$found"; then
@@ -147,6 +463,113 @@ m_check_column() {
     fi
 }
 
+# m_route_metric NODE TABLE PREFIX
+#
+# Prints the metric of every route for PREFIX in routing table TABLE on NODE.
+# The prefix is not always the first field: a route OVN redistributes without
+# a locally resolvable nexthop, which is what a NAT or a static route with an
+# off-link nexthop installs, renders as
+# "blackhole PREFIX proto ovn metric N".
+m_route_metric() {
+    m_as $1 ip route show table $2 | awk -v p="$3" '
+        { match_found = 0
+          for (i = 1; i <= NF; i++) if ($i == p) match_found = 1
+          if (match_found) {
+              for (i = 1; i <= NF; i++) if ($i == "metric") print $(i + 1)
+          } }'
+}
+
+# m_wait_route_metric NODE TABLE PREFIX EXPECTED
+#
+# Waits until the metric of PREFIX in routing table TABLE on NODE is EXPECTED.
+m_wait_route_metric() {
+    # OVS_WAIT_UNTIL runs its body in a context where the positional
+    # parameters are its own, so copy them out first.
+    local rm_node=$1 rm_table=$2 rm_prefix=$3 rm_expected=$4
+
+    echo "Waiting for $rm_prefix in table $rm_table on $rm_node to have" \
+         "metric $rm_expected..."
+    OVS_WAIT_UNTIL([test "$rm_expected" = \
+                        "$(m_route_metric $rm_node $rm_table $rm_prefix)"], [
+        echo "Routes in table $rm_table on $rm_node:"
+        m_as $rm_node ip route show table $rm_table])
+}
+
+# m_route_count NODE TABLE PREFIX
+#
+# Prints the number of routes for PREFIX in routing table TABLE on NODE.  See
+# m_route_metric() for why the prefix is looked for in every field.
+m_route_count() {
+    m_as $1 ip route show table $2 | awk -v p="$3" '
+        { for (i = 1; i <= NF; i++) if ($i == p) { found++; break } }
+        END { print found + 0 }'
+}
+
+# m_wait_route_count NODE TABLE PREFIX EXPECTED
+#
+# Waits until routing table TABLE on NODE holds EXPECTED routes for PREFIX.
+m_wait_route_count() {
+    local rc_node=$1 rc_table=$2 rc_prefix=$3 rc_expected=$4
+
+    echo "Waiting until table $rc_table on $rc_node has $rc_expected" \
+         "route(s) for $rc_prefix..."
+    OVS_WAIT_UNTIL([test "$rc_expected" = \
+                        "$(m_route_count $rc_node $rc_table $rc_prefix)"], [
+        echo "Routes in table $rc_table on $rc_node:"
+        m_as $rc_node ip route show table $rc_table])
+}
+
+# m_vrf_exists NODE DEV
+#
+# Prints "yes" if the vrf device DEV exists on NODE, "no" otherwise.
+m_vrf_exists() {
+    if m_as $1 ip link show dev $2 type vrf > /dev/null 2>&1; then
+        echo yes
+    else
+        echo no
+    fi
+}
+
+# m_wait_vrf NODE DEV EXPECTED
+#
+# Waits until the presence of the vrf device DEV on NODE is EXPECTED, which is
+# either "yes" or "no".
+m_wait_vrf() {
+    local wv_node=$1 wv_dev=$2 wv_expected=$3
+
+    echo "Waiting until vrf $wv_dev on $wv_node is present=$wv_expected..."
+    OVS_WAIT_UNTIL([test "$wv_expected" = \
+                        "$(m_vrf_exists $wv_node $wv_dev)"], [
+        echo "vrf devices on $wv_node:"
+        m_as $wv_node ip -o link show type vrf])
+}
+
+# m_add_internal_port NODE NETNS OVS_BRIDGE PORT IP [GW]
+#
+# Adds an OVS internal PORT to OVS_BRIDGE on NODE and moves the resulting
+# interface in the NETNS namespace.  It also configures it with the provided
+# IP and (optionally) default gateway GW.
+m_add_internal_port() {
+    local node=$1 ns=$2 br=$3 port=$4 ip=$5 gw=$6 ip6=$7
+
+    if ! m_as $node ip netns list | grep $ns; then
+        check m_as $node ip netns add $ns
+        on_exit "m_as $node ip netns delete $ns"
+    fi
+    check m_as $node ovs-vsctl add-port $br $port -- set interface $port type=internal
+    on_exit "m_as $node ovs-vsctl del-port $port"
+    check m_as $node ip link set $port netns $ns
+    check m_as $node ip netns exec $ns ip link set $port up
+    check m_as $node ip netns exec $ns ip addr add $ip dev $port
+
+    if test -n "$gw"; then
+        check m_as $node ip netns exec $ns ip route add default via $gw dev $port
+    fi
+    if test -n "$ip6"; then
+        check m_as $node ip netns exec $ns ip addr add $ip6 dev $port
+    fi
+}
+
 # m_wait_for_ports_up [PORT...]
 #
 # With arguments, waits for specified Logical_Switch_Ports to come up.
@@ -162,5 +585,60 @@ m_wait_for_ports_up() {
         done
     fi
 }
+
+# m_kill fake_node name
+#
+# Helper to properly kill command in a node.
+m_kill() {
+    containers=$1
+    command=$2
+    for c in $containers; do
+      podman exec $c ps -ef | grep -v grep | grep -q $command && \
+        echo "Killing $command on $c" && podman exec $c killall $command
+    done
+}
+
+m_is_fedora() {
+    m_central_as grep -qi fedora /etc/os-release
+}
+
+# Run ovs-vsctl using Host socket
+host_ovs_vsctl() {
+    # Discover host OVS socket on first call
+    if [[ -z "$HOST_OVS_SOCK" ]]; then
+        for sock in /run/openvswitch/db.sock /var/run/openvswitch/db.sock /usr/local/var/run/openvswitch/db.sock; do
+            if [[ -S "$sock" ]]; then
+                HOST_OVS_SOCK=$sock
+                break
+            fi
+        done
+        # Fallback on unusual prefix: discover from running process
+        if [[ -z "$HOST_OVS_SOCK" ]]; then
+            HOST_OVS_SOCK=$(ps aux | grep '[o]vsdb-server' | grep -oP 'punix:\K[^, ]+' | while read s; do
+                [[ -S "$s" ]] && [[ "$s" != *"$OVS_RUNDIR"* ]] && echo "$s" && break
+            done)
+        fi
+        if [[ -z "$HOST_OVS_SOCK" ]]; then
+            echo "ERROR: Could not find host OVS socket" >&2
+            AT_FAIL_IF([:])
+        fi
+    fi
+    ovs-vsctl --db=unix:$HOST_OVS_SOCK "$@"
+}
+
+# M_START_L4_SERVER([fake_node], [namespace], [ip_addr], [port], [reply_string], [pidfile])
+#
+# Helper to properly start l4 server in inside 'fake_node''s namespace'.
+m4_define([M_START_L4_SERVER],
+    [podman cp $srcdir/server.py $1:/data/metadata_server.py || exit 1
+     M_NS_DAEMONIZE([$1], [$2],
+                    [./data/metadata_server.py --bind-host $3 \
+                                               --bind-port $4 \
+                                               --reply-string $5],
+                     [$6])
+     pid=$(podman exec $1 ip netns exec $2 ps aux | grep metadata_server.py | grep $5 | tr -s ' ' | cut -d' ' -f2)
+     on_exit "podman exec $1 ip netns exec $2 kill $pid"
+    ]
+)
 
 OVS_END_SHELL_HELPERS

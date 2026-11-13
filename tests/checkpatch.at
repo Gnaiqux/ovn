@@ -39,6 +39,23 @@ try_checkpatch__() {
         AT_CHECK([$1 $top_srcdir/utilities/checkpatch.py -q test.patch])
     fi
 }
+
+try_checkpatch_stdin() {
+    echo "$1" | sed 's/^    //' > test.patch
+    if test -n "$2"; then
+        echo "$2" | sed 's/^    //' > expout
+    else
+        : > expout
+    fi
+
+    if test -s expout; then
+        AT_CHECK([$PYTHON3 $top_srcdir/utilities/checkpatch.py -q < test.patch],
+                 [1], [stdout])
+        AT_CHECK([sed '/^Lines checked:/,$d' stdout], [0], [expout])
+    else
+        AT_CHECK([$PYTHON3 $top_srcdir/utilities/checkpatch.py -q < test.patch])
+    fi
+}
 OVS_END_SHELL_HELPERS
 
 AT_SETUP([checkpatch - sign-offs])
@@ -433,6 +450,92 @@ try_checkpatch \
 
 AT_CLEANUP
 
+AT_SETUP([checkpatch - commit message body length])
+
+body_75=$(printf '%75s' '' | tr ' ' x)
+body_76=${body_75}x
+long_tag_value=$(printf '%80s' '' | tr ' ' x)
+
+try_checkpatch \
+   "Author: A
+    Commit: A
+
+    $body_75
+    Signed-off-by: A"
+
+try_checkpatch \
+   "Author: A
+    Commit: A
+
+    $body_76
+    Signed-off-by: A" \
+   "WARNING: Commit message body line is 76 characters long (recommended limit is 75)
+    1: $body_76
+"
+
+try_checkpatch_stdin \
+   "Author: A
+    Commit: A
+    Subject: checkpatch: Test body length.
+     $long_tag_value
+
+    $body_76
+    Signed-off-by: A
+    ---" \
+   "WARNING: Commit message body line is 76 characters long (recommended limit is 75)
+    6: $body_76
+"
+
+try_checkpatch \
+   "Author: A
+    Commit: A
+
+    Acked-by: B
+    Tested-at: https://example.com/test/1
+    Link: https://example.com/reviews/$long_tag_value
+    Arbitrary-Tag: $long_tag_value
+    Reported-at: https://example.com/bugs/$long_tag_value
+    Assisted-by: $long_tag_value
+    Fixes: 123456789abc (\"$long_tag_value\")
+    Signed-off-by: A"
+
+try_checkpatch \
+   "Author: A
+    Commit: A
+
+    This is ordinary prose with a colon: $long_tag_value
+    Signed-off-by: A" \
+   "WARNING: Commit message body line is 117 characters long (recommended limit is 75)
+    1: This is ordinary prose with a colon: $long_tag_value
+"
+
+try_checkpatch \
+   "Author: A
+    Commit: A
+
+    Not/A/Trailer: $long_tag_value
+    Signed-off-by: A" \
+   "WARNING: Commit message body line is 95 characters long (recommended limit is 75)
+    1: Not/A/Trailer: $long_tag_value
+"
+
+raw_patch="From 123456789abc Mon Sep 17 00:00:00 2001
+From: A
+Date: Tue, 29 Sep 2026 08:00:00 +0000
+X-Long-Header: $long_tag_value
+ $long_tag_value
+Subject: [PATCH] checkpatch: Test body length.
+
+$body_75
+Link: https://example.com/reviews/$long_tag_value
+Signed-off-by: A
+---"
+
+try_checkpatch "$raw_patch"
+try_checkpatch_stdin "$raw_patch"
+
+AT_CLEANUP
+
 AT_SETUP([checkpatch - malformed tags])
 try_checkpatch \
    "    Author: A
@@ -642,5 +745,79 @@ try_checkpatch \
     #8 FILE: tests/something.at:1:
     C_H_E_C_K([as gw1 ovs-ofctl dump-flows br-int table=42 | grep "dl_dst=00:00:02:01:02:04" | wc -l], [0], [[1]])
 "
+
+AT_CLEANUP
+
+AT_SETUP([checkpatch - check and check_uuid])
+# Verify that missing check is covered.
+try_checkpatch \
+   "COMMON_PATCH_HEADER([tests/something.at])
+    +ovn-nbctl lsp-add ls
+    " \
+    "WARNING: ovn-nbctl return should be checked Consider adding check or check_uuid in front.
+    #8 FILE: tests/something.at:1:
+    ovn-nbctl lsp-add ls
+"
+
+try_checkpatch \
+   "COMMON_PATCH_HEADER([tests/something.at])
+    +ovn_as az1 ovn-nbctl lsp-add ls
+    " \
+    "WARNING: ovn-nbctl return should be checked Consider adding check or check_uuid in front.
+    #8 FILE: tests/something.at:1:
+    ovn_as az1 ovn-nbctl lsp-add ls
+"
+
+# Verify that existing check makes checkpatch happy.
+try_checkpatch \
+   "COMMON_PATCH_HEADER([tests/something.at])
+    +check ovn-nbctl lsp-add ls
+    "
+
+# Verify that missing check_uuid is covered.
+try_checkpatch \
+   "COMMON_PATCH_HEADER([tests/something.at])
+    +ovn-sbctl -- create FDB mac='"00\:00\:00\:00\:00\:03"' dp_key=1 port_key=1
+    " \
+    "WARNING: ovn-sbctl return should be checked Consider adding check or check_uuid in front.
+    #8 FILE: tests/something.at:1:
+    ovn-sbctl -- create FDB mac='00:00:00:00:00:03' dp_key=1 port_key=1
+"
+
+# Verify that existing check_uuid makes checkpatch happy.
+try_checkpatch \
+   "COMMON_PATCH_HEADER([tests/something.at])
+    +check_uuid ovn-sbctl -- create FDB mac='"00\:00\:00\:00\:00\:03"' dp_key=1 port_key=1
+    "
+
+# Verify that missing check for a get command does not cause checkpatch failures.
+try_checkpatch \
+   "COMMON_PATCH_HEADER([tests/something.at])
+    +ovn-nbctl get Logical-Switch-Port p1 dynamic_addresses
+    "
+
+# Verify that missing check for a create command causes checkpatch failure - multiline.
+try_checkpatch \
+   "COMMON_PATCH_HEADER([tests/something.at])
+    +ovn-sbctl \
+    + -- create FDB mac='"00\:00\:00\:00\:00\:03"' dp_key=1 port_key=1
+    " \
+    "WARNING: ovn-sbctl return should be checked Consider adding check or check_uuid in front.
+    #8 FILE: tests/something.at:1:
+    ovn-sbctl     + -- create FDB mac='00:00:00:00:00:03' dp_key=1 port_key=1
+"
+
+# Verify that missing check for a get command does not cause checkpatch failures - multiline.
+try_checkpatch \
+   "COMMON_PATCH_HEADER([tests/something.at])
+    +ovn-nbctl \
+    + --  get Logical-Switch-Port p1 dynamic_addresses
+    "
+
+# Verify that we can still store outout of ovn-nbctl w/o check.
+try_checkpatch \
+   "COMMON_PATCH_HEADER([tests/something.at])
+   +lsp1_uuid=$(ovn-nbctl --bare --columns _uuid find Logical_Switch_Port name=lsp1)
+   "
 
 AT_CLEANUP

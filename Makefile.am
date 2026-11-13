@@ -20,16 +20,6 @@ AM_LDFLAGS = $(SSL_LDFLAGS)
 AM_LDFLAGS += $(OVS_LDFLAGS)
 
 AM_CPPFLAGS += -I $(top_srcdir)/include
-
-if WIN32
-AM_CPPFLAGS += $(PTHREAD_INCLUDES)
-AM_CPPFLAGS += $(MSVC_CFLAGS)
-AM_LDFLAGS += $(PTHREAD_LDFLAGS)
-AM_LDFLAGS += $(MSVC64_LDFLAGS)
-PLATFORM = $(MSVC_PLATFORM)
-endif
-
-AM_CPPFLAGS += -I $(top_srcdir)/include
 AM_CPPFLAGS += -I $(top_srcdir)/ovn
 AM_CPPFLAGS += -I $(top_builddir)/include
 AM_CPPFLAGS += -I $(top_srcdir)/lib
@@ -48,7 +38,7 @@ AM_CFLAGS = -Wstrict-prototypes
 AM_CFLAGS += $(WARNING_FLAGS)
 AM_CFLAGS += $(OVS_CFLAGS)
 
-AM_DISTCHECK_CONFIGURE_FLAGS = --with-ovs-source=$(PWD)/ovs
+AM_DISTCHECK_CONFIGURE_FLAGS = --with-ovs-source=$(PWD)/ovs --with-version-suffix="$(VERSION_SUFFIX)"
 
 if NDEBUG
 AM_CPPFLAGS += -DNDEBUG
@@ -57,18 +47,13 @@ endif
 
 AM_CTAGSFLAGS = $(OVS_CTAGS_IDENTIFIERS_LIST)
 
-if WIN32
-psep=";"
-else
-psep=":"
-endif
 # PYTHONDONTWRITEBYTECODE=yes keeps Python from creating .pyc and .pyo
 # files.  Creating .py[co] works OK for any given version of Open
 # vSwitch, but it causes trouble if you switch from a version with
 # foo/__init__.py into an (older) version with plain foo.py, since
 # foo/__init__.pyc will cause Python to ignore foo.py.
 run_python = \
-	PYTHONPATH=$(OVS_SRCDIR)/python$(psep)$$PYTHONPATH \
+	PYTHONPATH=$(OVS_SRCDIR)/python:$$PYTHONPATH \
 	PYTHONDONTWRITEBYTECODE=yes $(PYTHON3)
 
 ALL_LOCAL =
@@ -85,27 +70,25 @@ EXTRA_DIST = \
 	MAINTAINERS.rst \
 	README.rst \
 	NOTICE \
-	.cirrus.yml \
 	.ci/ci.sh \
-	.ci/dpdk-build.sh \
-	.ci/dpdk-prepare.sh \
 	.ci/linux-build.sh \
 	.ci/linux-util.sh \
+	.ci/ovn_upgrade_test.py \
+	.ci/ovn_upgrade_utils.py \
 	.ci/osx-build.sh \
 	.ci/osx-prepare.sh \
-	.ci/ovn-kubernetes/Dockerfile \
 	.ci/ovn-kubernetes/prepare.sh \
 	.ci/ovn-kubernetes/custom.patch \
 	.github/workflows/containers.yml \
 	.github/workflows/test.yml \
+	.github/workflows/test-arm.yml \
 	.github/workflows/ovn-kubernetes.yml \
 	.github/workflows/ovn-fake-multinode-tests.yml \
+	.github/workflows/ovn-upgrade-tests.yml \
 	.readthedocs.yaml \
 	boot.sh \
 	$(MAN_FRAGMENTS) \
 	$(MAN_ROOTS) \
-	Vagrantfile \
-	Vagrantfile-FreeBSD \
 	.mailmap \
 	TODO.rst \
 	TODO_SPLIT.rst \
@@ -117,7 +100,9 @@ EXTRA_DIST = \
 	ovn-ic-nb.ovsschema \
 	ovn-ic-nb.xml \
 	ovn-ic-sb.ovsschema \
-	ovn-ic-sb.xml
+	ovn-ic-sb.xml \
+	ovn-br.ovsschema \
+	ovn-br.xml
 bin_PROGRAMS =
 sbin_PROGRAMS =
 bin_SCRIPTS =
@@ -130,6 +115,7 @@ dist_scripts_SCRIPTS =
 dist_scripts_DATA =
 EXTRA_PROGRAMS =
 INSTALL_DATA_LOCAL =
+INSTALL_DATA_HOOK =
 UNINSTALL_LOCAL =
 man_MANS =
 MAN_FRAGMENTS =
@@ -173,7 +159,7 @@ submodules = $(shell grep 'path =' $(srcdir)/.gitmodules | sed -E 's/[\t ]*path 
 
 SUFFIXES += .in
 .in:
-	$(AM_V_GEN)PYTHONPATH=$(OVS_SRCDIR)/python$(psep)$$PYTHONPATH$(psep)$(srcdir)/python $(PYTHON3) $(srcdir)/build-aux/soexpand.py -I$(srcdir) -I$(OVS_SRCDIR) < $< | \
+	$(AM_V_GEN)PYTHONPATH=$(OVS_SRCDIR)/python:$$PYTHONPATH:$(srcdir)/python $(PYTHON3) $(srcdir)/build-aux/soexpand.py -I$(srcdir) -I$(OVS_SRCDIR) < $< | \
 	  $(PYTHON3) $(srcdir)/build-aux/dpdkstrip.py $(DPDKSTRIP_FLAGS) | \
 	  sed \
 	    -e 's,[@]PKIDIR[@],$(PKIDIR),g' \
@@ -183,6 +169,7 @@ SUFFIXES += .in
 	    -e 's,[@]OVN_RUNDIR[@],$(OVN_RUNDIR),g' \
 	    -e 's,[@]OVSBUILDDIR[@],$(OVSBUILDDIR),g' \
 	    -e 's,[@]VERSION[@],$(VERSION),g' \
+	    -e 's,[@]VERSION_SUFFIX[@],$(VERSION_SUFFIX),g' \
 	    -e 's,[@]OVSVERSION[@],$(OVSVERSION),g' \
 	    -e 's,[@]localstatedir[@],$(localstatedir),g' \
 	    -e 's,[@]pkgdatadir[@],$(pkgdatadir),g' \
@@ -271,7 +258,7 @@ config-h-check:
 	fi
 .PHONY: config-h-check
 
-# Check for printf() type modifiers that MSVC doesn't support.
+# Check for non-portable printf() type modifiers.
 ALL_LOCAL += printf-check
 printf-check:
 	@cd $(srcdir); \
@@ -352,13 +339,16 @@ check-tabs:
 	fi
 .PHONY: check-tabs
 
+# NOTE: test-ovn-netlink.c excluded due to use of system() to execute
+#       ip neigh / bridge fdb commands provided as arguments by test suite.
 ALL_LOCAL += thread-safety-check
 thread-safety-check:
 	@cd $(srcdir); \
 	if test -e .git && (git --version) >/dev/null 2>&1 && \
 	  grep -n -f build-aux/thread-safety-blacklist \
 	    `git ls-files | grep -v $(submodules) | grep '\.[ch]$$'` /dev/null \
-	      | $(EGREP) -v ':[ 	]*/?\*'; \
+	      | $(EGREP) -v ':[ 	]*/?\*' \
+	      | $(EGREP) -v '^tests/test-ovn-netlink.c'; \
 	then \
 	  echo "See above for list of calls to functions that are"; \
 	  echo "blacklisted due to thread safety issues"; \
@@ -380,6 +370,16 @@ check-ifconfig:
 	  exit 1; \
 	fi
 .PHONY: check-ifconfig
+
+northd_h = northd/northd.h
+action_h = include/ovn/actions.h
+checksum_file = lib/ovn-util.c
+
+# Check if northd stages and actions checksum is valid.
+ALL_LOCAL += check-northd
+check-northd: $(northd_h) $(action_h) $(checksum_file)
+	@$(srcdir)/build-aux/cksum-pipeline-check $^
+.PHONY: check-northd
 
 if HAVE_GROFF
 ALL_LOCAL += manpage-check
@@ -427,7 +427,7 @@ CLEANFILES += flake8-check
 
 include $(srcdir)/manpages.mk
 $(srcdir)/manpages.mk: $(MAN_ROOTS) build-aux/sodepends.py $(OVS_SRCDIR)/python/ovs_build_helpers/soutil.py
-	@PYTHONPATH=$(OVS_SRCDIR)/python$(psep)$$PYTHONPATH$(psep)$(srcdir)/python $(PYTHON3) $(srcdir)/build-aux/sodepends.py -I. -Isrcdir,$(srcdir) -IOVS_MANDIR,$(OVS_MANDIR) $(MAN_ROOTS) >$(@F).tmp
+	@PYTHONPATH=$(OVS_SRCDIR)/python:$$PYTHONPATH:$(srcdir)/python $(PYTHON3) $(srcdir)/build-aux/sodepends.py -I. -Isrcdir,$(srcdir) -IOVS_MANDIR,$(OVS_MANDIR) $(MAN_ROOTS) >$(@F).tmp
 	@if cmp -s $(@F).tmp $@; then \
 	  touch $@; \
 	  rm -f $(@F).tmp; \
@@ -435,35 +435,6 @@ $(srcdir)/manpages.mk: $(MAN_ROOTS) build-aux/sodepends.py $(OVS_SRCDIR)/python/
 	  mv $(@F).tmp $@; \
 	fi
 CLEANFILES += manpage-dep-check
-
-if VSTUDIO_DDK
-ALL_LOCAL += ovsext
-ARCH = x64
-ovsext: datapath-windows/ovsext.sln $(srcdir)/datapath-windows/include/OvsDpInterface.h
-if VSTUDIO_WIN8
-	MSBuild.exe //nologo //maxcpucount datapath-windows/ovsext.sln /target:Build /property:Configuration="Win8$(VSTUDIO_CONFIG)" /property:Version="$(PACKAGE_VERSION)" //p:Platform=$(ARCH)
-endif
-if VSTUDIO_WIN8_1
-	MSBuild.exe //nologo //maxcpucount datapath-windows/ovsext.sln /target:Build /property:Configuration="Win8.1$(VSTUDIO_CONFIG)" /property:Version="$(PACKAGE_VERSION)" //p:Platform=$(ARCH)
-endif
-if VSTUDIO_WIN10
-	MSBuild.exe //nologo //maxcpucount datapath-windows/ovsext.sln /target:Build /property:Configuration="Win10$(VSTUDIO_CONFIG)" /property:Version="$(PACKAGE_VERSION)" //p:Platform=$(ARCH)
-endif
-
-
-CLEAN_LOCAL += ovsext_clean
-ovsext_clean: datapath-windows/ovsext.sln
-if VSTUDIO_WIN8
-	MSBuild.exe //nologo //maxcpucount datapath-windows/ovsext.sln /target:Clean /property:Configuration="Win8$(VSTUDIO_CONFIG)" /property:Version="$(PACKAGE_VERSION)" //p:Platform=$(ARCH)
-endif
-if VSTUDIO_WIN8_1
-	MSBuild.exe //nologo //maxcpucount datapath-windows/ovsext.sln /target:Clean /property:Configuration="Win8.1$(VSTUDIO_CONFIG)" /property:Version="$(PACKAGE_VERSION)" //p:Platform=$(ARCH)
-endif
-if VSTUDIO_WIN10
-	MSBuild.exe //nologo //maxcpucount datapath-windows/ovsext.sln /target:Clean /property:Configuration="Win10$(VSTUDIO_CONFIG)" /property:Version="$(PACKAGE_VERSION)" //p:Platform=$(ARCH)
-endif
-endif
-.PHONY: ovsext
 
 clang-analyze: clean
 	@which clang scan-build >/dev/null 2>&1 || \
@@ -476,8 +447,9 @@ dist-hook: $(DIST_HOOKS)
 all-local: $(ALL_LOCAL)
 clean-local: $(CLEAN_LOCAL)
 install-data-local: $(INSTALL_DATA_LOCAL)
+install-data-hook: $(INSTALL_DATA_HOOK)
 uninstall-local: $(UNINSTALL_LOCAL)
-.PHONY: $(DIST_HOOKS) $(CLEAN_LOCAL) $(INSTALL_DATA_LOCAL) $(UNINSTALL_LOCAL)
+.PHONY: $(DIST_HOOKS) $(CLEAN_LOCAL) $(INSTALL_DATA_LOCAL) $(INSTALL_DATA_HOOK) $(UNINSTALL_LOCAL)
 
 dist-docs:
 	VERSION=$(VERSION) MAKE='$(MAKE)' $(srcdir)/build-aux/dist-docs $(srcdir) $(docs)
@@ -499,4 +471,5 @@ include controller/automake.mk
 include controller-vtep/automake.mk
 include northd/automake.mk
 include ic/automake.mk
+include br-controller/automake.mk
 include build-aux/automake.mk

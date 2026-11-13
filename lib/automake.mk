@@ -26,6 +26,8 @@ lib_libovn_la_SOURCES = \
 	lib/ovn-parallel-hmap.c \
 	lib/ip-mcast-index.c \
 	lib/ip-mcast-index.h \
+	lib/lflow-conj-ids.c \
+	lib/lflow-conj-ids.h \
 	lib/mac-binding-index.c \
 	lib/mac-binding-index.h \
 	lib/mcast-group-index.c \
@@ -35,6 +37,8 @@ lib_libovn_la_SOURCES = \
 	lib/lex.c \
 	lib/objdep.c \
 	lib/objdep.h \
+	lib/ofctrl-seqno.c \
+	lib/ofctrl-seqno.h \
 	lib/ovn-l7.h \
 	lib/ovn-l7.c \
 	lib/ovn-util.c \
@@ -44,9 +48,13 @@ lib_libovn_la_SOURCES = \
 	lib/inc-proc-eng.h \
 	lib/lb.c \
 	lib/lb.h \
-	lib/static-mac-binding-index.c \
-	lib/static-mac-binding-index.h \
+	lib/sparse-array.c \
+	lib/sparse-array.h \
+	lib/spsc-ring.c \
+	lib/spsc-ring.h \
 	lib/stopwatch-names.h \
+	lib/vec.c \
+	lib/vec.h \
 	lib/vif-plug-provider.h \
 	lib/vif-plug-provider.c \
 	lib/vif-plug-providers/dummy/vif-plug-dummy.c
@@ -59,7 +67,9 @@ nodist_lib_libovn_la_SOURCES = \
 	lib/ovn-ic-nb-idl.c \
 	lib/ovn-ic-nb-idl.h \
 	lib/ovn-ic-sb-idl.c \
-	lib/ovn-ic-sb-idl.h
+	lib/ovn-ic-sb-idl.h \
+	lib/ovn-br-idl.c \
+	lib/ovn-br-idl.h
 
 CLEANFILES += $(nodist_lib_libovn_la_SOURCES)
 
@@ -128,4 +138,17 @@ OVN_IC_SB_IDL_FILES = \
 	$(srcdir)/lib/ovn-ic-sb-idl.ann
 lib/ovn-ic-sb-idl.ovsidl: $(OVN_IC_SB_IDL_FILES)
 	$(AM_V_GEN)$(OVSDB_IDLC) annotate $(OVN_IC_SB_IDL_FILES) > $@.tmp && \
+	mv $@.tmp $@
+
+# ovn-br IDL
+OVSIDL_BUILT += \
+	lib/ovn-br-idl.c \
+	lib/ovn-br-idl.h \
+	lib/ovn-br-idl.ovsidl
+EXTRA_DIST += lib/ovn-br-idl.ann
+OVN_PR_IDL_FILES = \
+	$(srcdir)/ovn-br.ovsschema \
+	$(srcdir)/lib/ovn-br-idl.ann
+lib/ovn-br-idl.ovsidl: $(OVN_PR_IDL_FILES)
+	$(AM_V_GEN)$(OVSDB_IDLC) annotate $(OVN_PR_IDL_FILES) > $@.tmp && \
 	mv $@.tmp $@

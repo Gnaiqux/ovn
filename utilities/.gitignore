@@ -1,4 +1,5 @@
 /ovn-ctl.8
+/ovn-brctl
 /ovn-nbctl
 /ovn-nbctl.8
 /ovn-sbctl
@@ -15,7 +16,4 @@
 /ovn-detrace.1
 /ovn-debug
 /ovn-debug.8
-/ovn-docker-overlay-driver
-/ovn-docker-underlay-driver
 /ovn-lib
-/ovn-sim

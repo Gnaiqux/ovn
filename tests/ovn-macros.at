@@ -1,3 +1,265 @@
+# OVN_CHECK_PACKETS([PCAP], [EXPECTED])
+#
+# This compares packets read from PCAP, in pcap format, to those read
+# from EXPECTED, which is a text file containing packets as hex
+# strings, one per line.  If PCAP contains fewer packets than
+# EXPECTED, it waits up to 10 seconds for more packets to appear.
+#
+# The implementation is an m4 macro that is mostly implemented in
+# terms of a shell function.  This reduces the size of the generated
+# testsuite file since the shell function is only emitted once even
+# when this macro is invoked many times.
+m4_divert_text([PREPARE_TESTS],
+  [dump_diff__ () {
+     local rcv_pcap=$1 exp_text=$2
+     rcv_text=`echo "$rcv_pcap.packets" | sed 's/\.pcap//'`
+     echo "Expected:"
+     sort $exp_text
+     echo "Received:"
+     sort $rcv_text
+     sort $exp_text -o $exp_text.sorted
+     sort $rcv_text -o $rcv_text.sorted
+     echo "Diff:"
+     diff -u $exp_text.sorted $rcv_text.sorted
+   }
+   ovn_check_packets__ () {
+     rcv_pcap=$1
+     exp_text=$2
+     cmd=${4-cat}
+     echo "$3: checking packets in $1 against $2:"
+     rcv_text=`echo "$rcv_pcap.packets" | sed 's/\.pcap//'`
+     exp_n=`wc -l < "$exp_text"`
+     OVS_WAIT_UNTIL(
+       [$PYTHON "$ovs_srcdir/utilities/ovs-pcap.in" $rcv_pcap > rcv_tmp
+        rcv_n=`wc -l < rcv_tmp`
+        echo "rcv_n=$rcv_n exp_n=$exp_n"
+        cat rcv_tmp > $rcv_text
+        test $rcv_n -ge $exp_n],
+       [dump_diff__ "$rcv_pcap" "$exp_text"])
+     sort $exp_text | $cmd > expout
+     cat rcv_tmp | $cmd > $rcv_text
+   }
+   ovn_check_packets_remove_broadcast__ () {
+     rcv_pcap=$1
+     exp_text=$2
+     cmd=${4-cat}
+     echo "$3: checking packets in $1 against $2:"
+     rcv_text=`echo "$rcv_pcap.packets" | sed 's/\.pcap//'`
+     exp_n=`wc -l < "$exp_text"`
+     OVS_WAIT_UNTIL(
+       [$PYTHON "$ovs_srcdir/utilities/ovs-pcap.in" $rcv_pcap > rcv_tmp
+        sed -i '/ffffffffffff/d' rcv_tmp
+        rcv_n=`wc -l < rcv_tmp`
+        echo "rcv_n=$rcv_n exp_n=$exp_n"
+        cat rcv_tmp > $rcv_text
+        test $rcv_n -ge $exp_n],
+       [dump_diff__ "$rcv_pcap" "$exp_text"])
+     sort $exp_text | $cmd > expout
+     cat rcv_tmp | $cmd > $rcv_text
+   }
+   ovn_wait_packets__ () {
+     rcv_pcap=$1
+     exp_text=$2
+     cmd=${4-cat}
+     echo "$3: waiting packets from $2 at $1:"
+     rcv_text=`echo "$rcv_pcap.packets" | sed 's/\.pcap//'`
+     OVS_WAIT_UNTIL(
+       [$PYTHON "$ovs_srcdir/utilities/ovs-pcap.in" $rcv_pcap > rcv_tmp
+        sort $exp_text | $cmd > expout
+        cat rcv_tmp | $cmd > $rcv_text
+        test x"$(sort $rcv_text | comm -2 -3 expout -)" = "x"],
+       [dump_diff__ "$rcv_pcap" "$exp_text"])
+   }
+
+   ovn_wait_packets_uniq__ () {
+     rcv_pcap=$1
+     exp_text=$2
+     cmd=${4-cat}
+     echo "$3: waiting for packets from $2 at $1:"
+     rcv_text=`echo "$rcv_pcap.packets" | sed 's/\.pcap//'`
+     OVS_WAIT_UNTIL(
+       [$PYTHON "$ovs_srcdir/utilities/ovs-pcap.in" $rcv_pcap > $rcv_text
+        sort $exp_text | $cmd > expout
+        test x"$(sort $rcv_text | $cmd | uniq | comm -3 expout -)" = "x"],
+       [dump_diff__ "$rcv_pcap" "$exp_text"])
+   }
+
+   ovn_wait_remote_output_flows () {
+     hv1=$1
+     hv2=$2
+     echo "$3: waiting for flows for remote output on $hv1"
+     # Wait for a flow outputing  to remote output
+     OVS_WAIT_UNTIL([
+         if test X$OVN_ENABLE_FLOW_BASED_TUNNELS = Xyes; then
+             tun_name=ovn-geneve
+         else
+             tun_name=ovn-${hv2}-0
+         fi
+         ofport=$(as $hv1 ovs-vsctl --bare --columns ofport find Interface name=$tun_name)
+         echo "tunnel port=$ofport"
+         test -n "$ofport" && test 1 -le $(as $hv1 ovs-ofctl dump-flows br-int | grep -c "output:$ofport")
+     ])
+   }
+
+   ovn_wait_remote_input_flows () {
+     hv1=$1
+     hv2=$2
+     echo "$3: waiting for flows for remote input on $hv1"
+     # Wait for a flow outputing  to remote input
+     OVS_WAIT_UNTIL([
+         if test X$OVN_ENABLE_FLOW_BASED_TUNNELS = Xyes; then
+             tun_name=ovn-geneve
+         else
+             tun_name=ovn-${hv2}-0
+         fi
+         ofport=$(as $hv1 ovs-vsctl --bare --columns ofport find Interface name=$tun_name)
+         echo "tunnel port=$ofport"
+         test -n "$ofport" && test 1 -le $(as $hv1 ovs-ofctl dump-flows br-int | grep -c "in_port=$ofport")
+     ])
+   }
+
+   # ovn_wait_for_bfd_up HV
+   # BFD might be quite slow. While BFD is not up, all chassis will fight to claim the port
+   # Wait for BFD between different chassis to be up
+   ovn_wait_for_bfd_up() {
+     for hv; do
+       as $hv
+       for chassis; do
+         if test $hv != $chassis; then
+             echo "checking bdf_status for $hv -> $chassis"
+             OVS_WAIT_UNTIL([
+                 bfd_status=$(as $hv ovs-vsctl get interface ovn-$chassis-0 bfd_status:state)
+                 echo "bfd status = $bfd_status"
+                 test "$bfd_status" = "up"
+             ])
+         fi
+       done
+     done
+   }
+])
+
+# Wait to receive all packets in $2.
+# Fails if any additional packet, or any duplicate packets is received,
+m4_define([OVN_CHECK_PACKETS],
+  [AT_CHECK([$PYTHON "$ovs_srcdir/utilities/ovs-pcap.in" $1 ], [0], [ignore])
+   ovn_check_packets__ "$1" "$2" "__file__:__line__" $3
+   AT_CHECK([sort $rcv_text], [0], [expout], [ignore], [dump_diff__ "$1" "$2"])])
+
+# Wait to receive all packets in $2, potentially receiving extra broadcast packets.
+# Fails if any (non bcast) additional packet, or any duplicate packets is received.
+m4_define([OVN_CHECK_PACKETS_REMOVE_BROADCAST],
+  [ovn_check_packets_remove_broadcast__ "$1" "$2" "__file__:__line__" $3
+   AT_CHECK([sort $rcv_text], [0], [expout], [ignore], [dump_diff__ "$1" "$2"])])
+
+# Wait to receive all packets from $2.
+# Any additional and duplicate packets are accepted.
+m4_define([OVN_CHECK_PACKETS_CONTAIN],
+  [ovn_wait_packets__ "$1" "$2" "__file__:__line__" $3])
+
+# Wait to receive all packets from $2.
+# Duplicate packets are accepted, but the macro fails if unexpected packets are received.
+m4_define([OVN_CHECK_PACKETS_UNIQ],
+  [ovn_wait_packets_uniq__ "$1" "$2" "__file__:__line__" $3])
+
+m4_define([OVN_WAIT_REMOTE_OUTPUT_FLOWS],
+  [ovn_wait_remote_output_flows "$1" "$2" "__file__:__line__"])
+
+m4_define([OVN_WAIT_REMOTE_INPUT_FLOWS],
+  [ovn_wait_remote_input_flows "$1" "$2" "__file__:__line__"])
+
+# CHECK_UNEXPECTED_DB_CHANGES()
+# Check whether there is a significant number of changes
+# in any db used by the test.
+m4_define([CHECK_UNEXPECTED_DB_CHANGES],[
+    # List dbs and number of lines in those dbs.
+    find "$ovs_base" -name "*.db" | sort | while read db; do
+        printf '%d %s\n' "$(wc -l < "$db")" "$db"
+    done > db.txt
+
+    # First pass: check if there is any db change.
+    diff=0
+    while read before_count db; do
+        after_count=$(wc -l < "$db")
+        diff=$((after_count - before_count))
+        if [[ "$diff" -ne 0 ]]; then
+            break
+        fi
+    done < db.txt
+
+    # Second pass: if there is any db change, rerun check and ignore small number of changes.
+    if [[ "$diff" -ne 0 ]]; then
+        sleep 1
+        db_list=$(cut -d' ' -f2- db.txt)
+        for db in $db_list; do
+            before_count=$(grep " $db\$" db.txt | cut -d' ' -f1)
+            if test -n "$before_count"; then
+                after_count=$(wc -l < "$db")
+                diff=$((after_count - before_count))
+                if [[ "$diff" -ge "50" ]]; then
+                    printf 'Got %d changes in %s\n' "$diff" "$db"
+                    AT_CHECK([test "$diff" -lt "50"])
+                fi
+            fi
+        done
+    fi
+])
+
+# CHECK_NO_REPEATED_DB_ENTRIES()
+# Checks every db used by the test for a transaction that recurs more than
+# 500 times, once uuids and "_date" are normalized away over the db's
+# whole recorded history.
+#
+# A test that purposely adds/removes the same entry many times can raise the
+# threshold, or skip this check entirely, by setting
+# CHECK_NO_REPEATED_DB_ENTRIES_THRESHOLD.
+m4_define([CHECK_NO_REPEATED_DB_ENTRIES], [
+    dup_threshold=${CHECK_NO_REPEATED_DB_ENTRIES_THRESHOLD-500}
+    if test -n "$dup_threshold"; then
+        db_list=$(find "$ovs_base" -name "*.db" | sort)
+        for db in $db_list; do
+            # normalize away uuids and "_date" so that transactions with the
+            # same logical content compare equal, count how many times each one
+            # occurs, and keep only if occurring > $dup_threshold.
+            dup=$(sed 's/[[0-9a-f]]\{8\}-[[0-9a-f]]\{4\}-[[0-9a-f]]\{4\}-[[0-9a-f]]\{4\}-[[0-9a-f]]\{12\}/UUID/g
+                       s/"_date":[[0-9]]*/"_date":0/' "$db" | \
+                  sort | uniq -c | sort -rn | awk -v thresh="$dup_threshold" '@S|@1 > thresh')
+            dup_max=$(printf '%s\n' "$dup" | head -n 1 | tr -s ' ' | cut -d' ' -f2)
+            if test -n "$dup_max" && test "$dup_max" -gt "$dup_threshold"; then
+                printf 'Repeated db transactions in %s:\n%s\n' "$db" "$dup"
+                AT_CHECK([test "$dup_max" -le "$dup_threshold"])
+            fi
+        done
+    fi
+])
+
+# OVN_CLEANUP_DBS
+#
+# Gracefully terminate NB, SB OVN daemons.
+m4_define([OVN_CLEANUP_DBS],[
+    as ovn-sb
+    OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+
+    as ovn-nb
+    OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+])
+
+# OVN_CLEANUP_NORTHD
+#
+# Gracefully terminate all central OVN daemons: NB, SB and ovn-northd.
+m4_define([OVN_CLEANUP_NORTHD],[
+    CHECK_NO_REPEATED_DB_ENTRIES
+    CHECK_UNEXPECTED_DB_CHANGES
+    OVN_CLEANUP_DBS
+
+    as northd
+    OVS_APP_EXIT_AND_WAIT([ovn-northd])
+
+    if test -d northd-backup; then
+        as northd-backup
+        OVS_APP_EXIT_AND_WAIT([ovn-northd])
+    fi
+])
+
 # OVN_CLEANUP_VSWITCH(sim)
 #
 # Gracefully terminate vswitch daemons in the
@@ -16,15 +278,23 @@ m4_define([DUMP_FLOWS], [
     sbox=$1
     output_file=$2
     as $sbox
-    ovs-ofctl dump-flows br-int |
+    ovs-ofctl dump-flows br-int  | grep -v "NXST_FLOW reply" |
           sed 's/cookie=0x[[^,]]*/cookie=xx/g' |
           sed 's/duration=[[^,]]*/duration=xx/g' |
           sed 's/idle_age=[[^,]]*/idle_age=xx/g' |
           sed 's/, hard_age=[[^,]]*//g' |
           sed 's/n_bytes=[[^,]]*/n_bytes=xx/g' |
           sed 's/n_packets=[[^,]]*/n_packets=xx/g' |
-          sed 's/conjunction([[^,]]*/conjunction(xx/g' |
           sort > $output_file
+])
+
+# DUMP_RELATED_PORTS(sbox, output_file)
+# Dump related ports
+m4_define([DUMP_RELATED_PORTS], [
+    sbox=$1
+    output_file=$2
+    as $sbox
+    ovn-appctl debug/dump-related-ports | sort > $output_file
 ])
 
 m4_define([CHECK_FLOWS_AFTER_RECOMPUTE], [
@@ -32,7 +302,7 @@ m4_define([CHECK_FLOWS_AFTER_RECOMPUTE], [
     sbox=$2
     # Make sure I+P has finalized his job before getting flows and comparing them after recompte.
     # Some tests have northd and ovn-nb ovsdb stopped, so avoid ovn-nbctl for those.
-    if [[ -e ovn-nb/ovn-nb.sock ]] && [[ -e northd/ovn-northd.pid ]]; then
+    if [[ -e ${AZ_DIR}ovn-nb/ovn-nb.sock ]] && [[ -e ${AZ_DIR}northd/ovn-northd.pid ]]; then
         # Do wait twice to handle some potential race conditions
         check ovn-nbctl --wait=hv sync
         check ovn-nbctl --wait=hv sync
@@ -41,16 +311,132 @@ m4_define([CHECK_FLOWS_AFTER_RECOMPUTE], [
     as $sbox
     if test "$hv" != "vtep"; then
       # Get flows before and after recompute
-      DUMP_FLOWS([$sbox], [flows-$hv-1])
+      DUMP_FLOWS([$sbox], [flows-$hv-before])
 
       check ovn-appctl -t ovn-controller recompute
       # The recompute might cause some sb changes. Let controller catch up.
-      if [[ -e ovn-nb/ovn-nb.sock ]] && [[ -e northd/ovn-northd.pid ]]; then
+      if [[ -e ${AZ_DIR}ovn-nb/ovn-nb.sock ]] && [[ -e ${AZ_DIR}northd/ovn-northd.pid ]]; then
           check ovn-nbctl --wait=hv sync
       fi
-      DUMP_FLOWS([$sbox], [flows-$hv-2])
-      diff flows-$hv-1 flows-$hv-2 > flow-diff
-      AT_CHECK([test $(diff flows-$hv-1 flows-$hv-2 | wc -l) == 0])
+      DUMP_FLOWS([$sbox], [flows-$hv-after])
+      # Avoid learned flows i.e. flows with idle_timeout and no learn.
+      diff flows-$hv-before flows-$hv-after |
+          grep "^[<>]" |
+          awk '(!/idle_timeout=/ && !/hard_timeout=/) || /learn/' > flow-diff
+
+      AT_CHECK([wc -l < flow-diff], [0], [0
+])
+    fi
+])
+
+m4_define([CHECK_RELATED_PORTS_AFTER_RECOMPUTE], [
+    hv=$1
+    sbox=$2
+    related_ports=$3
+    AT_CAPTURE_FILE([related-ports-diff])
+    # Make sure I+P has finalized the job before getting flows and comparing them after recompte.
+    # Some tests have northd and ovn-nb ovsdb stopped, so avoid ovn-nbctl for those.
+    if [[ -e ${AZ_DIR}ovn-nb/ovn-nb.sock ]] && [[ -e ${AZ_DIR}northd/ovn-northd.pid ]]; then
+        # Do wait twice to handle some potential race conditions
+        check ovn-nbctl --wait=hv sync
+        check ovn-nbctl --wait=hv sync
+    fi
+
+    as $sbox
+    if test "$hv" != "vtep"; then
+      DUMP_RELATED_PORTS([$sbox], [related-ports-$hv-before])
+      check ovn-appctl -t ovn-controller recompute
+      # The recompute might cause some sb changes. Let controller catch up.
+      if [[ -e ${AZ_DIR}ovn-nb/ovn-nb.sock ]] && [[ -e ${AZ_DIR}northd/ovn-northd.pid ]]; then
+          check ovn-nbctl --wait=hv sync
+      fi
+      DUMP_RELATED_PORTS([$sbox], [related-ports-$hv-after])
+      # Compare and store differences before and after recompute
+      comm -3 related-ports-$hv-before related-ports-$hv-after > related-ports-diff-$hv
+      # Ignore some differences.
+      echo "$related_ports" | comm -2 -3 related-ports-diff-$hv - > related-ports-diff
+      AT_CHECK([wc -l < related-ports-diff], [0], [0
+])
+    fi
+])
+
+# CHECK_AFTER_RECOMPUTE(hv, sbox, related_ports, ignored_dp)
+# Check related ports (ignoring $related_ports) and FLOWS (ignoring flows from $ignored_dp and from $ignored_tables)
+# by comparing IP flows and flows after recompute.
+# We also ignore Flows from tables OFTABLE_MAC_BINDING, OFTABLE_MAC_LOOKUP, OFTABLE_MAC_CACHE_USE.
+m4_define([CHECK_AFTER_RECOMPUTE], [
+    hv=$1
+    sbox=$2
+    related_ports=$3
+    ignored_dp=$4
+    ignored_tables=$5
+    AT_CAPTURE_FILE([related-ports-diff])
+    # Make sure I+P has finalized his job before getting flows and comparing them after recompte.
+    # Some tests have northd and ovn-nb ovsdb stopped, so avoid ovn-nbctl for those.
+    if [[ -e ${AZ_DIR}ovn-nb/ovn-nb.sock ]] && [[ -e ${AZ_DIR}northd/ovn-northd.pid ]]; then
+        # Do wait twice to handle some potential race conditions
+        check ovn-nbctl --wait=hv sync
+        check ovn-nbctl --wait=hv sync
+    fi
+
+    as $sbox
+    if test "$hv" != "vtep"; then
+      DUMP_RELATED_PORTS([$sbox], [related-ports-$hv-before])
+      DUMP_FLOWS([$sbox], [flows-$hv-before])
+      check ovn-appctl -t ovn-controller recompute
+      echo "Checking after recompute for $sbox"
+      # The recompute might cause some sb changes. Let controller catch up.
+      if [[ -e ${AZ_DIR}ovn-nb/ovn-nb.sock ]] && [[ -e ${AZ_DIR}northd/ovn-northd.pid ]]; then
+          check ovn-nbctl --wait=hv sync
+      fi
+      DUMP_RELATED_PORTS([$sbox], [related-ports-$hv-after])
+      DUMP_FLOWS([$sbox], [flows-$hv-after])
+
+      # Compare and store related_ports differences before and after recompute
+      comm -3 related-ports-$hv-before related-ports-$hv-after > related-ports-diff-$hv
+      # Ignore some differences.
+      if [[ -n "$related_ports" ]]; then
+        echo "Ignoring related ports $related_ports"
+      fi
+      echo "$related_ports" | comm -2 -3 related-ports-diff-$hv - > related-ports-diff
+      AT_CHECK([wc -l < related-ports-diff], [0], [0
+])
+
+      # Compare and store flow differences before and after recompute
+      # Avoid learned flows i.e. flows with idle_timeout and no learn.
+      diff -u flows-$hv-before flows-$hv-after |
+          grep "^+ \|^- " |
+          awk '(!/idle_timeout=/ && !/hard_timeout=/) || /learn/' > flow-diff-$hv
+      if [[ -n "$related_ports" ]]; then
+        tag=$(ovn-sbctl --bare --columns tag list port_binding $related_ports)
+        if [[ -n "$tag" ]]; then
+          echo "Ignoring tag $tag"
+          cat flow-diff-$hv | grep -v "dl_vlan=$tag" > tmp; mv tmp flow-diff-$hv
+        fi
+      fi
+
+      dps=$(echo "$ignored_dp" | tr ',' ' ')
+      for dp in $dps
+      do
+        if [[ -n "${dp}" ]]; then
+          key=$(printf '0x%x' $(ovn-sbctl --bare --columns tunnel_key list datapath $dp))
+          if [[ -n "${key}" ]]; then
+            echo "Ignoring $dp i.e. tunnel_key $key"
+            cat flow-diff-$hv | grep -v "metadata=$key" | grep -v "load:${key}->OXM_OF_METADATA" > tmp; mv tmp flow-diff-$hv
+          fi
+        fi
+      done
+
+      tables=$(echo "$ignored_tables" | tr ',' ' ')
+      for table in $tables
+      do
+        echo "Ignoring table $table"
+        cat flow-diff-$hv | grep -v "table=$table" > tmp; mv tmp flow-diff-$hv
+      done
+
+      cat flow-diff-$hv | grep -v "table=OFTABLE_MAC_BINDING" | grep -v "table=OFTABLE_MAC_LOOKUP" | grep -v "table=OFTABLE_MAC_CACHE_USE" > tmp; mv tmp flow-diff-$hv
+      AT_CHECK([wc -l < flow-diff-$hv], [0], [0
+])
     fi
 ])
 
@@ -63,9 +449,14 @@ m4_define([CHECK_FLOWS_AFTER_RECOMPUTE], [
 m4_define([OVN_CLEANUP_CONTROLLER],[
     hv=$1
     sbox=$2
+    related_ports=$3
+    ignored_dp=$4
+    ignored_tables=$5
+    no_recompute_check=$6
+    if test "$no_recompute_check" != "True"; then
+        CHECK_AFTER_RECOMPUTE([$hv], [$sbox], [$related_ports], [$ignored_dp], [$ignored_tables])
+    fi
 
-    ovn-nbctl --wait=hv sync
-    as $sbox
     if test "$hv" = "vtep"; then
         OVS_APP_EXIT_AND_WAIT([ovn-controller-vtep])
         OVS_APP_EXIT_AND_WAIT([ovs-vtep])
@@ -83,8 +474,13 @@ m4_define([OVN_CLEANUP_CONTROLLER],[
 m4_define([OVN_CLEANUP_SBOX],[
     sbox=$1
     error=$2
+    related_ports=$3
+    ignored_dp=$4
+    ignored_tables=$5
+    no_recompute_check=$6
     echo "$sbox: clean up sandbox"
-    OVN_CLEANUP_CONTROLLER([$sbox], [$sbox])
+    as $sbox
+    OVN_CLEANUP_CONTROLLER([$sbox], [$sbox], [$related_ports], [$ignored_dp], [$ignored_tables], [$no_recompute_check])
     OVN_CLEANUP_VSWITCH([$sbox])
 
     # Check for errors in logs. Ignore following errors:
@@ -94,6 +490,8 @@ m4_define([OVN_CLEANUP_SBOX],[
     # "Failed to locate tunnel to reach main chassis" happening when controller started e.g. before ovn-bridge-mappings is set
     # "Transaction causes multiple rows in \"MAC_Binding\" table to have identical values"
     #  happening as ovn-controller has a race condition over MAC binding table with other controllers (GARP).
+    # "Transaction causes multiple rows in \"FDB\" table to have identical values"
+    #  happens when there is a race between multiple ovn-controllers that try to create the same FDB.
     AT_CHECK([check_logs "
         $error
         /connection failed (No such file or directory)/d
@@ -101,6 +499,7 @@ m4_define([OVN_CLEANUP_SBOX],[
         /receive tunnel port not found*/d
         /Failed to locate tunnel to reach main chassis/d
         /Transaction causes multiple rows.*MAC_Binding/d
+        /Transaction causes multiple rows.*FDB/d
     " $sbox])
 ])
 
@@ -109,10 +508,20 @@ m4_define([OVN_CLEANUP_SBOX],[
 # Gracefully terminate all OVN daemons, including those in the
 # specified sandbox instances.
 m4_define([OVN_CLEANUP],[
+    CHECK_NO_REPEATED_DB_ENTRIES
+    CHECK_UNEXPECTED_DB_CHANGES
     m4_foreach([sbox_and_error], [$@], [
         sbox=$(echo "sbox_and_error" |sed -n '1p')
-        error=$(echo "sbox_and_error" | sed -n '2,$p')
-        OVN_CLEANUP_SBOX([$sbox], [$error])
+        error=$(echo "sbox_and_error"  | grep '/')
+        ignored_dp=$(echo "sbox_and_error"  | grep 'ignored_dp' |  cut -d'=' -f 2)
+        ignored_tables=$(echo "sbox_and_error"  | grep 'ignored_tables' |  cut -d'=' -f 2)
+        related_ports=$(echo "sbox_and_error" | sed -n '2,$p' | grep -v '/' | grep -v 'ignored_dp' | grep -v 'ignored_tables')
+        CHECK_AFTER_RECOMPUTE([$sbox], [$sbox], [$related_ports], [$ignored_dp], [$ignored_tables])
+    ])
+    m4_foreach([sbox_and_error], [$@], [
+        sbox=$(echo "sbox_and_error" |sed -n '1p')
+        error=$(echo "sbox_and_error"  | grep '/')
+        OVN_CLEANUP_SBOX([$sbox], [$error], [], [], [], ["True"])
     ])
 
     echo
@@ -164,6 +573,8 @@ m4_define([OVN_CLEANUP_AZ],[
 # Gracefully terminate all interconnection DBs, and daemons in the
 # specified AZs, if any.
 m4_define([OVN_CLEANUP_IC],[
+    CHECK_NO_REPEATED_DB_ENTRIES
+    CHECK_UNEXPECTED_DB_CHANGES
     m4_foreach([az], [$@], [
         OVN_CLEANUP_AZ([az])
     ])
@@ -179,6 +590,43 @@ m4_define([OVN_CLEANUP_IC],[
     if test -d "$ovs_base"/main; then
         OVN_CLEANUP_VSWITCH([main])
     fi
+])
+
+# CHECK_ROUTE_RECOMPUTE(CHANGE_CMD, EXPECT)
+#
+# Quiesces the ovn-ic engine and clears its stats, runs CHANGE_CMD, and then
+# asserts that the en_route node's recompute count is "0" (EXPECT=norecompute)
+# or non-zero (EXPECT=recompute).
+m4_define([CHECK_ROUTE_RECOMPUTE], [
+    check ovn-ic-nbctl --wait=sb sync
+    check ovn-appctl -t ic/ovn-ic inc-engine/recompute
+    check ovn-ic-nbctl --wait=sb sync
+    check ovn-appctl -t ic/ovn-ic inc-engine/clear-stats
+    $1
+    check ovn-ic-nbctl --wait=sb sync
+    rc=$(ovn-appctl -t ic/ovn-ic inc-engine/show-stats route recompute)
+    echo "route recompute count after '$1': $rc (expect $2)"
+    if test "$2" = norecompute; then
+        AT_CHECK([test "$rc" = 0])
+    else
+        AT_CHECK([test "$rc" -gt 0])
+    fi
+])
+
+# OVN_IC_ROUTE_DUMP(FILE)
+#
+# Dumps the routing state this AZ manages - its NB static routes and the IC-SB
+# routes - into FILE, so two dumps can be compared.
+m4_define([OVN_IC_ROUTE_DUMP], [
+    ovn-nbctl --columns=ip_prefix,nexthop list logical_router_static_route \
+        | sort > $1
+    ovn-ic-sbctl --columns=ip_prefix,nexthop,transit_switch list route \
+        | sort >> $1
+])
+
+m4_define([CHECK_SCAPY],[
+    AT_SKIP_IF([test $HAVE_SCAPY = no])
+    start_scapy_server
 ])
 
 m4_divert_push([PREPARE_TESTS])
@@ -284,7 +732,7 @@ ovn_start () {
     ovn_init_db ovn-sb $1; ovn-sbctl init
     ovn_init_db ovn-nb $1; ovn-nbctl init
     if test -n "$1"; then
-        ovn-nbctl set NB_Global . name=$1
+        check ovn-nbctl set NB_Global . name=$1
     fi
 
     ovn_start_northd primary $AZ
@@ -314,7 +762,7 @@ ovn_start () {
     fi
 
     if test -n "$AZ"; then
-        ovn-nbctl --wait=sb sync || exit $?
+        check ovn-nbctl --wait=sb sync || exit $?
 
         echo "${msg_prefix}starting ovn-ic"
         mkdir "$ovs_base"/$d_prefix/ic
@@ -441,6 +889,13 @@ ovn_az_attach() {
         ovs-vsctl set open . external_ids:ovn-monitor-all=true
     fi
 
+    # Configure flow-based tunnels if the test variable is set
+    if test X$OVN_ENABLE_FLOW_BASED_TUNNELS = Xyes; then
+        ovs-vsctl set open . external_ids:ovn-enable-flow-based-tunnels=true
+    elif test X$OVN_ENABLE_FLOW_BASED_TUNNELS = Xno; then
+        ovs-vsctl set open . external_ids:ovn-enable-flow-based-tunnels=false
+    fi
+
     start_daemon ovn-controller --enable-dummy-vif-plug ${cli_args} || return 1
     if test X"$az" = XNONE; then
         ovn_wait_for_encaps $expected_encap_id
@@ -493,6 +948,7 @@ start_virtual_controller() {
 # ovn_setenv AZ
 ovn_setenv () {
     local d=$ovs_base/$1
+    AS_VAR_SET([AZ_DIR], ["$d"/]); export $var
     AS_VAR_SET([OVN_NB_DB], [unix:"$d"/ovn-nb/ovn-nb.sock]); export $var
     AS_VAR_SET([OVN_SB_DB], [unix:"$d"/ovn-sb/ovn-sb.sock]); export $var
 }
@@ -532,6 +988,15 @@ OVS_START_SHELL_HELPERS
 check() {
     echo "$@"
     AT_CHECK(["$@"])
+}
+
+# Runs COMMAND and checks that it does not print anything else than uuid as output.
+# It also fails if the output is empty.
+check_uuid() {
+    echo "$@"
+    output=$("${@}")
+    AT_CHECK([echo "$output" | grep .], [0], [ignore], [], [echo "Unexpected empty output: check_uuid is expecting a UUID"])
+    AT_CHECK([echo "$output" | grep -vE '^[[0-9a-fA-F]]{8}-[[0-9a-fA-F]]{4}-[[0-9a-fA-F]]{4}-[[0-9a-fA-F]]{4}-[[0-9a-fA-F]]{12}$'], [1])
 }
 
 parse_db() {
@@ -916,6 +1381,63 @@ store_ip6_multicast_pkt() {
     echo ${packet} >> ${outfile}
 }
 
+hex_to_mac() {
+    mac_hex=$1
+    echo $mac_hex | sed 's/../&:/g;s/:$//'
+}
+
+send_garp() {
+    local hv=$1 inport=$2 op=$3 eth_src=$4 eth_dst=$5 spa=$6 tpa=$7
+
+    local packet=$(fmt_pkt "Ether(dst='${eth_dst}', src='${eth_src}')/ \
+                      ARP(op=$op, hwsrc='${eth_src}', hwdst='${eth_src}', \
+                      psrc='${spa}', pdst='${tpa}')")
+    echo "Sending GARP($op) $eth_src $eth_dst $spa $tpa packet=$packet on $hv"
+    check as $hv ovs-appctl netdev-dummy/receive $inport $packet
+}
+
+send_na() {
+    local hv=$1 dev=$2 hsrc=$3 hdst=$4 isrc=$5 idst=$6
+    local packet=$(fmt_pkt "Ether(dst='${hdst}', src='${hsrc}')/ \
+                            IPv6(dst='${idst}', src='${isrc}')/ \
+                            ICMPv6ND_NA(tgt='${isrc}')/ \
+                            ICMPv6NDOptDstLLAddr(lladdr='${hsrc}')")
+    echo "${packet}"
+    check as $hv ovs-appctl netdev-dummy/receive $dev $packet >&2
+}
+
+send_udp() {
+    local hv=$1 dev=$2 hdst=$3 hsrc=$4 idst=$5 isrc=$6
+    local packet=$(fmt_pkt "Ether(dst='${hdst}', src='${hsrc}')/ \
+                            IP(dst='${idst}', src='${isrc}')/UDP()")
+    check as $hv ovs-appctl netdev-dummy/receive $dev $packet
+}
+
+send_udp6() {
+    local hv=$1 dev=$2 hdst=$3 hsrc=$4 idst=$5 isrc=$6
+    local packet=$(fmt_pkt "Ether(dst='${hdst}', src='${hsrc}')/ \
+                            IPv6(dst='${idst}', src='${isrc}')/UDP()")
+    check as $hv ovs-appctl netdev-dummy/receive $dev $packet
+}
+
+dump_arp() {
+    local op=$1 eth_src=$2 eth_dst=$3 spa=$4 tpa=$5 hwdst=$6
+
+    local packet=$(fmt_pkt "Ether(dst='${eth_dst}', src='${eth_src}')/ \
+                      ARP(op=$op, hwsrc='${eth_src}', hwdst='${hwdst}', \
+                      psrc='${spa}', pdst='${tpa}')")
+    echo $packet
+}
+
+dump_ns() {
+    local hdst=$1 hsrc=$2 idst=$3 isrc=$4 tgt=$5
+    local packet=$(fmt_pkt "Ether(dst='${hdst}', src='${hsrc}')/ \
+                            IPv6(dst='${idst}', src='${isrc}')/ \
+                            ICMPv6ND_NS(tgt='${tgt}')/ \
+                            ICMPv6NDOptSrcLLAddr(lladdr='${hsrc}')")
+    echo $packet
+}
+
 # Wrapper on top of ovn-trace, stripping some things and storing the trace
 # output to a file called 'trace'.  For now it strips the rows starting
 # with a '#'.  This should correspond to the flow key and might be displayed
@@ -929,7 +1451,7 @@ ovn_trace() {
 ovn_trace_client() {
     target=$1; shift
     AT_CAPTURE_FILE([trace])
-    ovs-appctl -t $target trace "$@" | tee trace | sed '/^# /d'
+    ovn-appctl -t $target trace "$@" | tee trace | sed '/^# /d'
 }
 
 # Receives a string with scapy python code that represents a packet.
@@ -950,10 +1472,6 @@ ovn_trace_client() {
 #
 fmt_pkt() {
     ctlfile=$ovs_base/scapy.ctl
-    if [[ ! -S $ctlfile ]]; then
-        start_scapy_server
-    fi
-    while [[ ! -S $ctlfile ]]; do sleep 0.1; done
     ovs-appctl -t $ctlfile payload "$1"
 }
 
@@ -966,12 +1484,13 @@ start_scapy_server() {
     flock -n $lockfile "$top_srcdir"/tests/scapy-server.py \
         --pidfile=$pidfile --unixctl=$ctlfile --log-file=$logfile --detach \
     && on_exit "test -e \"$pidfile\" && ovs-appctl -t $ctlfile exit"
+    OVS_WAIT_UNTIL([test -S "$ctlfile" && ovs-appctl -t "$ctlfile" version])
 }
 
 sleep_northd() {
   echo Northd going to sleep
   AT_CHECK([kill -STOP $(cat northd/ovn-northd.pid)])
-  on_exit "kill -CONT $(cat northd/ovn-northd.pid)"
+  on_exit "test -e northd/ovn-northd.pid && kill -CONT $(cat northd/ovn-northd.pid)"
 }
 
 wake_up_northd() {
@@ -982,7 +1501,7 @@ wake_up_northd() {
 sleep_sb() {
   echo SB going to sleep
   AT_CHECK([kill -STOP $(cat ovn-sb/ovsdb-server.pid)])
-  on_exit "kill -CONT $(cat ovn-sb/ovsdb-server.pid)"
+  on_exit "test -e ovn-sb/ovsdb-server.pid && kill -CONT $(cat ovn-sb/ovsdb-server.pid)"
 }
 wake_up_sb() {
   echo SB waking up
@@ -1006,7 +1525,7 @@ sleep_ovs() {
   hv=$1
   echo ovs $hv going to sleep
   AT_CHECK([kill -STOP $(cat $hv/ovs-vswitchd.pid)])
-  on_exit "kill -CONT $(cat $hv/ovs-vswitchd.pid)"
+  on_exit "test -e $hv/ovs-vswitchd.pid && kill -CONT $(cat $hv/ovs-vswitchd.pid)"
 }
 
 wake_up_ovs() {
@@ -1018,7 +1537,7 @@ wake_up_ovs() {
 sleep_ovsdb() {
   echo OVSDB $1 going to sleep
   AT_CHECK([kill -STOP $(cat $1/ovsdb-server.pid)])
-  on_exit "kill -CONT $(cat $1/ovsdb-server.pid)"
+  on_exit "test -e $1/ovsdb-server.pid && kill -CONT $(cat $1/ovsdb-server.pid)"
 }
 wake_up_ovsdb() {
   echo OVSDB $1 waking up
@@ -1029,16 +1548,29 @@ stop_ovsdb_controller_updates() {
   TCP_PORT=$1
   echo Stopping updates from ovn-controller to ovsdb using port $TCP_PORT
   on_exit 'nft list tables | grep ovn-test && nft delete table ip ovn-test'
-  nft add table ip ovn-test
-  nft 'add chain ip ovn-test INPUT { type filter hook input priority 0; policy accept; }'
-  nft add rule ip ovn-test INPUT tcp dport $TCP_PORT counter drop
+  # Report the test as skipped if proper nft related packages are not installed.
+  AT_SKIP_IF([test $HAVE_NFT = no])
+  AT_CHECK([nft add table ip ovn-test])
+  AT_CHECK([nft 'add chain ip ovn-test INPUT { type filter hook input priority 0; policy accept; }'])
+  AT_CHECK([nft add rule ip ovn-test INPUT tcp dport $TCP_PORT counter drop])
 }
 
 restart_ovsdb_controller_updates() {
   TCP_PORT=$1
   echo Restarting updates from ovn-controller to ovsdb
-  nft list ruleset | grep $TCP_PORT
-  nft delete table ip ovn-test
+  AT_CHECK([nft list ruleset | grep $TCP_PORT], [0], [ignore])
+  AT_CHECK([nft delete table ip ovn-test])
+}
+
+sleep_nb() {
+  echo NB going to sleep
+  AT_CHECK([kill -STOP $(cat ovn-nb/ovsdb-server.pid)])
+  on_exit "test -e ovn-nb/ovsdb-server.pid && kill -CONT $(cat ovn-nb/ovsdb-server.pid)"
+}
+
+wake_up_nb() {
+  echo NB waking up
+  AT_CHECK([kill -CONT $(cat ovn-nb/ovsdb-server.pid)])
 }
 
 trim_zeros() {
@@ -1049,9 +1581,73 @@ ovn_strip_lflows() {
      sed 's/table=[[0-9]]\{1,2\}\s\?/table=??/g' | sort
 }
 
+# The ECMP group and member ids are derived from hashes of the routes, replace
+# them with <gid> and <mid>.
+ovn_strip_ecmp_ids() {
+    sed -e 's/\(reg8\[[0\.\.15\]] =\{1,2\} \)[[1-9]][[0-9]]*/\1<gid>/' \
+        -e 's/\(reg8\[[16\.\.31\]] =\{1,2\} \)[[1-9]][[0-9]]*/\1<mid>/' \
+        -e ':a' \
+        -e 's/\(select[[^)]]*[[(, ]]\)[[0-9]][[0-9]]*/\1<mid>/' \
+        -e 'ta'
+}
+
+# ecmp_ids LR PREFIX: prints the group id and the comma separated member ids
+# of the ECMP group of PREFIX on LR, and fails if the members listed in its
+# select() action are not the ones that have a flow in lr_in_ip_routing_ecmp.
+ecmp_ids() {
+    local flows gid sel mids
+    flows=$(ovn-sbctl dump-flows $1)
+    gid=$(echo "$flows" | sed -n "s|.*ip[[46]]\.dst == $2).*reg8\[[0\.\.15\]] = \([[0-9]]*\);.*|\1|p")
+    sel=$(echo "$flows" | sed -n "s|.*ip[[46]]\.dst == $2).*select(\([[^)]]*\));.*|\1|p" | tr -d ' ')
+    mids=$(echo "$flows" | sed -n "s|.*(reg8\[[0\.\.15\]] == $gid && reg8\[[16\.\.31\]] == \([[0-9]]*\)).*|\1|p" | sort -n | paste -sd, -)
+    if test -z "$gid" || test "$sel" != "$mids"; then
+        echo "$2: group '$gid', select($sel) != members($mids)" >&2
+        return 1
+    fi
+    echo "$gid $sel"
+}
+
+# ecmp_member_id LR PREFIX NEXTHOP: prints the member id of NEXTHOP in the
+# ECMP group of PREFIX on LR.
+ecmp_member_id() {
+    local gid
+    gid=$(ecmp_ids $1 $2 | cut -d' ' -f1)
+    ovn-sbctl dump-flows $1 | sed -n "s|.*(reg8\[[0\.\.15\]] == $gid && reg8\[[16\.\.31\]] == \([[0-9]]*\)), action=(reg0 = $3;.*|\1|p"
+}
+
+ovn_strip_collector_set() {
+    sed 's/collector_set=[[0-9]]*,\?/collector_set=??,/g'
+}
+
+netlink_if_index() {
+    local ns_prefix=
+    if test -n "$2"; then
+        ns_prefix="ip netns exec $2"
+    fi
+    $ns_prefix ip -o link show dev $1 | awk -F: '{print $1}'
+}
+
+# Allocate a nexthop ID that is not currently in use by the system.
+# Prints the allocated ID to stdout.
+nexthop_alloc() {
+    for _nh_try in $(shuf -i 1000000-2000000 -n 10); do
+        if ! ip nexthop show id $_nh_try > /dev/null 2>&1; then
+            echo $_nh_try
+            return
+        fi
+    done
+    echo "Could not allocate a free nexthop ID"
+    AT_FAIL_IF([:])
+}
+
 OVS_END_SHELL_HELPERS
 
 m4_define([OVN_POPULATE_ARP], [AT_CHECK(ovn_populate_arp__, [0], [ignore])])
+
+# OVN_CLEAR_ARP_TABLE
+#
+# Clears the ARP table populated by ovn_attach().
+m4_define([OVN_CLEAR_ARP_TABLE], [arp_table=""])
 
 # Defines versions of the test with all combinations of northd,
 # parallelization enabled and conditional monitoring on/off.
@@ -1073,6 +1669,16 @@ m4_define([OVN_FOR_EACH_NORTHD_NO_HV],
 m4_define([OVN_FOR_EACH_NORTHD_NO_HV_PARALLELIZATION],
   [m4_foreach([NORTHD_USE_PARALLELIZATION], [yes, no], [$1
 ])])
+
+# Defines versions of the test with all combinations of northd,
+# parallelization enabled, conditional monitoring on/off, and flow-based
+# tunnels on/off. Use this for tests that need to verify behavior with both
+# port-based and flow-based tunnel implementations.
+m4_define([OVN_FOR_EACH_NORTHD_FLOW_TUNNEL],
+  [m4_foreach([NORTHD_USE_PARALLELIZATION], [yes],
+     [m4_foreach([OVN_MONITOR_ALL], [yes, no],
+        [m4_foreach([OVN_ENABLE_FLOW_BASED_TUNNELS], [yes, no], [$1
+])])])])
 
 # OVN_NBCTL(NBCTL_COMMAND) adds NBCTL_COMMAND to list of commands to be run by RUN_OVN_NBCTL().
 m4_define([OVN_NBCTL], [
@@ -1101,34 +1707,74 @@ m4_define([TAG_UNSTABLE], [
     AT_SKIP_IF([test X"$SKIP_UNSTABLE" = Xyes])
 ])
 
+# TAG_TEST_NOT_UPGRADABLE tag indicates that the test would fail
+# "upgrade" test (i.e. running old ovn-northd and new ovn-controller)
+m4_define([TAG_TEST_NOT_UPGRADABLE], [
+    AT_SKIP_IF([test X"$UPGRADE_TEST" = Xyes])
+])
+
 m4_define([OVN_CHECK_SCAPY_EDNS_CLIENT_SUBNET_SUPPORT],
 [
-    AT_SKIP_IF([test $HAVE_SCAPY = no])
     AT_SKIP_IF([! echo "from scapy.layers.dns import EDNS0ClientSubnet" | python 2>&1 > /dev/null])
+])
+
+# OVN_CONTROLLER_EXIT exits ovn-controller running on $1, with option $2 (e.g. --restart)
+m4_define([OVN_CONTROLLER_EXIT],
+  [TMPPID=$(cat ./$1/ovn-controller.pid)
+   AT_CHECK([as $1
+check ovn-appctl -t ovn-controller exit $2])
+   # Make sure ovn-controller stopped so that a future restart will not fail.
+   # Checking debug/status is running is not enough as there might be a small race condition.
+   echo "Waiting for pid $TMPPID"
+   OVS_WAIT_WHILE([kill -0 $TMPPID 2>/dev/null])
+])
+
+# OVN_SKIP_MEM_LEAK([leak ...])
+#
+# Skip memory leak, it can be function name, file path etc.
+m4_define([OVN_SKIP_MEM_LEAK],[
+    m4_foreach([def], [$@], [
+        echo "leak:def" >> ovn_leak_suppression.txt
+    ])
+
+    LSAN_OPTIONS=$LSAN_OPTIONS:suppressions=ovn_leak_suppression.txt
+    LSAN_OPTIONS=$LSAN_OPTIONS:print_suppressions=0
+    export LSAN_OPTIONS
 ])
 
 m4_define([OFTABLE_PHY_TO_LOG], [0])
 m4_define([OFTABLE_LOG_INGRESS_PIPELINE], [8])
-m4_define([OFTABLE_OUTPUT_LARGE_PKT_DETECT], [37])
-m4_define([OFTABLE_OUTPUT_LARGE_PKT_PROCESS], [38])
-m4_define([OFTABLE_REMOTE_OUTPUT], [39])
-m4_define([OFTABLE_LOCAL_OUTPUT], [40])
-m4_define([OFTABLE_LOG_EGRESS_PIPELINE], [42])
-m4_define([OFTABLE_SAVE_INPORT], [64])
-m4_define([OFTABLE_LOG_TO_PHY], [65])
-m4_define([OFTABLE_MAC_BINDING], [66])
-m4_define([OFTABLE_MAC_LOOKUP], [67])
-m4_define([OFTABLE_CHK_LB_HAIRPIN], [68])
-m4_define([OFTABLE_CHK_LB_HAIRPIN_REPLY], [69])
-m4_define([OFTABLE_CT_SNAT_HAIRPIN], [70])
-m4_define([OFTABLE_GET_FDB], [71])
-m4_define([OFTABLE_LOOKUP_FDB], [72])
-m4_define([OFTABLE_CHK_IN_PORT_SEC], [73])
-m4_define([OFTABLE_CHK_IN_PORT_SEC_ND], [74])
-m4_define([OFTABLE_CHK_OUT_PORT_SEC], [75])
-m4_define([OFTABLE_ECMP_NH_MAC], [76])
-m4_define([OFTABLE_ECMP_NH], [77])
-m4_define([OFTABLE_CHK_LB_AFFINITY], [78])
-m4_define([OFTABLE_MAC_CACHE_USE], [79])
+m4_define([OFTABLE_OUTPUT_LARGE_PKT_DETECT], [52])
+m4_define([OFTABLE_OUTPUT_LARGE_PKT_PROCESS], [53])
+m4_define([OFTABLE_REMOTE_OUTPUT], [54])
+m4_define([OFTABLE_REMOTE_VTEP_OUTPUT], [55])
+m4_define([OFTABLE_LOCAL_OUTPUT], [56])
+m4_define([OFTABLE_CHECK_LOOPBACK], [57])
+m4_define([OFTABLE_LOG_EGRESS_PIPELINE], [62])
+m4_define([OFTABLE_SAVE_INPORT], [88])
+m4_define([OFTABLE_LOG_TO_PHY], [89])
+m4_define([OFTABLE_MAC_BINDING], [90])
+m4_define([OFTABLE_MAC_LOOKUP], [91])
+m4_define([OFTABLE_CHK_LB_HAIRPIN], [92])
+m4_define([OFTABLE_CHK_LB_HAIRPIN_REPLY], [93])
+m4_define([OFTABLE_CT_SNAT_HAIRPIN], [94])
+m4_define([OFTABLE_GET_FDB], [95])
+m4_define([OFTABLE_LOOKUP_FDB], [96])
+m4_define([OFTABLE_CHK_IN_PORT_SEC], [97])
+m4_define([OFTABLE_CHK_IN_PORT_SEC_ND], [98])
+m4_define([OFTABLE_CHK_OUT_PORT_SEC], [99])
+m4_define([OFTABLE_CHK_LB_AFFINITY], [100])
+m4_define([OFTABLE_MAC_CACHE_USE], [101])
+m4_define([OFTABLE_CT_ZONE_LOOKUP], [102])
+m4_define([OFTABLE_CT_ORIG_NW_DST_LOAD], [103])
+m4_define([OFTABLE_CT_ORIG_IP6_DST_LOAD], [104])
+m4_define([OFTABLE_CT_ORIG_TP_DST_LOAD], [105])
+m4_define([OFTABLE_FLOOD_REMOTE_CHASSIS], [106])
+m4_define([OFTABLE_CT_STATE_SAVE], [107])
+m4_define([OFTABLE_CT_ORIG_PROTO_LOAD], [108])
+m4_define([OFTABLE_GET_REMOTE_FDB], [109])
+m4_define([OFTABLE_LEARN_REMOTE_FDB], [110])
+m4_define([OFTABLE_EVPN_ARP_LOOKUP], [111])
+m4_define([OFTABLE_NF_ORIG_INPORT_LEARN], [112])
 
 m4_define([OFTABLE_SAVE_INPORT_HEX], [m4_eval(OFTABLE_SAVE_INPORT, 16)])

@@ -45,9 +45,10 @@ Scheduling`_ for the timing of each stage:
 1. "Soft freeze" of the main branch.
 
    During the freeze, we ask committers to refrain from applying patches that
-   add new features unless those patches were already being publicly discussed
-   and reviewed before the freeze began.  Bug fixes are welcome at any time.
-   Please propose and discuss exceptions on ovs-dev.
+   add new features unless those patches were already posted for public review
+   and had received public review feedback on the mailing list before the
+   freeze began.  Bug fixes are welcome at any time.  Please propose and
+   discuss exceptions on ovs-dev.
  
 2. Fork a release branch from main, named for the expected release number,
    e.g. "branch-25.09" for the branch that will yield OVN 25.09.x.
@@ -65,8 +66,8 @@ Scheduling`_ for the timing of each stage:
    and risk and discussed on ovs-dev before creating the branch.
 
    In order to keep the CI stable on the new release branch, the Ubuntu
-   container should be pinned to the current LTS version in the Dockerfile
-   e.g. registry.hub.docker.com/library/ubuntu:22.04.
+   container should be pinned to the LTS version used by the project's
+   container Dockerfile, e.g. registry.hub.docker.com/library/ubuntu:26.04.
 
 3. When committers come to rough consensus that the release is ready, they
    release the .0 release on its branch, e.g. 25.09.0 for branch-25.09.  To
@@ -115,9 +116,13 @@ or security fixes.
 
 The branches for standard term support versions may receive bug fixes and
 critical and security fixes after the OVN team has stopped creating regular
-releases. This is strictly to facilitate easy backporting of fixes to LTS
+releases. This is to facilitate easy backporting of fixes to LTS
 versions that are still receiving regular releases. Even though the branch may
 receive additional fixes, no releases will be made with these fixes.
+
+Sometimes, a fix can be backported to these branches if requested by the user
+or author of that fix.  The request maybe rejected by the maintainers if it is
+deemed risky or complex.
 
 Release Numbering
 -----------------
@@ -147,13 +152,13 @@ approximate:
 +---------------+---------------------+--------------------------------------+
 | Time (months) | Example Dates       | Stage                                |
 +---------------+---------------------+--------------------------------------+
-| T             | Mar 1, Sep 1, ...   | Begin x.y release cycle              |
+| T             | Mar 15, Sep 16, ... | Begin x.y release cycle              |
 +---------------+---------------------+--------------------------------------+
-| T + 4.5       | Jul 15, Jan 15, ... | "Soft freeze" main for x.y release   |
+| T + 4         | Jul 15, Jan 15, ... | "Soft freeze" main for x.y release   |
 +---------------+---------------------+--------------------------------------+
-| T + 5         | Aug 1, Feb 1, ...   | Fork branch-x.y from main            |
+| T + 5         | Aug 15, Feb 15, ... | Fork branch-x.y from main            |
 +---------------+---------------------+--------------------------------------+
-| T + 6         | Sep 1, Mar 1, ...   | Release version x.y.0                |
+| T + 6         | Sep 15, Mar 15, ... | Release version x.y.0                |
 +---------------+---------------------+--------------------------------------+
 
 Subsequent Releases
@@ -173,29 +178,28 @@ OVN version.
 Release Calendar
 ----------------
 
-The 2023 timetable is shown below. Note that these dates are not set in stone.
+The 2026 timetable is shown below. Note that these dates are not set in stone.
 If extenuating circumstances arise, a release may be delayed from its target
-date. Also note that the release policy changed partway through 2023, which is
-why the release dates and timetables do not line up with the example above.
+date.
 
 +---------+-------------+-----------------+---------+
 | Release | Soft Freeze | Branch Creation | Release |
 +---------+-------------+-----------------+---------+
-| 23.03.0 | Feb 3       | Feb 17          | Mar 3   |
+| 26.03.0 | Jan 23      | Feb 20          | Mar 20  |
 +---------+-------------+-----------------+---------+
-| 23.06.0 | May 5       | May 19          | Jun 2   |
-+---------+-------------+-----------------+---------+
-| 23.09.0 | Aug 4       | Aug 18          | Sep 1   |
+| 26.09.0 | Jul 24      | Aug 21          | Sep 18  |
 +---------+-------------+-----------------+---------+
 
-Below is the 2024 timetable
+Below is the 2027 timetable. Note that unlike in previous years, this
+calendar proposes Tuesday releases instead of Friday releases. However,
+soft freeze and branching dates are still on Fridays.
 
 +---------+-------------+-----------------+---------+
 | Release | Soft Freeze | Branch Creation | Release |
 +---------+-------------+-----------------+---------+
-| 24.03.0 | Jan 19      | Feb 2           | Mar 1   |
+| 27.03.0 | Jan 22      | Feb 19          | Mar 23  |
 +---------+-------------+-----------------+---------+
-| 24.09.0 | Jul 19      | Aug 2           | Sep 6   |
+| 27.09.0 | Jul 23      | Aug 20          | Sep 21  |
 +---------+-------------+-----------------+---------+
 
 Contact

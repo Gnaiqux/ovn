@@ -29,16 +29,32 @@
 #include "lib/ovn-sb-idl.h"
 #include "lib/ovn-util.h"
 
+enum ovn_nat_type {
+    SNAT,
+    DNAT,
+    DNAT_AND_SNAT,
+};
+
 /* Contains a NAT entry with the external addresses pre-parsed. */
 struct ovn_nat {
     const struct nbrec_nat *nb;
-    struct lport_addresses ext_addrs;
+    struct lport_addresses ext_addrs; /* Parsed NB.NAT.external_ip. */
+    struct eth_addr mac;              /* Parsed NB.NAT.external_mac. */
+    int logical_ip_cidr_bits;         /* Parsed NB.NATlogical_ip prefix len. */
     struct ovs_list ext_addr_list_node; /* Linkage in the per-external IP
                                          * list of nat entries. Currently
                                          * only used for SNAT.
                                          */
     bool is_router_ip; /* Indicates if the NAT external_ip is also one of
                         * router's lrp ip.  Can be 'true' only for SNAT. */
+
+    struct ovn_port *l3dgw_port; /* If non-NULL, the distributed gateway port
+                                  * this NAT will use.  NULL for gateway
+                                  * routers. */
+    bool is_distributed;         /* True if this NAT record is fully
+                                  * distributed. */
+    bool is_valid; /* True if the configuration of this entry is valid. */
+    enum ovn_nat_type type;
 };
 
 /* Stores the list of SNAT entries referencing a unique SNAT IP address.
@@ -64,6 +80,9 @@ struct lr_nat_record {
 
     bool has_distributed_nat;
 
+    /* Set of nat external ips on the router. */
+    struct sset external_ips;
+
     /* Set of nat external macs on the router. */
     struct sset external_macs;
 
@@ -78,17 +97,16 @@ struct lr_nat_record {
 struct lr_nat_tracked_data {
     /* Created or updated logical router with NAT data. */
     struct hmapx crupdated;
+    /* Deleted logical router with NAT data. */
+    struct hmapx deleted;
 };
 
 struct lr_nat_table {
     struct hmap entries; /* Stores struct lr_nat_record. */
-
-    /* The array index of each element in 'entries'. */
-    struct lr_nat_record **array;
 };
 
-const struct lr_nat_record * lr_nat_table_find_by_index(
-    const struct lr_nat_table *, size_t od_index);
+const struct lr_nat_record * lr_nat_table_find_by_uuid(
+    const struct lr_nat_table *, struct uuid nb_uuid);
 
 #define LR_NAT_TABLE_FOR_EACH(LR_NAT_REC, TABLE) \
     HMAP_FOR_EACH (LR_NAT_REC, key_node, &(TABLE)->entries)
@@ -102,23 +120,10 @@ struct ed_type_lr_nat_data {
 void *en_lr_nat_init(struct engine_node *, struct engine_arg *);
 void en_lr_nat_cleanup(void *data);
 void en_lr_nat_clear_tracked_data(void *data);
-void en_lr_nat_run(struct engine_node *, void *data);
+enum engine_node_state en_lr_nat_run(struct engine_node *, void *data);
 
-bool lr_nat_logical_router_handler(struct engine_node *, void *data);
-bool lr_nat_northd_handler(struct engine_node *, void *data);
-
-/* Returns true if a 'nat_entry' is valid, i.e.:
- * - parsing was successful.
- * - the string yielded exactly one IPv4 address or exactly one IPv6 address.
- */
-static inline bool
-nat_entry_is_valid(const struct ovn_nat *nat_entry)
-{
-    const struct lport_addresses *ext_addrs = &nat_entry->ext_addrs;
-
-    return (ext_addrs->n_ipv4_addrs == 1 && ext_addrs->n_ipv6_addrs == 0) ||
-        (ext_addrs->n_ipv4_addrs == 0 && ext_addrs->n_ipv6_addrs == 1);
-}
+enum engine_input_handler_result lr_nat_northd_handler(struct engine_node *,
+                                                       void *data);
 
 static inline bool
 nat_entry_is_v6(const struct ovn_nat *nat_entry)
@@ -128,7 +133,8 @@ nat_entry_is_v6(const struct ovn_nat *nat_entry)
 
 static inline bool
 lr_nat_has_tracked_data(struct lr_nat_tracked_data *trk_data) {
-    return !hmapx_is_empty(&trk_data->crupdated);
+    return !hmapx_is_empty(&trk_data->crupdated) ||
+           !hmapx_is_empty(&trk_data->deleted);
 }
 
 #endif /* EN_LR_NAT_H */

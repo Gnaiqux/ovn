@@ -32,6 +32,9 @@ Daniele Di Proietto <diproiettod@vmware.com> <daniele.di.proietto@gmail.com>
 Daniele Di Proietto <diproiettod@vmware.com> <ddiproietto@vmware.com>
 Ed Maste <emaste@freebsd.org> <emaste@adaranet.com>
 Ethan J. Jackson <ejj@eecs.berkeley.edu> <ethan@nicira.com>
+Felix Huettner <felix.huettner@digits.schwarz> <felix.huettner@mail.schwarz>
+Felix Huettner <felix.huettner@digits.schwarz> <felix.huettner@stackit.cloud>
+Felix Moebius <felix.moebius@digits.schwarz> <felix.moebius@mail.schwarz>
 Fischetti, Antonio <antonio.fischetti@intel.com>
 Flavio Fernandes <flavio@flaviof.com>
 Flavio Leitner <fbl@sysclose.org> <fbl@redhat.com>
@@ -43,6 +46,9 @@ Han Zhou <hzhou@ovn.org> <zhouhan@gmail.com>
 Henry Mai <hmai@nicira.com> <henrymai@nicira.com>
 Hui Kang <kangh@us.ibm.com> <hkang.sunysb@gmail.com>
 Ian Campbell <ian.campbell@citrix.com> <Ian.Campbell@citrix.com>
+Ihar Hrachyshka <ihar.hrachyshka@gmail.com> <ihrachys@redhat.com>
+Ihar Hrachyshka <ihar.hrachyshka@gmail.com> <ihrachyshka@nvidia.com>
+Ihtisham ul Haq <Ihtisham.ul_Haq@digits.schwarz> <Ihtisham.ul_Haq@mail.schwarz>
 James Page <james.page@ubuntu.com> <roampune@gmail.com>
 Jarno Rajahalme <jarno@ovn.org> <jarno.rajahalme@nsn.com>
 Jarno Rajahalme <jarno@ovn.org> <jrajahalme@nicira.com>
@@ -54,11 +60,16 @@ Joe Stringer <joe@ovn.org> <joestringer@nicira.com>
 Justin Pettit <jpettit@ovn.org> <jpettit@nicira.com>
 Kmindg <kmindg@gmail.com>
 Kyle Mestery <mestery@mestery.com> <kmestery@cisco.com>
+Lucas Vargas Dias <lucas.vdias@magalu.cloud> <lucas.vdias@luizalabs.com>
 Mark Gray <mark.d.gray@redhat.com> <mark.d.gray@intel.com>
+Martin Kalcok <martin.kalcok@gmail.com> <martin.kalcok@canonical.com>
 Mauricio Vasquez <mauricio.vasquez@polito.it> <mauricio.vasquezbernal@studenti.polito.it>
+Max Lamprecht <max.lamprecht@digits.schwarz> <max.lamprecht@mail.schwarz>
+Maxim Korezkij <maxim.korezkij@digits.schwarz> <maxim.korezkij@mail.schwarz>
 Miguel Angel Ajo <majopela@redhat.com> <mangelajo@redhat.com>
 Neil McKee <neil.mckee@inmon.com>
 Ofer Ben-Yacov <ofer.benyacov@gmail.com>
+Paulo Guilherme Silva <guilherme.paulo@magalu.cloud> <guilherme.paulo@luizalabs.com>
 Polehn, Mike A <mike.a.polehn@intel.com>
 Pravin B Shelar <pshelar@ovn.org> <pshelar@nicira.com>
 Raju Subramanian <rsubramanian@nicira.com>
@@ -69,6 +80,7 @@ Robert Åkerblom-Andersson <Robert.nr1@gmail.com> <Scorpiion@users.noreply.githu
 Roberto Bartzen Acosta <rbartzen@gmail.com> <roberto.acosta@luizalabs.com>
 Romain Lenglet <romain.lenglet@oracle.com> <rlenglet@vmware.com>
 Romain Lenglet <romain.lenglet@oracle.com> <romain.lenglet@berabera.info>
+Rosemarie O'Riorden <rosemarie@redhat.com> <roriorden@redhat.com>
 Russell Bryant <russell@ovn.org> <rbryant@redhat.com>
 Ryan Moats <rmoats@us.ibm.com>
 Sabyasachi Sengupta <Sabyasachi.Sengupta@alcatel-lucent.com> <sabyasachi.sengupta@alcatel-lucent.com>

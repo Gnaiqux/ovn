@@ -169,7 +169,7 @@ def reset_counters():
 __parenthesized_constructs = 'if|for|while|switch|[_A-Z]+FOR_*EACH[_A-Z0-9]*'
 
 __regex_added_line = re.compile(r'^\+{1,2}[^\+][\w\W]*')
-__regex_subtracted_line = re.compile(r'^\-{1,2}[^\-][\w\W]*')
+__regex_subtracted_line = re.compile(r'^\-{1,2}(?!\-)[\w\W]*')
 __regex_leading_with_whitespace_at_all = re.compile(r'^\s+')
 __regex_leading_with_spaces = re.compile(r'^ +[\S]+')
 __regex_trailing_whitespace = re.compile(r'[^\S]+$')
@@ -203,6 +203,8 @@ __regex_if_macros = re.compile(r'^ +(%s) \([\S]([\s\S]+[\S])*\) { +\\' %
 __regex_nonascii_characters = re.compile("[^\u0000-\u007f]")
 __regex_efgrep = re.compile(r'.*[ef]grep.*$')
 __regex_hardcoded_table = re.compile(r'.*(table=[0-9]+)|.*(resubmit\(,[0-9]+\))')
+__regex_ovn_nbctl = re.compile(r'^\s*(?:ovn_as\s+\S+\s+)?ovn-nbctl\b')
+__regex_ovn_sbctl = re.compile(r'^\s*(?:ovn_as\s+\S+\s+)?ovn-sbctl\b')
 
 skip_leading_whitespace_check = False
 skip_trailing_whitespace_check = False
@@ -216,7 +218,7 @@ skip_committer_signoff_check = False
 #
 # Python isn't checked as flake8 performs these checks during build.
 line_length_blacklist = re.compile(
-    r'\.(am|at|etc|in|m4|mk|patch|py|yml)$|^debian/.*$')
+    r'\.(am|at|etc|in|m4|mailmap|mk|patch|py|yml)$|^debian/.*$')
 
 # Don't enforce a requirement that leading whitespace be all spaces on
 # files that include these characters in their name, since these kinds
@@ -376,6 +378,21 @@ def has_hardcoded_table(line):
     """Return TRUE if the current line contains table=<NUMBER> or
        resubmit(,<NUMBER>)"""
     return __regex_hardcoded_table.match(line) is not None
+
+def has_nbctl_non_checked_commands(line):
+    """Return TRUE if the current line is missing check in front of ovn-nbctl,
+       except for commands containing 'find', 'show', 'list' and 'get'."""
+    return (__regex_ovn_nbctl.match(line) is not None and
+            "find" not in line and "show" not in line and
+            "list" not in line and "get" not in line)
+
+def has_sbctl_non_checked_commands(line):
+    """Return TRUE if the current line is missing check in front of ovn-sbctl.
+       except for commands containing 'find', 'show', 'list' and 'get'."""
+    return (__regex_ovn_sbctl.match(line) is not None and
+            "dump-flows" not in line and
+            "find" not in line and "show" not in line and
+            "list" not in line and "get" not in line)
 
 def filter_comments(current_line, keep=False):
     """remove all of the c-style comments in a line"""
@@ -668,6 +685,18 @@ checks = [
          lambda: print_warning("Use of hardcoded table=<NUMBER> or"
                                " resubmit=(,<NUMBER>) is discouraged in tests."
                                " Consider using MACRO instead.")},
+
+    {'regex': r'\.at$', 'match_name': None,
+     'check': lambda x: has_nbctl_non_checked_commands(x),
+     'print':
+         lambda: print_warning("ovn-nbctl return should be checked"
+                               " Consider adding check or check_uuid in front.")},
+
+    {'regex': r'\.at$', 'match_name': None,
+     'check': lambda x: has_sbctl_non_checked_commands(x),
+     'print':
+         lambda: print_warning("ovn-sbctl return should be checked"
+                               " Consider adding check or check_uuid in front.")},
 ]
 
 
@@ -857,7 +886,8 @@ def run_subject_checks(subject, spellcheck=False):
     return warnings
 
 
-def ovs_checkpatch_parse(text, filename, author=None, committer=None):
+def ovs_checkpatch_parse(text, filename, author=None, committer=None,
+                         body_only=False):
     global print_file_name, total_line, checking_file, \
         empty_return_check_state
 
@@ -886,6 +916,7 @@ def ovs_checkpatch_parse(text, filename, author=None, committer=None):
                                      re.I | re.M | re.S)
     is_fixes = re.compile(r'(\s*(Fixes:)(.*))$', re.I | re.M | re.S)
     is_fixes_exact = re.compile(r'^Fixes: [0-9a-f]{12} \(".*"\)$')
+    is_trailer = re.compile(r'^[A-Za-z0-9][A-Za-z0-9-]*:[ \t]+\S')
 
     tags_typos = {
         r'^Acked by:': 'Acked-by:',
@@ -899,6 +930,9 @@ def ovs_checkpatch_parse(text, filename, author=None, committer=None):
 
     reset_counters()
 
+    current_line = ""
+    subject_seen = False
+    in_commit_body = body_only
     for line in text.split("\n"):
         if current_file != previous_file:
             previous_file = current_file
@@ -906,10 +940,25 @@ def ovs_checkpatch_parse(text, filename, author=None, committer=None):
         lineno = lineno + 1
         total_line = total_line + 1
 
+        if current_file.endswith(".at"):
+            if current_line:
+                if line.startswith("-"):
+                    lineno = lineno - 1
+            if line.endswith("\\"):
+                current_line += line[:-1]
+                continue
+            else:
+                current_line += line
+
+            line = current_line
+            current_line = ""
+
         if line == "\f":
             # Form feed
             continue
         if len(line) <= 0:
+            if subject_seen:
+                in_commit_body = True
             continue
 
         if checking_file:
@@ -979,6 +1028,7 @@ def ovs_checkpatch_parse(text, filename, author=None, committer=None):
             elif is_author.match(line):
                 author = is_author.match(line).group(2)
             elif is_subject.match(line):
+                subject_seen = True
                 run_subject_checks(line, spellcheck)
             elif is_signature.match(line):
                 m = is_signature.match(line)
@@ -998,8 +1048,14 @@ def ovs_checkpatch_parse(text, filename, author=None, committer=None):
                             '--pretty=format:"Fixes: %h (\\\"%s\\\")" '
                             '--abbrev=12 COMMIT_REF\n')
                 print("%d: %s\n" % (lineno, line))
-            elif spellcheck:
-                check_spelling(line, False)
+            else:
+                if (in_commit_body and len(line) > 75
+                    and not is_trailer.match(line)):
+                    print_warning("Commit message body line is %d characters "
+                                  "long (recommended limit is 75)" % len(line))
+                    print("%d: %s\n" % (lineno, line))
+                if spellcheck:
+                    check_spelling(line, False)
             for typo, correct in tags_typos.items():
                 m = re.match(typo, line, re.I)
                 if m:
@@ -1030,18 +1086,13 @@ def ovs_checkpatch_parse(text, filename, author=None, committer=None):
                 interim_line_check(current_file, cmp_line, lineno)
                 continue
 
-            # Skip files which have /datapath in them, since they are
-            # linux or windows coding standards
-            if current_file.startswith('datapath'):
-                continue
+            # Linux headers use Linux kernel coding style for the most part.
             if current_file.startswith('include/linux'):
                 continue
             # "sparse" includes could be copy-pasted from different sources
             # like DPDK or Linux and could contain workarounds not suitable
             # for a common style.
             if current_file.startswith('include/sparse'):
-                continue
-            if current_file.startswith('utilities/bugtool'):
                 continue
             run_checks(current_file, cmp_line, lineno)
 
@@ -1098,7 +1149,7 @@ def ovs_checkpatch_file(filename):
             continue
     result = ovs_checkpatch_parse(part.get_payload(decode=False), filename,
                                   mail.get('Author', mail['From']),
-                                  mail['Commit'])
+                                  mail['Commit'], body_only=True)
 
     if not mail['Subject'] or not mail['Subject'].strip():
         if mail['Subject']:

@@ -25,7 +25,7 @@
 Submitting Patches
 ==================
 
-Send changes to OVN as patches to dev@openvswitch.org.  One patch per
+Send changes to OVN as patches to dev@openvswitch.org.  Send one patch per
 email.  More details are included below.
 
 If you are using Git, then `git format-patch` takes care of most of the
@@ -67,6 +67,10 @@ Testing is also important:
 - A patch that adds a new feature should add appropriate tests for the
   feature.  A bug fix patch should preferably add a test that would
   fail if the bug recurs.
+
+- To check for memory or performance regressions, you can run
+  ``./ovn-benchmark.sh`` inside the OVN sandbox (``make sandbox``).
+  See the "ovn-benchmark" section of :doc:`/topics/testing` for details.
 
 If you are using GitHub, then you may utilize the GitHub Actions CI system.
 This will run the above tests automatically when you push changes to your
@@ -329,6 +333,23 @@ Examples of common tags follow.
   appropriate to cite the URL to the report in a Reported-at
   tag.  Use a Reported-by tag to acknowledge the reporters.
 
+``Assisted-by: Name of model, and/or AI Code Assistant``
+
+  When a patch has been created with the assistance of an AI tool,
+  this tag should be used to disclose that fact.  Provide the name
+  of the underlying model used, if known.  For the name of the tool,
+  only include the name, not an email address.  For
+  example:
+
+  ::
+
+      Assisted-by: model-name-42.0, OVN-Code-Assistant-Pro-9.0
+
+  The author of the patch remains fully responsible for the content
+  and must ensure it complies with the Developer's Certificate of
+  Origin.  See the "AI-assisted Contributions" section for more
+  information.
+
 Developer's Certificate of Origin
 ---------------------------------
 
@@ -365,6 +386,19 @@ OVN please sign off your work.  The sign off certifies the following:
         this project or the open source license(s) involved.
 
 See also http://developercertificate.org/.
+
+AI-assisted Contributions
+-------------------------
+
+OVN is a Linux Foundation project, and the Linux Foundation's policy for
+AI-generated patches can be found here:
+https://www.linuxfoundation.org/legal/generative-ai .
+
+OVN allows the use of AI assistants in producing patches. Contributions
+which have used an AI assistant should disclose the use of the assistant by
+using the "Assisted-by" tag. While AI-assisted patches are allowed, the author
+of the patch is ultimately responsible for ensuring that the AI-generated code
+has not violated any terms of the Developer's Certificate of Origin.
 
 Feature Deprecation Guidelines
 ------------------------------

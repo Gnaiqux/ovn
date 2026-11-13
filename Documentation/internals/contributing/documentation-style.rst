@@ -341,8 +341,8 @@ In addition to the above, man pages have some specific requirements:
 - The man page must be included in the list of man page documents found in
   `conf.py`__
 
-Refer to existing man pages, such as :doc:`/ref/ovn-sim.1` for a worked
-example.
+Refer to existing man pages, such as :doc:`/ref/ovn-logical-flows.7` for a
+worked example.
 
 __ http://www.sphinx-doc.org/en/stable/domains.html#directive-program
 __ http://www.sphinx-doc.org/en/stable/domains.html#directive-option
@@ -351,9 +351,9 @@ __ http://www.sphinx-doc.org/en/stable/config.html#confval-man_pages
 Writing Style
 -------------
 
-Follow these guidelines to ensure readability and consistency of the Open
-vSwitch documentation. These guidelines are based on the `/*IBM Style Guide/*
-<https://www.ibm.com/developerworks/library/styleguidelines/>`__.
+Follow these guidelines to ensure readability and consistency of the OVN
+documentation. These guidelines are based on the `IBM Style Guide
+<https://www.ibm.com/docs/en/ibm-style>`__.
 
 - Use standard US English
 
@@ -416,10 +416,6 @@ Helpful Tools
 
 There are a number of tools, online and offline, which can be used to preview
 documents are you edit them:
-
-- `rst.ninjs.org <http://rst.ninjs.org/>`__
-
-  An online rST editor/previewer
 
 - `ReText <https://github.com/retext-project/retext>`__
 

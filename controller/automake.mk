@@ -1,5 +1,7 @@
 bin_PROGRAMS += controller/ovn-controller
 controller_ovn_controller_SOURCES = \
+	controller/acl-ids.c \
+	controller/acl-ids.h \
 	controller/bfd.c \
 	controller/bfd.h \
 	controller/binding.c \
@@ -8,6 +10,14 @@ controller_ovn_controller_SOURCES = \
 	controller/chassis.h \
 	controller/encaps.c \
 	controller/encaps.h \
+	controller/evpn-arp.c \
+	controller/evpn-arp.h \
+	controller/evpn-binding.c \
+	controller/evpn-binding.h \
+	controller/evpn-fdb.c \
+	controller/evpn-fdb.h \
+	controller/evpn-mac-binding-sync.c \
+	controller/evpn-mac-binding-sync.h \
 	controller/ha-chassis.c \
 	controller/ha-chassis.h \
 	controller/if-status.c \
@@ -20,14 +30,15 @@ controller_ovn_controller_SOURCES = \
 	controller/lflow.h \
 	controller/lflow-cache.c \
 	controller/lflow-cache.h \
-	controller/lflow-conj-ids.c \
-	controller/lflow-conj-ids.h \
 	controller/lport.c \
 	controller/lport.h \
 	controller/ofctrl.c \
 	controller/ofctrl.h \
-	controller/ofctrl-seqno.c \
-	controller/ofctrl-seqno.h \
+	controller/ovn-netlink-notifier.h \
+	controller/neighbor.c \
+	controller/neighbor.h \
+	controller/neighbor-of.c \
+	controller/neighbor-of.h \
 	controller/pinctrl.c \
 	controller/pinctrl.h \
 	controller/patch.c \
@@ -47,7 +58,41 @@ controller_ovn_controller_SOURCES = \
 	controller/mac-cache.h \
 	controller/mac-cache.c \
 	controller/statctrl.h \
-	controller/statctrl.c
+	controller/statctrl.c \
+	controller/ct-zone.h \
+	controller/ct-zone.c \
+	controller/ovn-dns.c \
+	controller/ovn-dns.h \
+	controller/ecmp-next-hop-monitor.h \
+	controller/ecmp-next-hop-monitor.c \
+	controller/route-exchange.h \
+	controller/route.h \
+	controller/route.c \
+	controller/garp_rarp.h \
+	controller/garp_rarp.c \
+	controller/neighbor-exchange.h \
+	controller/host-if-monitor.h
+
+if HAVE_NETLINK
+controller_ovn_controller_SOURCES += \
+	controller/host-if-monitor.c \
+	controller/ovn-netlink-notifier.c \
+	controller/neighbor-exchange-netlink.h \
+	controller/neighbor-exchange-netlink.c \
+	controller/neighbor-exchange.c \
+	controller/nexthop-exchange.h \
+	controller/nexthop-exchange.c \
+	controller/route-exchange-netlink.h \
+	controller/route-exchange-netlink.c \
+	controller/route-exchange.c
+else
+controller_ovn_controller_SOURCES += \
+	controller/host-if-monitor-stub.c \
+	controller/ovn-netlink-notifier-stub.c \
+	controller/neighbor-exchange-stub.c \
+	controller/nexthop-exchange-stub.c \
+	controller/route-exchange-stub.c
+endif
 
 controller_ovn_controller_LDADD = lib/libovn.la $(OVS_LIBDIR)/libopenvswitch.la
 man_MANS += controller/ovn-controller.8

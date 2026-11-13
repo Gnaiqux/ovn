@@ -97,7 +97,7 @@ compare_entries_by_prefix_length(const void *a, const void *b)
 static bool
 parse_threshold_entry(const char *str, struct threshold_entry *entry)
 {
-    char *colon_ptr;
+    const char *colon_ptr;
     unsigned int value;
     const char *threshold_str;
 
@@ -330,7 +330,8 @@ aging_context_handle_timestamp(struct aging_context *ctx, int64_t timestamp,
     }
 
     ovs_assert(ctx->threshold);
-    uint64_t threshold = 1000 * find_threshold_for_ip(ip, ctx->threshold);
+    uint64_t threshold =
+            1000 * (uint64_t) find_threshold_for_ip(ip, ctx->threshold);
 
     if (!threshold) {
         return false;
@@ -385,21 +386,16 @@ mac_binding_aging_run_for_datapath(const struct sbrec_datapath_binding *dp,
     sbrec_mac_binding_index_destroy_row(mb_index_row);
 }
 
-void
+enum engine_node_state
 en_mac_binding_aging_run(struct engine_node *node, void *data OVS_UNUSED)
 {
-    const struct engine_context *eng_ctx = engine_get_context();
     struct northd_data *northd_data = engine_get_input_data("northd", node);
-    struct ed_type_global_config *global_config =
-        engine_get_input_data("global_config", node);
 
     struct aging_waker *waker =
         engine_get_input_data("mac_binding_aging_waker", node);
 
-    if (!eng_ctx->ovnsb_idl_txn ||
-        !global_config->features.mac_binding_timestamp ||
-        time_msec() < waker->next_wake_msec) {
-        return;
+    if (time_msec() < waker->next_wake_msec) {
+        return EN_STALE;
     }
 
     uint32_t limit = get_removal_limit(node, "mac_binding_removal_limit");
@@ -413,7 +409,7 @@ en_mac_binding_aging_run(struct engine_node *node, void *data OVS_UNUSED)
     HMAP_FOR_EACH (od, key_node, &northd_data->lr_datapaths.datapaths) {
         ovs_assert(od->nbr);
 
-        if (!od->sb) {
+        if (!od->sdp->sb_dp) {
             continue;
         }
 
@@ -421,12 +417,12 @@ en_mac_binding_aging_run(struct engine_node *node, void *data OVS_UNUSED)
         if (!parse_aging_threshold(smap_get(&od->nbr->options,
                                             "mac_binding_age_threshold"),
                                    &threshold_config)) {
-            return;
+            continue;
         }
 
         aging_context_set_threshold(&ctx, &threshold_config);
 
-        mac_binding_aging_run_for_datapath(od->sb,
+        mac_binding_aging_run_for_datapath(od->sdp->sb_dp,
                                            sbrec_mac_binding_by_datapath,
                                            &ctx);
         threshold_config_destroy(&threshold_config);
@@ -440,7 +436,7 @@ en_mac_binding_aging_run(struct engine_node *node, void *data OVS_UNUSED)
 
     aging_waker_schedule_next_wake(waker, ctx.next_wake_ms);
 
-    engine_set_node_state(node, EN_UPDATED);
+    return EN_UPDATED;
 }
 
 void *
@@ -461,24 +457,22 @@ en_mac_binding_aging_cleanup(void *data OVS_UNUSED)
  * if we there are updates, so it could process the other nodes, however
  * the waker cannot be dependent on other node because it wouldn't be
  * input node anymore. */
-void
-en_mac_binding_aging_waker_run(struct engine_node *node, void *data)
+enum engine_node_state
+en_mac_binding_aging_waker_run(struct engine_node *node OVS_UNUSED, void *data)
 {
     struct aging_waker *waker = data;
 
-    engine_set_node_state(node, EN_UNCHANGED);
-
     if (!waker->should_schedule) {
-        return;
+        return EN_UNCHANGED;
     }
 
     if (time_msec() >= waker->next_wake_msec) {
         waker->should_schedule = false;
-        engine_set_node_state(node, EN_UPDATED);
-        return;
+        return EN_UPDATED;
     }
 
     poll_timer_wait_until(waker->next_wake_msec);
+    return EN_UNCHANGED;
 }
 
 void *
@@ -523,19 +517,14 @@ fdb_run_for_datapath(const struct sbrec_datapath_binding *dp,
     sbrec_fdb_index_destroy_row(fdb_index_row);
 }
 
-void
+enum engine_node_state
 en_fdb_aging_run(struct engine_node *node, void *data OVS_UNUSED)
 {
-    const struct engine_context *eng_ctx = engine_get_context();
     struct northd_data *northd_data = engine_get_input_data("northd", node);
     struct aging_waker *waker = engine_get_input_data("fdb_aging_waker", node);
-    struct ed_type_global_config *global_config =
-        engine_get_input_data("global_config", node);
 
-    if (!eng_ctx->ovnsb_idl_txn ||
-        !global_config->features.fdb_timestamp ||
-        time_msec() < waker->next_wake_msec) {
-        return;
+    if (time_msec() < waker->next_wake_msec) {
+        return EN_STALE;
     }
 
     uint32_t limit = get_removal_limit(node, "fdb_removal_limit");
@@ -549,7 +538,7 @@ en_fdb_aging_run(struct engine_node *node, void *data OVS_UNUSED)
     HMAP_FOR_EACH (od, key_node, &northd_data->ls_datapaths.datapaths) {
         ovs_assert(od->nbs);
 
-        if (!od->sb) {
+        if (!od->sdp->sb_dp) {
             continue;
         }
 
@@ -558,7 +547,7 @@ en_fdb_aging_run(struct engine_node *node, void *data OVS_UNUSED)
         threshold_config.default_threshold =
             smap_get_uint(&od->nbs->other_config, "fdb_age_threshold", 0);
         aging_context_set_threshold(&ctx, &threshold_config);
-        fdb_run_for_datapath(od->sb, sbrec_fdb_by_dp_key, &ctx);
+        fdb_run_for_datapath(od->sdp->sb_dp, sbrec_fdb_by_dp_key, &ctx);
 
         if (aging_context_is_at_limit(&ctx)) {
             /* Schedule the next run after specified delay. */
@@ -569,7 +558,7 @@ en_fdb_aging_run(struct engine_node *node, void *data OVS_UNUSED)
 
     aging_waker_schedule_next_wake(waker, ctx.next_wake_ms);
 
-    engine_set_node_state(node, EN_UPDATED);
+    return EN_UPDATED;
 }
 
 void *
@@ -590,24 +579,22 @@ en_fdb_aging_cleanup(void *data OVS_UNUSED)
  * if we there are updates, so it could process the other nodes, however
  * the waker cannot be dependent on other node because it wouldn't be
  * input node anymore. */
-void
-en_fdb_aging_waker_run(struct engine_node *node, void *data)
+enum engine_node_state
+en_fdb_aging_waker_run(struct engine_node *node OVS_UNUSED, void *data)
 {
     struct aging_waker *waker = data;
 
-    engine_set_node_state(node, EN_UNCHANGED);
-
     if (!waker->should_schedule) {
-        return;
+        return EN_UNCHANGED;
     }
 
     if (time_msec() >= waker->next_wake_msec) {
         waker->should_schedule = false;
-        engine_set_node_state(node, EN_UPDATED);
-        return;
+        return EN_UPDATED;
     }
 
     poll_timer_wait_until(waker->next_wake_msec);
+    return EN_UNCHANGED;
 }
 
 void *

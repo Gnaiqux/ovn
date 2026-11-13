@@ -31,39 +31,44 @@ struct ovsdb_idl_index;
 struct ovsdb_idl_txn;
 struct ovsrec_bridge;
 struct ovsrec_open_vswitch_table;
+struct rconn;
 struct sbrec_chassis;
 struct sbrec_dns_table;
 struct sbrec_controller_event_table;
 struct sbrec_service_monitor_table;
 struct sbrec_bfd_table;
+struct sbrec_ecmp_nexthop_table;
 struct sbrec_port_binding;
 struct sbrec_mac_binding_table;
 
 void pinctrl_init(void);
 void pinctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
                  struct ovsdb_idl_index *sbrec_datapath_binding_by_key,
-                 struct ovsdb_idl_index *sbrec_port_binding_by_datapath,
                  struct ovsdb_idl_index *sbrec_port_binding_by_key,
                  struct ovsdb_idl_index *sbrec_port_binding_by_name,
                  struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
                  struct ovsdb_idl_index *sbrec_igmp_groups,
                  struct ovsdb_idl_index *sbrec_ip_multicast_opts,
                  struct ovsdb_idl_index *sbrec_fdb_by_dp_key_mac,
-                 const struct sbrec_dns_table *,
                  const struct sbrec_controller_event_table *,
                  const struct sbrec_service_monitor_table *,
                  const struct sbrec_mac_binding_table *,
                  const struct sbrec_bfd_table *,
-                 const struct ovsrec_bridge *, const struct sbrec_chassis *,
+                 const struct sbrec_ecmp_nexthop_table *,
+                 const struct sbrec_chassis *chassis,
                  const struct hmap *local_datapaths,
-                 const struct sset *active_tunnels,
                  const struct shash *local_active_ports_ipv6_pd,
                  const struct shash *local_active_ports_ras,
-                 const struct ovsrec_open_vswitch_table *ovs_table);
+                 const struct ovsrec_open_vswitch_table *ovs_table,
+                 int64_t cur_cfg);
 void pinctrl_wait(struct ovsdb_idl_txn *ovnsb_idl_txn);
 void pinctrl_destroy(void);
-void pinctrl_set_br_int_name(const char *br_int_name);
-void pinctrl_update(const struct ovsdb_idl *idl, const char *br_int_name);
+void pinctrl_seqno_run(void);
+void pinctrl_seqno_flush(void);
+
+void pinctrl_update_swconn(const char *target, int probe_interval);
+
+void pinctrl_update(const struct ovsdb_idl *idl);
 
 struct activated_port {
     uint32_t dp_key;
@@ -74,4 +79,28 @@ struct activated_port {
 void tag_port_as_activated_in_engine(struct activated_port *ap);
 struct ovs_list *get_ports_to_activate_in_engine(void);
 bool pinctrl_is_port_activated(int64_t dp_key, int64_t port_key);
+void send_self_originated_neigh_packet(struct rconn *swconn,
+                                       uint32_t dp_key, uint32_t port_key,
+                                       struct eth_addr eth_src,
+                                       struct eth_addr eth_dst,
+                                       struct in6_addr *local,
+                                       struct in6_addr *target,
+                                       uint8_t table_id);
+
+/* A local port that the multicast flood group would deliver a query to, along
+ * with the conntrack zone that the flood group's per-port action loads. */
+struct mcast_querier_port {
+    uint32_t port_key;
+    uint16_t ct_zone;
+};
+
+/* Records the local ports of the flood group for datapath 'dp_key', so the
+ * querier can send its query to each port directly rather than through the
+ * flood group.  'ports' may be NULL to record an empty list.
+ *
+ * Called from the main thread; read by the handler thread.
+ * Takes pinctrl_mutex internally. */
+void pinctrl_mcast_querier_set_ports(int64_t dp_key,
+                                     const struct mcast_querier_port *ports,
+                                     size_t n_ports);
 #endif /* controller/pinctrl.h */

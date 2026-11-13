@@ -42,7 +42,6 @@
 #include "openvswitch/ofp-util.h"
 #include "openvswitch/ofpbuf.h"
 #include "openvswitch/vlog.h"
-#include "ovn-controller.h"
 #include "ovn/actions.h"
 #include "lib/extend-table.h"
 #include "lib/lb.h"
@@ -53,6 +52,10 @@
 #include "timeval.h"
 #include "util.h"
 #include "vswitch-idl.h"
+#include "ovn-sb-idl.h"
+#include "ct-zone.h"
+#include "ecmp-next-hop-monitor.h"
+#include "acl-ids.h"
 
 VLOG_DEFINE_THIS_MODULE(ofctrl);
 
@@ -148,10 +151,14 @@ struct desired_flow {
     struct hmap_node match_hmap_node; /* For match based hashing. */
     struct ovs_list list_node; /* For handling lists of flows. */
 
-    /* A list of struct sb_flow_ref nodes, which references this flow. (There
-     * are cases that multiple SB entities share the same desired OpenFlow
-     * flow, e.g. when conjunction is used.) */
-    struct ovs_list references;
+    /* A hash map of struct sb_flow_ref nodes, which references this flow.
+     * Key is the SB UUID.  (There are cases that multiple SB entities share
+     * the same desired OpenFlow flow, e.g. when conjunction is used.) */
+    struct hmap references;
+    /* The number of flows in 'references' that are tracking some address
+     * sets, i.e., have their 'sb_flow_ref.as_ip_flow_list' node in the
+     * 'as_ip_to_flow_node.flows'. */
+    size_t referenced_as_ip_flows;
 
     /* The corresponding flow in installed table. */
     struct installed_flow *installed_flow;
@@ -175,7 +182,7 @@ struct sb_to_flow {
 };
 
 struct sb_flow_ref {
-    struct ovs_list sb_list; /* Node in desired_flow.references. */
+    struct hmap_node sb_node; /* Node in desired_flow.references. */
     struct ovs_list flow_list; /* Node in sb_to_flow.flows. */
     struct ovs_list as_ip_flow_list; /* Node in as_ip_to_flow_node.flows. */
     struct desired_flow *flow;
@@ -271,6 +278,8 @@ static struct desired_flow *desired_flow_lookup_conjunctive(
     struct ovn_desired_flow_table *,
     const struct ovn_flow *target);
 static void desired_flow_destroy(struct desired_flow *);
+static bool flow_contains_sb_reference(const struct desired_flow *,
+                                       const void *uuid_arg);
 
 static struct installed_flow *installed_flow_lookup(
     const struct ovn_flow *target, struct hmap *installed_flows);
@@ -287,6 +296,11 @@ static void remove_flows_from_sb_to_flow(struct ovn_desired_flow_table *,
                                          struct sb_to_flow *,
                                          const char *log_msg,
                                          struct uuidset *flood_remove_nodes);
+static void ovn_flow_uninit(struct ovn_flow *f);
+static void ovn_flow_init(struct ovn_flow *f, uint8_t table_id,
+                          uint16_t priority, uint64_t cookie,
+                          const struct match *match, void *actions,
+                          size_t action_len, uint32_t meter_id);
 
 /* OpenFlow connection to the switch. */
 static struct rconn *swconn;
@@ -346,13 +360,8 @@ static uint64_t cur_cfg;
 /* Current state. */
 static enum ofctrl_state state;
 
-/* The time (ms) to stay in the state S_WAIT_BEFORE_CLEAR. Read from
- * external_ids: ovn-ofctrl-wait-before-clear. */
-static unsigned int wait_before_clear_time = 0;
-
-/* The time when the state S_WAIT_BEFORE_CLEAR should complete.
- * If the timer is not started yet, it is set to 0. */
-static long long int wait_before_clear_expire = 0;
+/* Release wait before clear stage. */
+static bool wait_before_clear_proceed = false;
 
 /* Transaction IDs for messages in flight to the switch. */
 static ovs_be32 xid, xid2;
@@ -424,6 +433,7 @@ ofctrl_init(struct ovn_extend_table *group_table,
     tx_counter = rconn_packet_counter_create();
     hmap_init(&installed_lflows);
     hmap_init(&installed_pflows);
+    ecmp_nexthop_init();
     ovs_list_init(&flow_updates);
     ovn_init_symtab(&symtab);
     groups = group_table;
@@ -442,13 +452,15 @@ run_S_NEW(void)
     struct ofpbuf *buf = ofpraw_alloc(OFPRAW_NXT_TLV_TABLE_REQUEST,
                                       rconn_get_version(swconn), 0);
     xid = queue_msg(buf);
+    wait_before_clear_proceed = false;
     state = S_TLV_TABLE_REQUESTED;
 }
 
 static void
 recv_S_NEW(const struct ofp_header *oh OVS_UNUSED,
            enum ofptype type OVS_UNUSED,
-           struct shash *pending_ct_zones OVS_UNUSED)
+           struct shash *pending_ct_zones OVS_UNUSED,
+           struct tracked_acl_ids *tracked_acl_ids OVS_UNUSED)
 {
     OVS_NOT_REACHED();
 }
@@ -536,7 +548,8 @@ process_tlv_table_reply(const struct ofputil_tlv_table_reply *reply)
 
 static void
 recv_S_TLV_TABLE_REQUESTED(const struct ofp_header *oh, enum ofptype type,
-                           struct shash *pending_ct_zones OVS_UNUSED)
+                           struct shash *pending_ct_zones OVS_UNUSED,
+                           struct tracked_acl_ids *tracked_acl_ids OVS_UNUSED)
 {
     if (oh->xid != xid) {
         ofctrl_recv(oh, type);
@@ -592,7 +605,8 @@ run_S_TLV_TABLE_MOD_SENT(void)
 
 static void
 recv_S_TLV_TABLE_MOD_SENT(const struct ofp_header *oh, enum ofptype type,
-                          struct shash *pending_ct_zones OVS_UNUSED)
+                          struct shash *pending_ct_zones OVS_UNUSED,
+                          struct tracked_acl_ids *tracked_acl_ids OVS_UNUSED)
 {
     if (oh->xid != xid && oh->xid != xid2) {
         ofctrl_recv(oh, type);
@@ -631,23 +645,15 @@ error:
 static void
 run_S_WAIT_BEFORE_CLEAR(void)
 {
-    if (!wait_before_clear_time ||
-        (wait_before_clear_expire &&
-         time_msec() >= wait_before_clear_expire)) {
+    if (wait_before_clear_proceed) {
         state = S_CLEAR_FLOWS;
-        return;
     }
-
-    if (!wait_before_clear_expire) {
-        /* Start the timer. */
-        wait_before_clear_expire = time_msec() + wait_before_clear_time;
-    }
-    poll_timer_wait_until(wait_before_clear_expire);
 }
 
 static void
 recv_S_WAIT_BEFORE_CLEAR(const struct ofp_header *oh, enum ofptype type,
-                         struct shash *pending_ct_zones OVS_UNUSED)
+                         struct shash *pending_ct_zones OVS_UNUSED,
+                         struct tracked_acl_ids *tracked_acl_ids OVS_UNUSED)
 {
     ofctrl_recv(oh, type);
 }
@@ -699,7 +705,8 @@ run_S_CLEAR_FLOWS(void)
 
 static void
 recv_S_CLEAR_FLOWS(const struct ofp_header *oh, enum ofptype type,
-                   struct shash *pending_ct_zones OVS_UNUSED)
+                   struct shash *pending_ct_zones OVS_UNUSED,
+                   struct tracked_acl_ids *tracked_acl_ids OVS_UNUSED)
 {
     ofctrl_recv(oh, type);
 }
@@ -721,32 +728,46 @@ run_S_UPDATE_FLOWS(void)
 }
 
 static void
-recv_S_UPDATE_FLOWS(const struct ofp_header *oh, enum ofptype type,
-                    struct shash *pending_ct_zones)
+flow_updates_handle_barrier_reply(const struct ofp_header *oh,
+                                  struct shash *pending_ct_zones)
 {
-    if (type == OFPTYPE_BARRIER_REPLY && !ovs_list_is_empty(&flow_updates)) {
-        struct ofctrl_flow_update *fup = ofctrl_flow_update_from_list_node(
-            ovs_list_front(&flow_updates));
-        if (fup->xid == oh->xid) {
-            if (fup->req_cfg >= cur_cfg) {
-                cur_cfg = fup->req_cfg;
-            }
-            mem_stats.oflow_update_usage -= ofctrl_flow_update_size(fup);
-            ovs_list_remove(&fup->list_node);
-            free(fup);
-        }
+    if (ovs_list_is_empty(&flow_updates)) {
+        return;
+    }
 
-        /* If the barrier xid is associated with an outstanding conntrack
-         * flush, the flush succeeded.  Move the pending ct zone entry
-         * to the next stage. */
-        struct shash_node *iter;
-        SHASH_FOR_EACH(iter, pending_ct_zones) {
-            struct ct_zone_pending_entry *ctzpe = iter->data;
-            if (ctzpe->state == CT_ZONE_OF_SENT && ctzpe->of_xid == oh->xid) {
-                ctzpe->state = CT_ZONE_DB_QUEUED;
-            }
+    struct ofctrl_flow_update *fup = ofctrl_flow_update_from_list_node(
+        ovs_list_front(&flow_updates));
+    if (fup->xid == oh->xid) {
+        if (fup->req_cfg >= cur_cfg) {
+            cur_cfg = fup->req_cfg;
         }
-    } else {
+        mem_stats.oflow_update_usage -= ofctrl_flow_update_size(fup);
+        ovs_list_remove(&fup->list_node);
+        free(fup);
+    }
+
+    /* If the barrier xid is associated with an outstanding conntrack
+     * flush, the flush succeeded.  Move the pending ct zone entry
+     * to the next stage. */
+    struct shash_node *iter;
+    SHASH_FOR_EACH (iter, pending_ct_zones) {
+        struct ct_zone_pending_entry *ctzpe = iter->data;
+        if (ctzpe->state == CT_ZONE_OF_SENT && ctzpe->of_xid == oh->xid) {
+            ctzpe->state = CT_ZONE_DB_QUEUED;
+        }
+    }
+
+}
+
+static void
+recv_S_UPDATE_FLOWS(const struct ofp_header *oh, enum ofptype type,
+                    struct shash *pending_ct_zones,
+                    struct tracked_acl_ids *tracked_acl_ids)
+{
+    if (type == OFPTYPE_BARRIER_REPLY) {
+        flow_updates_handle_barrier_reply(oh, pending_ct_zones);
+        acl_ids_handle_barrier_reply(tracked_acl_ids, oh->xid);
+    } else if (!acl_ids_handle_non_barrier_reply(oh, type, tracked_acl_ids)) {
         ofctrl_recv(oh, type);
     }
 }
@@ -771,19 +792,13 @@ ofctrl_get_mf_field_id(void)
  * Returns 'true' if an OpenFlow reconnect happened; 'false' otherwise.
  */
 bool
-ofctrl_run(const struct ovsrec_bridge *br_int,
-           const struct ovsrec_open_vswitch_table *ovs_table,
-           struct shash *pending_ct_zones)
+ofctrl_run(const char *conn_target, int probe_interval,
+           struct shash *pending_ct_zones,
+           struct tracked_acl_ids *tracked_acl_ids)
 {
-    char *target = xasprintf("unix:%s/%s.mgmt", ovs_rundir(), br_int->name);
     bool reconnected = false;
 
-    if (strcmp(target, rconn_get_target(swconn))) {
-        VLOG_INFO("%s: connecting to switch", target);
-        rconn_connect(swconn, target, target);
-    }
-    free(target);
-
+    ovn_update_swconn_at(swconn, conn_target, probe_interval, "ofctrl");
     rconn_run(swconn);
 
     if (!rconn_is_connected(swconn) || !pending_ct_zones) {
@@ -803,16 +818,6 @@ ofctrl_run(const struct ovsrec_bridge *br_int,
                 ctzpe->state = CT_ZONE_OF_QUEUED;
             }
         }
-    }
-    const struct ovsrec_open_vswitch *cfg =
-        ovsrec_open_vswitch_table_first(ovs_table);
-    ovs_assert(cfg);
-    unsigned int _wait_before_clear_time =
-        smap_get_uint(&cfg->external_ids, "ovn-ofctrl-wait-before-clear", 0);
-    if (_wait_before_clear_time != wait_before_clear_time) {
-        VLOG_INFO("ofctrl-wait-before-clear is now %u ms (was %u ms)",
-                  _wait_before_clear_time, wait_before_clear_time);
-        wait_before_clear_time = _wait_before_clear_time;
     }
 
     bool progress = true;
@@ -837,7 +842,8 @@ ofctrl_run(const struct ovsrec_bridge *br_int,
             error = ofptype_decode(&type, oh);
             if (!error) {
                 switch (state) {
-#define STATE(NAME) case NAME: recv_##NAME(oh, type, pending_ct_zones); break;
+#define STATE(NAME) case NAME: recv_##NAME(oh, type, pending_ct_zones, \
+                                           tracked_acl_ids); break;
                     STATES
 #undef STATE
                 default:
@@ -882,6 +888,7 @@ ofctrl_destroy(void)
     expr_symtab_destroy(&symtab);
     shash_destroy(&symtab);
     ofctrl_meter_bands_destroy();
+    ecmp_nexthop_destroy();
 }
 
 uint64_t
@@ -1117,6 +1124,26 @@ sb_addrset_ref_size(const struct sb_addrset_ref *sar)
     return sizeof *sar + strlen(sar->name) + 1;
 }
 
+static void
+sb_flow_ref_as_ip_untrack(struct desired_flow *f, struct sb_flow_ref *sfr)
+{
+    if (ovs_list_is_empty(&sfr->as_ip_flow_list)) {
+        return;
+    }
+    ovs_list_remove(&sfr->as_ip_flow_list);
+    ovs_list_init(&sfr->as_ip_flow_list);
+    f->referenced_as_ip_flows--;
+}
+
+static void
+sb_flow_ref_as_ip_track(struct desired_flow *f,
+                        struct as_ip_to_flow_node *itfn,
+                        struct sb_flow_ref *sfr)
+{
+    ovs_list_insert(&itfn->flows, &sfr->as_ip_flow_list);
+    f->referenced_as_ip_flows++;
+}
+
 static struct sb_to_flow *
 sb_to_flow_find(struct hmap *uuid_flow_table, const struct uuid *sb_uuid)
 {
@@ -1156,7 +1183,7 @@ link_flow_to_sb(struct ovn_desired_flow_table *flow_table,
     mem_stats.sb_flow_ref_usage += sb_flow_ref_size(sfr);
     sfr->flow = f;
     sfr->sb_uuid = *sb_uuid;
-    ovs_list_insert(&f->references, &sfr->sb_list);
+    hmap_insert(&f->references, &sfr->sb_node, uuid_hash(sb_uuid));
     struct sb_to_flow *stf = sb_to_flow_find(&flow_table->uuid_flow_table,
                                              sb_uuid);
     if (!stf) {
@@ -1205,7 +1232,7 @@ link_flow_to_sb(struct ovn_desired_flow_table *flow_table,
         hmap_insert(&sar->as_ip_to_flow_map, &itfn->hmap_node, hash);
     }
 
-    ovs_list_insert(&itfn->flows, &sfr->as_ip_flow_list);
+    sb_flow_ref_as_ip_track(f, itfn, sfr);
 }
 
 /* Flow table interfaces to the rest of ovn-controller. */
@@ -1279,98 +1306,139 @@ ofctrl_add_flow_metered(struct ovn_desired_flow_table *desired_flows,
                                       meter_id, as_info, true);
 }
 
-struct ofpact_ref {
-    struct hmap_node hmap_node;
-    struct ofpact *ofpact;
-};
-
-static struct ofpact_ref *
-ofpact_ref_find(const struct hmap *refs, const struct ofpact *ofpact)
+static inline void
+ofpacts_replace(struct ovn_flow *flow, struct ofpbuf *replacement)
 {
-    uint32_t hash = hash_bytes(ofpact, ofpact->len, 0);
+    /* Make sure there is no extra head- or tailroom.
+     * Should be a no-op in most cases. */
+    ofpbuf_trim(replacement);
 
-    struct ofpact_ref *ref;
-    HMAP_FOR_EACH_WITH_HASH (ref, hmap_node, hash, refs) {
-        if (ofpacts_equal(ref->ofpact, ref->ofpact->len,
-                          ofpact, ofpact->len)) {
-            return ref;
+    free(flow->ofpacts);
+    flow->ofpacts_len = replacement->size;
+    flow->ofpacts = ofpbuf_steal_data(replacement);
+}
+
+static int
+compare_conjunctions(const void *a_, const void *b_)
+{
+    const struct ofpact_conjunction *a = ofpact_get_CONJUNCTION(a_);
+    const struct ofpact_conjunction *b = ofpact_get_CONJUNCTION(b_);
+
+    return a->id == b->id ? 0 : (a->id < b->id ? -1 : 1);
+}
+
+/* Finds conjunction 'key' in the 'ofpacts' using binary search.  'ofpacts'
+ * must only contain conjunctions in the ascending order of their IDs.
+ *
+ * Returns 'true' if the 'key' is found, setting 'pos' to the offset in
+ * 'ofpacts' where the 'key' is.  Otherwise, returns 'false' and sets the
+ * 'pos' to the offset in the 'ofpacts' where the 'key' should have been. */
+static bool
+ofpacts_find_conjunction(const struct ofpact *ofpacts, size_t ofpacts_len,
+                         const struct ofpact_conjunction *key, size_t *pos)
+{
+    const uint8_t *data = (const uint8_t *) ofpacts;
+    size_t high = ofpacts_len / sizeof *key;
+    size_t low = 0;
+    size_t idx;
+    int cmp;
+
+    while (low < high) {
+        idx = (low + high) / 2;
+        cmp = compare_conjunctions(key, data + idx * sizeof *key);
+
+        if (cmp < 0) {
+            high = idx;
+        } else if (cmp > 0) {
+            low = idx + 1;
+        } else {
+            if (pos) {
+                *pos = idx * sizeof *key;
+            }
+            return true;
+        }
+    }
+    if (pos) {
+        *pos = low * sizeof *key;
+    }
+    return false;
+}
+
+static struct ofpbuf *
+create_conjunction_actions(const struct vector *conjunctions,
+                           const struct ovn_flow *existing)
+{
+    size_t len = vector_len(conjunctions);
+    struct ofpact_conjunction *conj;
+    size_t conj_size = sizeof *conj;
+    struct ofpbuf *ofpbuf;
+    size_t pos;
+
+    if (existing) {
+        ofpbuf = ofpbuf_new(existing->ofpacts_len + conj_size * len);
+        ofpbuf_put(ofpbuf, existing->ofpacts, existing->ofpacts_len);
+    } else {
+        ofpbuf = ofpbuf_new(conj_size * len);
+    }
+
+    const struct cls_conjunction *cls;
+    VECTOR_FOR_EACH_PTR (conjunctions, cls) {
+        conj = ofpact_put_CONJUNCTION(ofpbuf);
+        conj->id = cls->id;
+        conj->clause = cls->clause;
+        conj->n_clauses = cls->n_clauses;
+
+        if (!existing) {
+            continue;
+        }
+
+        if (ofpacts_find_conjunction(ofpbuf->data, ofpbuf->size - conj_size,
+                                     conj, &pos)) {
+            /* It's a duplicate, drop it. */
+            ofpbuf->size -= sizeof *conj;
+        } else if (pos == ofpbuf->size - conj_size) {
+            /* Not found, but needed to insert at the end anyway. */
+        } else {
+            /* Not found and need to insert in the middle. */
+            struct ofpact_conjunction tmp = *conj;
+
+            ofpbuf->size -= sizeof *conj;
+            ofpbuf_insert(ofpbuf, pos, &tmp, sizeof tmp);
         }
     }
 
-    return NULL;
-}
-
-static void
-ofpact_refs_destroy(struct hmap *refs)
-{
-    struct ofpact_ref *ref;
-    HMAP_FOR_EACH_POP (ref, hmap_node, refs) {
-        free(ref);
-    }
-    hmap_destroy(refs);
+    return ofpbuf;
 }
 
 /* Either add a new flow, or append actions on an existing flow. If the
  * flow existed, a new link will also be created between the new sb_uuid
  * and the existing flow. */
 void
-ofctrl_add_or_append_flow(struct ovn_desired_flow_table *desired_flows,
-                          uint8_t table_id, uint16_t priority, uint64_t cookie,
-                          const struct match *match,
-                          const struct ofpbuf *actions,
-                          const struct uuid *sb_uuid,
-                          uint32_t meter_id,
-                          const struct addrset_info *as_info)
+ofctrl_add_or_append_conj_flow(struct ovn_desired_flow_table *desired_flows,
+                               uint8_t table_id, uint16_t priority,
+                               const struct match *match,
+                               const struct vector *conjunctions,
+                               const struct uuid *sb_uuid,
+                               uint32_t meter_id,
+                               const struct addrset_info *as_info)
 {
     struct desired_flow *existing;
     struct desired_flow *f;
+    struct ofpbuf *actions;
 
-    f = desired_flow_alloc(table_id, priority, cookie, match, actions,
-                           meter_id);
-    existing = desired_flow_lookup_conjunctive(desired_flows, &f->flow);
+    /* Create flow just to search for existing one, this avoids the allocation
+     * of ofpacts buffer if it's not needed yet. */
+    struct ovn_flow search_flow;
+    ovn_flow_init(&search_flow, table_id, priority, 0,
+                  match, NULL, 0, meter_id);
+    existing = desired_flow_lookup_conjunctive(desired_flows, &search_flow);
     if (existing) {
-        struct hmap existing_conj = HMAP_INITIALIZER(&existing_conj);
-
-        struct ofpact *ofpact;
-        OFPACT_FOR_EACH (ofpact, existing->flow.ofpacts,
-                         existing->flow.ofpacts_len) {
-            if (ofpact->type != OFPACT_CONJUNCTION) {
-                continue;
-            }
-
-            struct ofpact_ref *ref = xmalloc(sizeof *ref);
-            ref->ofpact = ofpact;
-            uint32_t hash = hash_bytes(ofpact, ofpact->len, 0);
-            hmap_insert(&existing_conj, &ref->hmap_node, hash);
-        }
-
-        /* There's already a flow with this particular match and action
-         * 'conjunction'. Append the action to that flow rather than
-         * adding a new flow.
-         */
-        uint64_t compound_stub[64 / 8];
-        struct ofpbuf compound;
-        ofpbuf_use_stub(&compound, compound_stub, sizeof(compound_stub));
-        ofpbuf_put(&compound, existing->flow.ofpacts,
-                   existing->flow.ofpacts_len);
-
-        OFPACT_FOR_EACH (ofpact, f->flow.ofpacts, f->flow.ofpacts_len) {
-            if (ofpact->type != OFPACT_CONJUNCTION ||
-                !ofpact_ref_find(&existing_conj, ofpact)) {
-                ofpbuf_put(&compound, ofpact, OFPACT_ALIGN(ofpact->len));
-            }
-        }
-
-        ofpact_refs_destroy(&existing_conj);
+        actions = create_conjunction_actions(conjunctions, &existing->flow);
 
         mem_stats.desired_flow_usage -= desired_flow_size(existing);
-        free(existing->flow.ofpacts);
-        existing->flow.ofpacts = xmemdup(compound.data, compound.size);
-        existing->flow.ofpacts_len = compound.size;
+        ofpacts_replace(&existing->flow, actions);
         mem_stats.desired_flow_usage += desired_flow_size(existing);
 
-        ofpbuf_uninit(&compound);
-        desired_flow_destroy(f);
         f = existing;
 
         /* Since the flow now shared by more than one SB lflows, don't track
@@ -1381,24 +1449,38 @@ ofctrl_add_or_append_flow(struct ovn_desired_flow_table *desired_flows,
          * lflows, but we need to remove the related conjunction from the
          * actions properly when handle addrset ip deletion, instead of simply
          * delete the flow. */
-        struct sb_flow_ref *sfr;
-        LIST_FOR_EACH (sfr, sb_list, &f->references) {
-            ovs_list_remove(&sfr->as_ip_flow_list);
-            ovs_list_init(&sfr->as_ip_flow_list);
+        if (f->referenced_as_ip_flows) {
+            struct sb_flow_ref *sfr;
+            HMAP_FOR_EACH (sfr, sb_node, &f->references) {
+                sb_flow_ref_as_ip_untrack(f, sfr);
+            }
+            ovs_assert(!f->referenced_as_ip_flows);
         }
-        link_flow_to_sb(desired_flows, f, sb_uuid, NULL);
+
+        if (flow_contains_sb_reference(f, sb_uuid)) {
+            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+            char *s = ovn_flow_to_string(&f->flow);
+            VLOG_WARN_RL(&rl, "lflow "UUID_FMT" already references desired "
+                         "flow: %s", UUID_ARGS(sb_uuid), s);
+            free(s);
+        } else {
+            link_flow_to_sb(desired_flows, f, sb_uuid, NULL);
+        }
     } else {
+        actions = create_conjunction_actions(conjunctions, NULL);
+        f = desired_flow_alloc(table_id, priority, 0, match, actions,
+                               meter_id);
         hmap_insert(&desired_flows->match_flow_table, &f->match_hmap_node,
                     f->flow.hash);
         link_flow_to_sb(desired_flows, f, sb_uuid, as_info);
     }
     track_flow_add_or_modify(desired_flows, f);
 
-    if (existing) {
-        ovn_flow_log(&f->flow, "ofctrl_add_or_append_flow (append)");
-    } else {
-        ovn_flow_log(&f->flow, "ofctrl_add_or_append_flow (add)");
-    }
+    ovn_flow_log(&f->flow, existing
+                 ? "ofctrl_add_or_append_conj_flow (append)"
+                 : "ofctrl_add_or_append_conj_flow (add)");
+    ovn_flow_uninit(&search_flow);
+    ofpbuf_delete(actions);
 }
 
 void
@@ -1500,20 +1582,21 @@ ofctrl_remove_flows_for_as_ip(struct ovn_desired_flow_table *flow_table,
     struct sb_flow_ref *sfr;
     size_t count = 0;
     LIST_FOR_EACH_SAFE (sfr, as_ip_flow_list, &itfn->flows) {
+        struct desired_flow *f = sfr->flow;
+
         /* If the desired flow is referenced by multiple sb lflows, it
          * shouldn't have been indexed by address set. */
-        ovs_assert(ovs_list_is_short(&sfr->sb_list));
+        ovs_assert(hmap_count(&f->references) == 1);
 
-        ovs_list_remove(&sfr->sb_list);
+        hmap_remove(&f->references, &sfr->sb_node);
         ovs_list_remove(&sfr->flow_list);
-        ovs_list_remove(&sfr->as_ip_flow_list);
+        sb_flow_ref_as_ip_untrack(f, sfr);
 
-        struct desired_flow *f = sfr->flow;
         mem_stats.sb_flow_ref_usage -= sb_flow_ref_size(sfr);
         free(sfr);
 
         ovs_assert(ovs_list_is_empty(&f->list_node));
-        ovs_assert(ovs_list_is_empty(&f->references));
+        ovs_assert(!hmap_count(&f->references));
         ovn_flow_log(&f->flow, "remove_flows_for_as_ip");
         hmap_remove(&flow_table->match_flow_table,
                     &f->match_hmap_node);
@@ -1542,15 +1625,16 @@ remove_flows_from_sb_to_flow(struct ovn_desired_flow_table *flow_table,
     /* Traverse all flows for the given sb_uuid. */
     struct sb_flow_ref *sfr;
     LIST_FOR_EACH_SAFE (sfr, flow_list, &stf->flows) {
-        ovs_list_remove(&sfr->sb_list);
-        ovs_list_remove(&sfr->flow_list);
-        ovs_list_remove(&sfr->as_ip_flow_list);
         struct desired_flow *f = sfr->flow;
+
+        hmap_remove(&f->references, &sfr->sb_node);
+        ovs_list_remove(&sfr->flow_list);
+        sb_flow_ref_as_ip_untrack(f, sfr);
         mem_stats.sb_flow_ref_usage -= sb_flow_ref_size(sfr);
         free(sfr);
 
         ovs_assert(ovs_list_is_empty(&f->list_node));
-        if (ovs_list_is_empty(&f->references)) {
+        if (!hmap_count(&f->references)) {
             if (log_msg) {
                 ovn_flow_log(&f->flow, log_msg);
             }
@@ -1586,23 +1670,23 @@ remove_flows_from_sb_to_flow(struct ovn_desired_flow_table *flow_table,
      * list. */
 
     /* Detach the items in f->references from the sfr.flow_list lists,
-     * so that recursive calls will not mess up the sfr.sb_list list. */
+     * so that recursive calls will not mess up the sfr.sb_node. */
     struct desired_flow *f;
     LIST_FOR_EACH (f, list_node, &to_be_removed) {
-        ovs_assert(!ovs_list_is_empty(&f->references));
-        LIST_FOR_EACH (sfr, sb_list, &f->references) {
+        ovs_assert(hmap_count(&f->references));
+        HMAP_FOR_EACH (sfr, sb_node, &f->references) {
             ovs_list_remove(&sfr->flow_list);
-            ovs_list_remove(&sfr->as_ip_flow_list);
+            sb_flow_ref_as_ip_untrack(f, sfr);
         }
     }
     LIST_FOR_EACH_SAFE (f, list_node, &to_be_removed) {
-        LIST_FOR_EACH_SAFE (sfr, sb_list, &f->references) {
+        HMAP_FOR_EACH_SAFE (sfr, sb_node, &f->references) {
             if (!uuidset_find(flood_remove_nodes, &sfr->sb_uuid)) {
                 uuidset_insert(flood_remove_nodes, &sfr->sb_uuid);
                 flood_remove_flows_for_sb_uuid(flow_table, &sfr->sb_uuid,
                                                flood_remove_nodes);
             }
-            ovs_list_remove(&sfr->sb_list);
+            hmap_remove(&f->references, &sfr->sb_node);
             mem_stats.sb_flow_ref_usage -= sb_flow_ref_size(sfr);
             free(sfr);
         }
@@ -1621,13 +1705,13 @@ remove_flows_from_sb_to_flow(struct ovn_desired_flow_table *flow_table,
 static void
 ovn_flow_init(struct ovn_flow *f, uint8_t table_id, uint16_t priority,
               uint64_t cookie, const struct match *match,
-              const struct ofpbuf *actions, uint32_t meter_id)
+              void *actions, size_t action_len, uint32_t meter_id)
 {
     f->table_id = table_id;
     f->priority = priority;
     minimatch_init(&f->match, match);
-    f->ofpacts = xmemdup(actions->data, actions->size);
-    f->ofpacts_len = actions->size;
+    f->ofpacts = actions ? xmemdup(actions, action_len) : NULL;
+    f->ofpacts_len = action_len;
     f->hash = ovn_flow_match_hash(f);
     f->cookie = cookie;
     f->ctrl_meter_id = meter_id;
@@ -1645,14 +1729,15 @@ desired_flow_alloc(uint8_t table_id, uint16_t priority, uint64_t cookie,
                    uint32_t meter_id)
 {
     struct desired_flow *f = xmalloc(sizeof *f);
-    ovs_list_init(&f->references);
+    hmap_init(&f->references);
+    f->referenced_as_ip_flows = 0;
     ovs_list_init(&f->list_node);
     ovs_list_init(&f->installed_ref_list_node);
     ovs_list_init(&f->track_list_node);
     f->installed_flow = NULL;
     f->is_deleted = false;
-    ovn_flow_init(&f->flow, table_id, priority, cookie, match, actions,
-                  meter_id);
+    ovn_flow_init(&f->flow, table_id, priority, cookie, match, actions->data,
+                  actions->size, meter_id);
 
     mem_stats.desired_flow_usage += desired_flow_size(f);
     return f;
@@ -1735,13 +1820,15 @@ desired_flow_lookup(struct ovn_desired_flow_table *flow_table,
 }
 
 static bool
-flow_lookup_match_uuid_cb(const struct desired_flow *candidate,
-                          const void *arg)
+flow_contains_sb_reference(const struct desired_flow *candidate,
+                           const void *uuid_arg)
 {
-    const struct uuid *sb_uuid = arg;
+    const struct uuid *sb_uuid = uuid_arg;
     struct sb_flow_ref *sfr;
+    uint32_t hash;
 
-    LIST_FOR_EACH (sfr, sb_list, &candidate->references) {
+    hash = uuid_hash(sb_uuid);
+    HMAP_FOR_EACH_WITH_HASH (sfr, sb_node, hash, &candidate->references) {
         if (uuid_equals(sb_uuid, &sfr->sb_uuid)) {
             return true;
         }
@@ -1760,8 +1847,8 @@ desired_flow_lookup_check_uuid(struct ovn_desired_flow_table *flow_table,
                             const struct ovn_flow *target,
                             const struct uuid *sb_uuid)
 {
-    return desired_flow_lookup__(flow_table, target, flow_lookup_match_uuid_cb,
-                                 sb_uuid);
+    return desired_flow_lookup__(flow_table, target,
+                                 flow_contains_sb_reference, sb_uuid);
 }
 
 static bool
@@ -1852,9 +1939,11 @@ static void
 desired_flow_destroy(struct desired_flow *f)
 {
     if (f) {
-        ovs_assert(ovs_list_is_empty(&f->references));
+        ovs_assert(!hmap_count(&f->references));
+        ovs_assert(!f->referenced_as_ip_flows);
         ovs_assert(!f->installed_flow);
         mem_stats.desired_flow_usage -= desired_flow_size(f);
+        hmap_destroy(&f->references);
         ovn_flow_uninit(&f->flow);
         free(f);
     }
@@ -2667,15 +2756,32 @@ void
 ofctrl_put(struct ovn_desired_flow_table *lflow_table,
            struct ovn_desired_flow_table *pflow_table,
            struct shash *pending_ct_zones,
+           struct shash *current_ct_zones,
            struct hmap *pending_lb_tuples,
+           const struct hmap *local_datapaths,
            struct ovsdb_idl_index *sbrec_meter_by_name,
+           const struct sbrec_ecmp_nexthop_table *enh_table,
            uint64_t req_cfg,
            bool lflows_changed,
-           bool pflows_changed)
+           bool pflows_changed,
+           struct tracked_acl_ids *tracked_acl_ids,
+           bool monitor_cond_complete)
 {
     static bool skipped_last_time = false;
     static uint64_t old_req_cfg = 0;
     bool need_put = false;
+
+    if (state == S_WAIT_BEFORE_CLEAR) {
+        /* If no more monitored condition changes expected, release wait
+         * before clear stage and skip over poll wait. */
+        if (monitor_cond_complete) {
+            wait_before_clear_proceed = true;
+            poll_immediate_wake();
+        }
+        skipped_last_time = true;
+        return;
+    }
+
     if (lflows_changed || pflows_changed || skipped_last_time ||
         ofctrl_initial_clear) {
         need_put = true;
@@ -2696,25 +2802,36 @@ ofctrl_put(struct ovn_desired_flow_table *lflow_table,
         }
     }
 
+    /* OpenFlow messages to send to the switch to bring it up-to-date. */
+    struct ovs_list msgs = OVS_LIST_INITIALIZER(&msgs);
+
+    if (local_datapaths) {
+        need_put |= ecmp_nexthop_monitor_run(enh_table, local_datapaths,
+                                             current_ct_zones, swconn, &msgs);
+    }
+
     if (!need_put) {
+        ovs_assert(ovs_list_is_empty(&msgs));
         VLOG_DBG("ofctrl_put not needed");
         return;
     }
     if (!ofctrl_can_put()) {
         VLOG_DBG("ofctrl_put can't be performed");
+
+        struct ofpbuf *msg;
+        LIST_FOR_EACH_POP (msg, list_node, &msgs) {
+            ofpbuf_delete(msg);
+        }
         skipped_last_time = true;
         return;
     }
-
-    /* OpenFlow messages to send to the switch to bring it up-to-date. */
-    struct ovs_list msgs = OVS_LIST_INITIALIZER(&msgs);
 
     /* Iterate through ct zones that need to be flushed. */
     struct shash_node *iter;
     SHASH_FOR_EACH(iter, pending_ct_zones) {
         struct ct_zone_pending_entry *ctzpe = iter->data;
         if (ctzpe->state == CT_ZONE_OF_QUEUED) {
-            add_ct_flush_zone(ctzpe->zone, &msgs);
+            add_ct_flush_zone(ctzpe->ct_zone.zone, &msgs);
             ctzpe->state = CT_ZONE_OF_SENT;
             ctzpe->of_xid = 0;
         }
@@ -2906,12 +3023,16 @@ ofctrl_put(struct ovn_desired_flow_table *lflow_table,
         }
     }
 
+    acl_ids_flush_expired(tracked_acl_ids, rconn_get_version(swconn), &msgs);
+
     if (!ovs_list_is_empty(&msgs)) {
         /* Add a barrier to the list of messages. */
         struct ofpbuf *barrier = ofputil_encode_barrier_request(OFP15_VERSION);
         const struct ofp_header *oh = barrier->data;
         ovs_be32 xid_ = oh->xid;
         ovs_list_push_back(&msgs, &barrier->list_node);
+
+        acl_ids_record_barrier_xid(tracked_acl_ids, xid_);
 
         /* Queue the messages. */
         struct ofpbuf *msg;
@@ -2940,16 +3061,6 @@ ofctrl_put(struct ovn_desired_flow_table *lflow_table,
                 mem_stats.oflow_update_usage -= ofctrl_flow_update_size(fup);
                 ovs_list_remove(&fup->list_node);
                 free(fup);
-            } else if (req_cfg == fup->req_cfg) {
-                /* This ofctrl_flow_update is for the same configuration as
-                 * 'req_cfg'.  Probably, some change to the physical topology
-                 * means that we had to revise the OpenFlow flow table even
-                 * though the logical topology did not change.  Update fp->xid,
-                 * so that we don't send a notification that we're up-to-date
-                 * until we're really caught up. */
-                VLOG_DBG("advanced xid target for req_cfg=%"PRId64, req_cfg);
-                fup->xid = xid_;
-                goto done;
             } else {
                 break;
             }
@@ -2961,7 +3072,6 @@ ofctrl_put(struct ovn_desired_flow_table *lflow_table,
         fup->xid = xid_;
         fup->req_cfg = req_cfg;
         mem_stats.oflow_update_usage += ofctrl_flow_update_size(fup);
-    done:;
     } else if (!ovs_list_is_empty(&flow_updates)) {
         /* Getting up-to-date with 'req_cfg' didn't require any extra flow
          * table changes, so whenever we get up-to-date with the most recent
@@ -3032,11 +3142,13 @@ ofctrl_inject_pkt(const struct ovsrec_bridge *br_int, const char *flow_s,
     if (version < 0) {
         return xstrdup("OpenFlow channel not ready.");
     }
+    struct lex_str flow_exp_s;
+    if (!lexer_parse_template_string(&flow_exp_s, flow_s,
+                                     template_vars, NULL)) {
+        return xasprintf("Could not parse flow \"%s\"", flow_s);
+    }
 
     struct flow uflow;
-    struct lex_str flow_exp_s = lexer_parse_template_string(flow_s,
-                                                            template_vars,
-                                                            NULL);
     char *error = expr_parse_microflow(lex_str_get(&flow_exp_s), &symtab,
                                        addr_sets, port_groups,
                                        ofctrl_lookup_port, br_int, &uflow);

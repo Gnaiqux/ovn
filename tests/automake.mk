@@ -15,8 +15,7 @@ EXTRA_DIST += \
 	$(MULTINODE_TESTSUITE) \
 	tests/atlocal.in \
 	$(srcdir)/package.m4 \
-	$(srcdir)/tests/testsuite \
-	$(srcdir)/tests/testsuite.patch
+	$(srcdir)/tests/testsuite
 
 COMMON_MACROS_AT = \
 	tests/ovsdb-macros.at \
@@ -45,7 +44,10 @@ TESTSUITE_AT = \
 	tests/ovn-lflow-cache.at \
 	tests/ovn-lflow-conj-ids.at \
 	tests/ovn-ipsec.at \
-	tests/ovn-vif-plug.at
+	tests/ovn-vif-plug.at \
+	tests/ovn-util.at \
+	tests/ovn-br-controller.at \
+	tests/ovn-inc-proc-graph-dump.at
 
 SYSTEM_DPDK_TESTSUITE_AT = \
 	tests/system-dpdk-testsuite.at \
@@ -62,13 +64,16 @@ SYSTEM_USERSPACE_TESTSUITE_AT = \
 
 SYSTEM_TESTSUITE_AT = \
 	tests/system-common-macros.at \
-	tests/system-ovn.at
+	tests/system-ovn.at \
+	tests/system-ovn-netlink.at
 
 PERF_TESTSUITE_AT = \
 	tests/perf-testsuite.at \
-	tests/perf-northd.at
+	tests/perf-northd.at \
+	tests/perf-ovn-ic.at
 
 MULTINODE_TESTSUITE_AT = \
+	tests/multinode-bgp-macros.at \
 	tests/multinode-testsuite.at \
 	tests/multinode-macros.at \
 	tests/multinode.at
@@ -76,7 +81,6 @@ MULTINODE_TESTSUITE_AT = \
 check_SCRIPTS += tests/atlocal
 
 TESTSUITE = $(srcdir)/tests/testsuite
-TESTSUITE_PATCH = $(srcdir)/tests/testsuite.patch
 TESTSUITE_DIR = $(abs_top_builddir)/tests/testsuite.dir
 SYSTEM_DPDK_TESTSUITE = $(srcdir)/tests/system-dpdk-testsuite
 SYSTEM_KMOD_TESTSUITE = $(srcdir)/tests/system-kmod-testsuite
@@ -88,9 +92,10 @@ DISTCLEANFILES += tests/atconfig tests/atlocal
 MULTINODE_TESTSUITE = $(srcdir)/tests/multinode-testsuite
 MULTINODE_TESTSUITE_DIR = $(abs_top_builddir)/tests/multinode-testsuite.dir
 MULTINODE_TESTSUITE_RESULTS = $(MULTINODE_TESTSUITE_DIR)/results
-AUTOTEST_PATH = $(ovs_builddir)/utilities:$(ovs_builddir)/vswitchd:$(ovs_builddir)/ovsdb:$(ovs_builddir)/vtep:tests:$(PTHREAD_WIN32_DIR_DLL):$(SSL_DIR):controller-vtep:northd:utilities:controller:ic
+AUTOTEST_PATH = $(ovs_builddir)/utilities:$(ovs_builddir)/vswitchd:$(ovs_builddir)/ovsdb:$(ovs_builddir)/vtep:tests:$(SSL_DIR):controller-vtep:northd:utilities:controller:ic:br-controller
 
 export ovs_srcdir
+export ovs_builddir
 
 check-local:
 	set $(SHELL) '$(TESTSUITE)' -C tests AUTOTEST_PATH=$(AUTOTEST_PATH); \
@@ -186,17 +191,17 @@ check-userspace-valgrind: all $(valgrind_wrappers) $(check_DATA)
 check-helgrind: all $(valgrind_wrappers) $(check_DATA)
 	-$(SHELL) '$(TESTSUITE)' -C tests CHECK_VALGRIND=true VALGRIND='$(HELGRIND)' AUTOTEST_PATH='tests/valgrind:$(AUTOTEST_PATH)' -d $(TESTSUITEFLAGS)
 
-check-system-dpdk: all
+check-system-dpdk: all $(check_DATA)
 	set $(SHELL) '$(SYSTEM_DPDK_TESTSUITE)' -C tests  AUTOTEST_PATH='$(AUTOTEST_PATH)'; \
 	$(SUDO) "$$@" $(TESTSUITEFLAGS) -j1 || (test X'$(RECHECK)' = Xyes && $(SUDO) "$$@" --recheck)
 
 # Run kmod tests. Assume kernel modules has been installed or linked into the kernel
-check-kernel: all
+check-kernel: all $(check_DATA)
 	set $(SHELL) '$(SYSTEM_KMOD_TESTSUITE)' -C tests  AUTOTEST_PATH='$(AUTOTEST_PATH)'; \
 	$(SUDO) "$$@" $(TESTSUITEFLAGS) -j1 || (test X'$(RECHECK)' = Xyes && $(SUDO) "$$@" --recheck)
 
 
-check-system-userspace: all
+check-system-userspace: all $(check_DATA)
 	set $(SHELL) '$(SYSTEM_USERSPACE_TESTSUITE)' -C tests  AUTOTEST_PATH='$(AUTOTEST_PATH)'; \
 	$(SUDO) "$$@" $(TESTSUITEFLAGS) -j1 || (test X'$(RECHECK)' = Xyes && $(SUDO) "$$@" --recheck)
 
@@ -231,16 +236,9 @@ check-multinode: all
 
 AUTOTEST = $(AUTOM4TE) --language=autotest
 
-if WIN32
-$(TESTSUITE): package.m4 $(TESTSUITE_AT) $(COMMON_MACROS_AT) $(TESTSUITE_PATCH)
-	$(AM_V_GEN)$(AUTOTEST) -I '$(srcdir)' -o testsuite.tmp $@.at
-	patch -p0 testsuite.tmp $(TESTSUITE_PATCH)
-	$(AM_V_at)mv testsuite.tmp $@
-else
 $(TESTSUITE): package.m4 $(TESTSUITE_AT) $(COMMON_MACROS_AT)
 	$(AM_V_GEN)$(AUTOTEST) -I '$(srcdir)' -o $@.tmp $@.at
 	$(AM_V_at)mv $@.tmp $@
-endif
 
 $(SYSTEM_DPDK_TESTSUITE): package.m4 $(SYSTEM_TESTSUITE_AT) $(SYSTEM_DPDK_TESTSUITE_AT) $(COMMON_MACROS_AT)
 	$(AM_V_GEN)$(AUTOTEST) -I '$(srcdir)' -o $@.tmp $@.at
@@ -282,12 +280,32 @@ tests_ovstest_SOURCES = \
 	tests/test-utils.c \
 	tests/test-utils.h \
 	tests/test-ovn.c \
+	tests/test-sparse-array.c \
+	tests/test-spsc-ring.c \
+	tests/test-vector.c \
 	controller/test-lflow-cache.c \
-	controller/test-lflow-conj-ids.c \
-	controller/test-ofctrl-seqno.c \
 	controller/test-vif-plug.c \
+	lib/test-lflow-conj-ids.c \
 	lib/test-ovn-features.c \
+	lib/test-ofctrl-seqno.c \
 	northd/test-ipam.c
+
+if HAVE_NETLINK
+tests_ovstest_SOURCES += \
+	controller/host-if-monitor.c \
+	controller/host-if-monitor.h \
+	controller/neighbor-exchange-netlink.c \
+	controller/neighbor-exchange-netlink.h \
+	controller/nexthop-exchange.c \
+	controller/nexthop-exchange.h \
+	controller/neighbor.c \
+	controller/neighbor.h \
+	controller/ovn-netlink-notifier.c \
+	controller/ovn-netlink-notifier.h \
+	controller/route-exchange-netlink.c \
+	controller/route-exchange-netlink.h \
+	tests/test-ovn-netlink.c
+endif
 
 tests_ovstest_LDADD = $(OVS_LIBDIR)/daemon.lo \
     $(OVS_LIBDIR)/libopenvswitch.la lib/libovn.la \
@@ -297,12 +315,11 @@ tests_ovstest_LDADD = $(OVS_LIBDIR)/daemon.lo \
 	controller/ha-chassis.$(OBJEXT) \
 	controller/if-status.$(OBJEXT) \
 	controller/lflow-cache.$(OBJEXT) \
-	controller/lflow-conj-ids.$(OBJEXT) \
 	controller/local_data.$(OBJEXT) \
 	controller/lport.$(OBJEXT) \
-	controller/ofctrl-seqno.$(OBJEXT) \
 	controller/ovsport.$(OBJEXT) \
 	controller/patch.$(OBJEXT) \
+	controller/route.$(OBJEXT) \
 	controller/vif-plug.$(OBJEXT) \
 	northd/ipam.$(OBJEXT)
 
@@ -312,7 +329,9 @@ CHECK_PYFILES = \
 	tests/uuidfilt.py \
 	tests/test-tcp-rst.py \
 	tests/check_acl_log.py \
-	tests/scapy-server.py
+	tests/scapy-server.py \
+	tests/client.py \
+	tests/server.py
 
 EXTRA_DIST += $(CHECK_PYFILES)
 PYCOV_CLEAN_FILES += $(CHECK_PYFILES:.py=.py,cover) .coverage
@@ -362,3 +381,17 @@ clean-pki:
 	rm -f tests/pki/stamp
 	rm -rf tests/pki
 endif
+
+# Upgrade test support
+# Run via: make check-upgrade BASE_VERSION=branch-26.03 TESTSUITEFLAGS="1-100"
+BASE_VERSION ?= branch-26.03
+
+check-upgrade: all
+	@mkdir -p upgrade-testsuite.dir
+	@echo "Running upgrade tests from $(BASE_VERSION)..."
+	@echo "CC=$(CC) OPTS=$(OPTS) TESTSUITEFLAGS=$(TESTSUITEFLAGS) UNSTABLE=$(UNSTABLE)"
+	@BASE_VERSION="$(BASE_VERSION)" \
+	 TESTSUITEFLAGS="$(TESTSUITEFLAGS)" \
+	 UNSTABLE="$(UNSTABLE)" \
+	 PYTHONPATH="$(srcdir)/.ci:$$PYTHONPATH" \
+	$(PYTHON3) "$(srcdir)/.ci/ovn_upgrade_test.py"

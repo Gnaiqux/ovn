@@ -58,6 +58,9 @@ static char *vtep_remote;
 static char *ovnsb_remote;
 static char *default_db_;
 
+/* --unixctl-path: Path to use for unixctl server socket. */
+static char *unixctl_path;
+
 /* Returns true if the northd internal version stored in SB_Global
  * and ovn-controller-vtep internal version match.
  */
@@ -112,13 +115,12 @@ main(int argc, char *argv[])
 
     ovs_cmdl_proctitle_init(argc, argv);
     ovn_set_program_name(argv[0]);
-    service_start(&argc, &argv);
     parse_options(argc, argv);
     fatal_ignore_sigpipe();
 
     daemonize_start(false, false);
 
-    char *abs_unixctl_path = get_abs_unix_ctl_path(NULL);
+    char *abs_unixctl_path = get_abs_unix_ctl_path(unixctl_path);
     retval = unixctl_server_create(abs_unixctl_path, &unixctl);
     free(abs_unixctl_path);
 
@@ -168,6 +170,12 @@ main(int argc, char *argv[])
     ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_port_binding_col_options);
     ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_port_binding_col_type);
     ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_port_binding_col_up);
+    ovsdb_idl_add_column(ovnsb_idl_loop.idl,
+                         &sbrec_port_binding_col_tunnel_key);
+    ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_fdb);
+    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_fdb_col_mac);
+    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_fdb_col_dp_key);
+    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_fdb_col_port_key);
 
     ovsdb_idl_set_leader_only(ovnsb_idl_loop.idl, false);
     ovsdb_idl_get_initial_snapshot(ovnsb_idl_loop.idl);
@@ -220,9 +228,6 @@ main(int argc, char *argv[])
         ovsdb_idl_loop_commit_and_wait(&vtep_idl_loop);
         ovsdb_idl_loop_commit_and_wait(&ovnsb_idl_loop);
         poll_block();
-        if (should_service_stop()) {
-            exiting = true;
-        }
     }
 
     /* It's time to exit.  Clean up the databases. */
@@ -254,10 +259,10 @@ main(int argc, char *argv[])
     ovsdb_idl_loop_destroy(&vtep_idl_loop);
     ovsdb_idl_loop_destroy(&ovnsb_idl_loop);
 
+    free(ovn_version);
     free(ovnsb_remote);
     free(vtep_remote);
     free(default_db_);
-    service_stop();
 
     exit(retval);
 }
@@ -287,6 +292,7 @@ parse_options(int argc, char *argv[])
         {"vtep-db", required_argument, NULL, 'D'},
         {"help", no_argument, NULL, 'h'},
         {"version", no_argument, NULL, 'V'},
+        {"unixctl", required_argument, NULL, 'u'},
         VLOG_LONG_OPTIONS,
         OVN_DAEMON_LONG_OPTIONS,
         STREAM_SSL_LONG_OPTIONS,
@@ -321,6 +327,10 @@ parse_options(int argc, char *argv[])
         case 'V':
             ovn_print_version(OFP13_VERSION, OFP13_VERSION);
             exit(EXIT_SUCCESS);
+
+        case 'u':
+            unixctl_path = optarg;
+            break;
 
         VLOG_OPTION_HANDLERS
         OVN_DAEMON_OPTION_HANDLERS
@@ -364,6 +374,7 @@ Options:\n\
                             (default: %s)\n\
   --ovnsb-db=DATABASE       connect to ovn-sb database at DATABASE\n\
                             (default: %s)\n\
+  -u, --unixctl=SOCKET      set control socket name\n\
   -h, --help                display this help message\n\
   -o, --options             list available options\n\
   -V, --version             display version information\n\

@@ -16,16 +16,14 @@
 
 OVN_PATH=${OVN_PATH:-$PWD}
 OVS_PATH=${OVS_PATH:-$OVN_PATH/ovs}
-DPDK_PATH=${DPDK_PATH:-$OVN_PATH/dpdk-dir}
 CONTAINER_CMD=${CONTAINER_CMD:-podman}
 CONTAINER_WORKSPACE="/workspace"
 CONTAINER_WORKDIR="/workspace/ovn-tmp"
 IMAGE_NAME=${IMAGE_NAME:-"ovn-org/ovn-tests"}
+TIMEOUT=${TIMEOUT:-"0"}
 
 # Test variables
-ARCH=${ARCH:-$(uname -m)}
 CC=${CC:-gcc}
-
 
 test -t 1 && USE_TTY="t"
 
@@ -48,10 +46,13 @@ function archive_logs() {
         && \
         cp $CONTAINER_WORKDIR/config.log $log_dir \
         && \
-        cp -r $CONTAINER_WORKDIR/*/_build/sub/tests/testsuite.* \
+        cp -r $CONTAINER_WORKDIR/tests/testsuite.* \
         $log_dir || true \
         && \
         cp -r $CONTAINER_WORKDIR/tests/system-*-testsuite.* \
+        $log_dir || true \
+        && \
+        cp -r $CONTAINER_WORKDIR/tests/upgrade-testsuite.* \
         $log_dir || true \
         && \
         chmod -R +r $log_dir \
@@ -89,34 +90,19 @@ function copy_sources_to_workdir() {
     "
 }
 
-function overwrite_jobs() {
-    container_exec "
-        sed -i s/-j[0-9]/-j$jobs/ $CONTAINER_WORKDIR/.ci/linux-build.sh
-    "
-}
-
 function run_tests() {
     container_exec "
         cd $CONTAINER_WORKDIR \
         && \
         ARCH=$ARCH CC=$CC LIBS=$LIBS OPTS=$OPTS TESTSUITE=$TESTSUITE \
         TEST_RANGE=$TEST_RANGE SANITIZERS=$SANITIZERS DPDK=$DPDK \
-        RECHECK=$RECHECK UNSTABLE=$UNSTABLE ./.ci/linux-build.sh
+        RECHECK=$RECHECK UNSTABLE=$UNSTABLE TIMEOUT=$TIMEOUT \
+        BASE_VERSION=$BASE_VERSION JOBS=$JOBS ./.ci/linux-build.sh
     "
 }
 
-function check_clang_version_ge() {
-    lower=$1
-    version=$(clang --version | head -n1 | cut -d' ' -f3)
-    if ! echo -e "$lower\n$version" | sort -CV; then
-      return 1
-    fi
-
-    return 0
-}
-
 options=$(getopt --options "" \
-    --long help,shell,archive-logs,jobs:,ovn-path:,ovs-path:,image-name:\
+    --long help,shell,archive-logs,jobs:,ovn-path:,ovs-path:,image-name:,timeout:\
     -- "${@}")
 eval set -- "$options"
 while true; do
@@ -126,7 +112,7 @@ while true; do
         ;;
     --jobs)
         shift
-        jobs="$1"
+        JOBS="-j$1"
         ;;
     --ovn-path)
         shift
@@ -143,11 +129,15 @@ while true; do
     --archive-logs)
         archive_logs="1"
         ;;
+    --timeout)
+        shift
+        TIMEOUT="$1"
+        ;;
     --help)
         set +x
         printf "$0 [--shell] [--help] [--archive-logs] [--jobs=<JOBS>] "
         printf "[--ovn-path=<OVN_PATH>] [--ovs-path=<OVS_PATH>] "
-        printf "[--image-name=<IMAGE_NAME>]\n"
+        printf "[--image-name=<IMAGE_NAME>] [--timeout=<TIMEOUT>]\n"
         exit
         ;;
     --)
@@ -158,30 +148,16 @@ while true; do
     shift
 done
 
-# Workaround for https://bugzilla.redhat.com/2153359
-if [ "$ARCH" = "aarch64" ] && ! check_clang_version_ge "16.0.0"; then
-    ASAN_OPTIONS="detect_leaks=0"
-fi
-
-if [ -z "$DPDK" ]; then
-   mkdir -p "$DPDK_PATH"
-fi
-
 CONTAINER_ID="$($CONTAINER_CMD run --privileged -d \
     --pids-limit=-1 \
-    --env ASAN_OPTIONS=$ASAN_OPTIONS \
+    --security-opt apparmor=unconfined \
     -v /lib/modules/$(uname -r):/lib/modules/$(uname -r):ro \
     -v $OVN_PATH:$CONTAINER_WORKSPACE/ovn:Z \
     -v $OVS_PATH:$CONTAINER_WORKSPACE/ovs:Z \
-    -v $DPDK_PATH:$CONTAINER_WORKSPACE/dpdk-dir:Z \
     $IMAGE_NAME)"
 trap remove_container EXIT
 
 copy_sources_to_workdir
-
-if [ -n "$jobs" ]; then
-    overwrite_jobs
-fi
 
 if [ -n "$shell" ];then
     container_shell

@@ -42,6 +42,12 @@ struct mmr_hash_node_data {
     struct shash physical_locators;
 };
 
+struct lp_fdb_node_data {
+    uint32_t dp_key;
+    uint32_t port_key;
+    struct shash mac_fdbs;
+};
+
 /*
  * Scans through the Binding table in ovnsb, and updates the vtep logical
  * switch tunnel keys and the 'Ucast_Macs_Remote' table in the VTEP
@@ -264,12 +270,34 @@ vtep_lswitch_run(struct shash *vtep_pbs, struct sset *vtep_pswitches,
     sset_destroy(&used_ls);
 }
 
+static void
+vtep_cache_mmr_ext(struct mmr_hash_node_data **mmr_ext,
+                   const struct vteprec_logical_switch *vtep_ls,
+                   int64_t tnl_key, struct shash *mcast_macs_rmts)
+{
+    if (*mmr_ext) {
+        return;
+    }
+
+    char *mac_tnlkey = xasprintf("%s_%"PRId64, "unknown-dst", tnl_key);
+    *mmr_ext = shash_find_data(mcast_macs_rmts, mac_tnlkey);
+
+    if (*mmr_ext && (*mmr_ext)->mmr->logical_switch == vtep_ls) {
+        /* Delete the entry from the hash table so the mmr does not get
+         * removed from the DB later on during stale checking. */
+        shash_find_and_delete(mcast_macs_rmts, mac_tnlkey);
+    }
+    free(mac_tnlkey);
+}
+
 /* Updates the vtep 'Ucast_Macs_Remote' and 'Mcast_Macs_Remote' tables based
  * on non-vtep port bindings. */
 static void
 vtep_macs_run(struct ovsdb_idl_txn *vtep_idl_txn, struct shash *ucast_macs_rmts,
               struct shash *mcast_macs_rmts, struct shash *physical_locators,
-              struct shash *vtep_lswitches, struct shash *non_vtep_pbs)
+              struct shash *vtep_lswitches, struct shash *non_vtep_pbs,
+              struct sset *vtep_pswitches, struct shash *vtep_pbs,
+              struct shash *lp_fdbs)
 {
     struct shash_node *node;
     struct hmap ls_map;
@@ -344,6 +372,14 @@ vtep_macs_run(struct ovsdb_idl_txn *vtep_idl_txn, struct shash *ucast_macs_rmts,
                 continue;
             }
             tnl_key = peer_pb->datapath->tunnel_key;
+        } else if (!strcmp(port_binding_rec->type, "external")) {
+            /* External ports not bound on specific chassis, they
+             * may sit on some of VTEP endpoints, but port itself
+             * is bound to one of gateway nodes to provide DHCP/Metadata.
+             * Skip port_binding information for such ports, as it does
+             * not specify real node location.
+             */
+            continue;
         } else {
             tnl_key = port_binding_rec->datapath->tunnel_key;
         }
@@ -389,19 +425,8 @@ vtep_macs_run(struct ovsdb_idl_txn *vtep_idl_txn, struct shash *ucast_macs_rmts,
             shash_add(&ls_node->physical_locators, chassis_ip, pl);
         }
 
-        if (!ls_node->mmr_ext) {
-            char *mac_tnlkey = xasprintf("%s_%"PRId64, "unknown-dst", tnl_key);
-            ls_node->mmr_ext = shash_find_data(mcast_macs_rmts, mac_tnlkey);
-
-            if (ls_node->mmr_ext &&
-                ls_node->mmr_ext->mmr->logical_switch == ls_node->vtep_ls) {
-
-                /* Delete the entry from the hash table so the mmr does not get
-                * removed from the DB later on during stale checking. */
-                shash_find_and_delete(mcast_macs_rmts, mac_tnlkey);
-            }
-            free(mac_tnlkey);
-        }
+        vtep_cache_mmr_ext(&ls_node->mmr_ext, ls_node->vtep_ls, tnl_key,
+                           mcast_macs_rmts);
 
         for (i = 0; i < port_binding_rec->n_mac; i++) {
             const struct vteprec_ucast_macs_remote *umr;
@@ -442,6 +467,121 @@ vtep_macs_run(struct ovsdb_idl_txn *vtep_idl_txn, struct shash *ucast_macs_rmts,
             }
             free(mac_ip_tnlkey);
             destroy_lport_addresses(&laddrs);
+        }
+    }
+
+    /* Handle dynamically learned MACs from remote VTEPs registered in
+     * FDB table. */
+    SHASH_FOR_EACH (node, vtep_pbs) {
+        const struct sbrec_port_binding *port_binding_rec = node->data;
+
+        const struct sbrec_chassis *chassis_rec = port_binding_rec->chassis;
+        if (!chassis_rec) {
+            continue;
+        }
+
+        const char *pswitch_name = smap_get(&port_binding_rec->options,
+                                            "vtep-physical-switch");
+        /* Ignore macs learned by ourselves. */
+        if (!pswitch_name || sset_find(vtep_pswitches, pswitch_name)) {
+            continue;
+        }
+        int64_t tnl_key = port_binding_rec->datapath->tunnel_key;
+
+        struct ls_hash_node *ls_node;
+        HMAP_FOR_EACH_WITH_HASH (ls_node, hmap_node,
+                                 hash_uint64((uint64_t) tnl_key),
+                                 &ls_map) {
+            if (ls_node->vtep_ls->tunnel_key[0] == tnl_key) {
+                break;
+            }
+        }
+        /* If 'ls_node' is NULL, that means no vtep logical switch is
+         * attached to the corresponding ovn logical datapath, so pass.
+         */
+        if (!ls_node) {
+            continue;
+        }
+
+        const char *chassis_ip = get_chassis_vtep_ip(chassis_rec);
+        /* Unreachable chassis, continue. */
+        if (!chassis_ip) {
+            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+            VLOG_INFO_RL(&rl, "VTEP tunnel encap on chassis (%s) not found",
+                         chassis_rec->name);
+            continue;
+        }
+
+        const struct vteprec_physical_locator *pl =
+            shash_find_data(physical_locators, chassis_ip);
+        if (!pl) {
+            pl = create_pl(vtep_idl_txn, chassis_ip);
+            shash_add(physical_locators, chassis_ip, pl);
+        }
+
+        const struct vteprec_physical_locator *ls_pl =
+            shash_find_data(&ls_node->physical_locators, chassis_ip);
+        if (!ls_pl) {
+            struct vtep_rec_physical_locator_list_entry *ploc_entry =
+                xmalloc(sizeof *ploc_entry);
+            ploc_entry->vteprec_ploc = pl;
+            ovs_list_push_back(&ls_node->locators_list,
+                               &ploc_entry->locators_node);
+            shash_add(&ls_node->physical_locators, chassis_ip, pl);
+        }
+
+        vtep_cache_mmr_ext(&ls_node->mmr_ext, ls_node->vtep_ls, tnl_key,
+                           mcast_macs_rmts);
+
+        char *fdb_dp_port_key =
+            xasprintf("%"PRId64"_%"PRId64,
+                      port_binding_rec->datapath->tunnel_key,
+                      port_binding_rec->tunnel_key);
+        struct lp_fdb_node_data *sbrec_lp_fdb =
+            shash_find_data(lp_fdbs, fdb_dp_port_key);
+        free(fdb_dp_port_key);
+
+        if (!sbrec_lp_fdb) {
+            continue;
+        }
+
+        struct shash_node *sbrec_fdb_node;
+        SHASH_FOR_EACH (sbrec_fdb_node, &sbrec_lp_fdb->mac_fdbs) {
+            const struct sbrec_fdb *fdb = sbrec_fdb_node->data;
+
+            const struct vteprec_ucast_macs_remote *umr;
+            const struct sbrec_port_binding *conflict;
+
+            char *mac = fdb->mac;
+
+            /* Checks for duplicate MAC in the same vtep logical switch. */
+            conflict = shash_find_data(&ls_node->added_macs, mac);
+            if (conflict) {
+                static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+                VLOG_WARN_RL(&rl, "MAC address (%s) has already been known to "
+                             "be on logical port (%s) in the same logical "
+                             "datapath, so just ignore this logical port (%s)",
+                             mac, conflict->logical_port,
+                             port_binding_rec->logical_port);
+                continue;
+            }
+            shash_add(&ls_node->added_macs, mac, port_binding_rec);
+
+            char *mac_ip_tnlkey = xasprintf("%s_%s_%"PRId64, mac, chassis_ip,
+                                            tnl_key);
+            umr = shash_find_data(ucast_macs_rmts, mac_ip_tnlkey);
+            /* If finds the 'umr' entry for the mac, ip, and tnl_key, deletes
+             * the entry from shash so that it is not garbage collected.
+             *
+             * If not found, creates a new 'umr' entry. */
+            if (umr && umr->logical_switch == ls_node->vtep_ls) {
+                shash_find_and_delete(ucast_macs_rmts, mac_ip_tnlkey);
+            } else {
+                const struct vteprec_ucast_macs_remote *new_umr;
+                new_umr = create_umr(vtep_idl_txn, mac, ls_node->vtep_ls);
+                vteprec_ucast_macs_remote_set_locator(new_umr, pl);
+            }
+            free(mac_ip_tnlkey);
         }
     }
 
@@ -518,6 +658,140 @@ vtep_mcast_macs_cleanup(struct ovsdb_idl *vtep_idl)
     }
 
     return true;
+}
+
+static const struct sbrec_port_binding *
+logical_switch_find_pb(struct shash *vtep_pbs,
+                       struct sset *vtep_pswitches,
+                       const char *ls_name)
+{
+    struct shash_node *node;
+    SHASH_FOR_EACH (node, vtep_pbs) {
+        const struct sbrec_port_binding *port_binding_rec = node->data;
+        const char *pswitch_name = smap_get(&port_binding_rec->options,
+                                            "vtep-physical-switch");
+        const char *lswitch_name = smap_get(&port_binding_rec->options,
+                                            "vtep-logical-switch");
+        if (!port_binding_rec->chassis) {
+            continue;
+        }
+
+        /* If 'port_binding_rec->chassis' exists then 'pswitch_name'
+         * and 'lswitch_name' must also exist. */
+        if (!pswitch_name || !lswitch_name) {
+            /* This could only happen when someone directly modifies the
+             * database,  (e.g. using ovn-sbctl). */
+            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+            VLOG_ERR_RL(&rl, "logical port (%s) with no "
+                        "'options:vtep-physical-switch' or "
+                        "'options:vtep-logical-switch' specified "
+                        "is bound to chassis (%s).",
+                        port_binding_rec->logical_port,
+                        port_binding_rec->chassis->name);
+            continue;
+        }
+        /* Make sure both logical_switch and physical_switch matches */
+        if (!strcmp(ls_name, lswitch_name)) {
+            if (sset_find(vtep_pswitches, port_binding_rec->chassis->name)) {
+                return port_binding_rec;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Propagate dynamically learned MACs on local VTEPs to OVN SB. Where
+ * later this information is used to create tunnels between neighbour
+ * VTEPs.
+ */
+static void
+vtep_local_macs(struct controller_vtep_ctx *ctx,
+                struct shash *vtep_pbs,
+                struct sset *vtep_pswitches,
+                struct shash *vtep_lswitches,
+                struct shash *lp_fdb)
+{
+    if (!ctx->ovnsb_idl_txn) {
+        return;
+    }
+
+    ovsdb_idl_txn_add_comment(ctx->ovnsb_idl_txn,
+                              "ovn-controller-vtep: updating fdb");
+
+    const struct vteprec_ucast_macs_local *vtep_uml;
+
+    /* Collect local unicast MACs */
+    VTEPREC_UCAST_MACS_LOCAL_FOR_EACH (vtep_uml, ctx->vtep_idl) {
+        const struct sbrec_port_binding *port_binding_rec =
+            logical_switch_find_pb(vtep_pbs,
+                                   vtep_pswitches,
+                                   vtep_uml->logical_switch->name);
+        if (!port_binding_rec) {
+            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+            VLOG_ERR_RL(&rl, "Cannot find port_binding for dynamically "
+                       "learned MAC %s in logical_switch %s",
+                        vtep_uml->MAC,
+                        vtep_uml->logical_switch->name);
+            continue;
+        }
+
+        char *fdb_dp_port_key = xasprintf(
+            "%"PRId64"_%"PRId64, port_binding_rec->datapath->tunnel_key,
+            port_binding_rec->tunnel_key);
+
+        struct lp_fdb_node_data *sbrec_lp_fdb =
+            shash_find_data(lp_fdb, fdb_dp_port_key);
+
+        const struct sbrec_fdb *sb_fdb = NULL;
+        if (sbrec_lp_fdb) {
+            sb_fdb = shash_find_and_delete(&sbrec_lp_fdb->mac_fdbs,
+                                           vtep_uml->MAC);
+        }
+        free(fdb_dp_port_key);
+
+        if (!sb_fdb) {
+            VLOG_DBG("Creating new FDB entry for mac %s", vtep_uml->MAC);
+            sb_fdb = sbrec_fdb_insert(ctx->ovnsb_idl_txn);
+            sbrec_fdb_set_dp_key(sb_fdb,
+                                 port_binding_rec->datapath->tunnel_key);
+            sbrec_fdb_set_mac(sb_fdb, vtep_uml->MAC);
+            sbrec_fdb_set_port_key(sb_fdb, port_binding_rec->tunnel_key);
+            sbrec_fdb_set_timestamp(sb_fdb, INT64_MAX);
+        }
+    }
+
+    struct shash_node *node;
+    SHASH_FOR_EACH (node, vtep_lswitches) {
+        struct shash_node *sbrec_fdb_node;
+        const struct sbrec_port_binding *port_binding_rec =
+            logical_switch_find_pb(vtep_pbs,
+                                   vtep_pswitches,
+                                   node->name);
+        if (!port_binding_rec) {
+            continue;
+        }
+        if (!port_binding_rec->datapath->tunnel_key ||
+            !port_binding_rec->tunnel_key) {
+            continue;
+        }
+
+        char *fdb_dp_port_key = xasprintf(
+            "%"PRId64"_%"PRId64, port_binding_rec->datapath->tunnel_key,
+            port_binding_rec->tunnel_key);
+        struct lp_fdb_node_data *sbrec_lp_fdb = shash_find_data(
+            lp_fdb, fdb_dp_port_key);
+        free(fdb_dp_port_key);
+
+        if (!sbrec_lp_fdb) {
+            continue;
+        }
+
+        SHASH_FOR_EACH (sbrec_fdb_node, &sbrec_lp_fdb->mac_fdbs) {
+            struct sbrec_fdb *mac_fdb = sbrec_fdb_node->data;
+            VLOG_DBG("Removing stale FDB for VTEP mac %s", mac_fdb->mac);
+            sbrec_fdb_delete(mac_fdb);
+        }
+    }
 }
 
 /* Updates vtep logical switch tunnel keys. */
@@ -605,6 +879,29 @@ vtep_run(struct controller_vtep_ctx *ctx)
         shash_add(target, port_binding_rec->logical_port, port_binding_rec);
     }
 
+    /* Construct logical_port to fdb */
+    const struct sbrec_fdb *fdb;
+    struct shash lp_fdbs = SHASH_INITIALIZER(&lp_fdbs);
+
+    SBREC_FDB_FOR_EACH (fdb, ctx->ovnsb_idl) {
+        char *fdb_dp_port_key = xasprintf("%"PRId64"_%"PRId64, fdb->dp_key,
+                                          fdb->port_key);
+        struct lp_fdb_node_data *lp_fdb = shash_find_data(&lp_fdbs,
+                                                          fdb_dp_port_key);
+        if (!lp_fdb) {
+            lp_fdb = xmalloc(sizeof *lp_fdb);
+            *lp_fdb = (struct lp_fdb_node_data) {
+                .dp_key = fdb->dp_key,
+                .port_key = fdb->port_key,
+                .mac_fdbs = SHASH_INITIALIZER(&lp_fdb->mac_fdbs),
+            };
+
+            shash_add(&lp_fdbs, fdb_dp_port_key, lp_fdb);
+        }
+        shash_add(&lp_fdb->mac_fdbs, fdb->mac, fdb);
+        free(fdb_dp_port_key);
+    }
+
     ovsdb_idl_txn_add_comment(ctx->vtep_idl_txn,
                               "ovn-controller-vtep: update logical switch "
                               "tunnel keys and 'ucast_macs_remote's");
@@ -612,7 +909,11 @@ vtep_run(struct controller_vtep_ctx *ctx)
     vtep_lswitch_run(&vtep_pbs, &vtep_pswitches, &vtep_lswitches);
     vtep_macs_run(ctx->vtep_idl_txn, &ucast_macs_rmts,
                   &mcast_macs_rmts, &physical_locators,
-                  &vtep_lswitches, &non_vtep_pbs);
+                  &vtep_lswitches, &non_vtep_pbs,
+                  &vtep_pswitches, &vtep_pbs,
+                  &lp_fdbs);
+    vtep_local_macs(ctx, &vtep_pbs, &vtep_pswitches, &vtep_lswitches,
+                    &lp_fdbs);
 
     sset_destroy(&vtep_pswitches);
     shash_destroy(&vtep_lswitches);
@@ -628,6 +929,14 @@ vtep_run(struct controller_vtep_ctx *ctx)
     shash_destroy(&physical_locators);
     shash_destroy(&vtep_pbs);
     shash_destroy(&non_vtep_pbs);
+
+    struct shash_node *lp_fdb_node;
+    SHASH_FOR_EACH (lp_fdb_node, &lp_fdbs) {
+        struct lp_fdb_node_data *lp_fdb = lp_fdb_node->data;
+        shash_destroy(&lp_fdb->mac_fdbs);
+        free(lp_fdb);
+    }
+    shash_destroy(&lp_fdbs);
 }
 
 /* Cleans up all related entries in vtep.  Returns true when done (i.e. there

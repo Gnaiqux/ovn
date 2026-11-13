@@ -71,6 +71,12 @@ struct related_lports {
                               */
 };
 
+enum binding_local_lport_status {
+    LPORT_STATUS_NOT_BOUND, /* Set if just iface-id is set but the port is
+                               not in sb. */
+    LPORT_STATUS_BOUND, /* Set if the port is in sb and locally relevant. */
+};
+
 void related_lports_init(struct related_lports *);
 void related_lports_destroy(struct related_lports *);
 
@@ -81,7 +87,7 @@ struct binding_ctx_out {
     struct local_binding_data *lbinding_data;
 
     /* sset of (potential) local lports. */
-    struct sset *local_lports;
+    struct simap *local_lports;
     /* Track if local_lports have been updated. */
     bool local_lports_changed;
 
@@ -111,6 +117,10 @@ struct binding_ctx_out {
 
     bool localnet_learn_fdb;
     bool localnet_learn_fdb_changed;
+
+    /* Track if any tunnel OVS interface has been added, deleted or
+     * updated. */
+    bool tunnel_ifaces_changed;
 };
 
 /* Local bindings. binding.c module binds the logical port (represented by
@@ -157,6 +167,7 @@ void local_binding_data_destroy(struct local_binding_data *);
 
 const struct sbrec_port_binding *local_binding_get_primary_pb(
     const struct shash *local_bindings, const char *pb_name);
+struct binding_lport *local_binding_get_primary_lport(struct local_binding *);
 ofp_port_t local_binding_get_lport_ofport(const struct shash *local_bindings,
                                           const char *pb_name);
 
@@ -201,6 +212,9 @@ bool binding_handle_port_binding_changes(struct binding_ctx_in *,
 void binding_tracked_dp_destroy(struct hmap *tracked_datapaths);
 
 void binding_dump_local_bindings(struct local_binding_data *, struct ds *);
+void binding_dump_local_datapaths(struct hmap *local_datapaths, struct ds *);
+void binding_dump_related_lports(struct related_lports *related_lports,
+                                 struct ds *);
 
 bool is_additional_chassis(const struct sbrec_port_binding *pb,
                            const struct sbrec_chassis *chassis_rec);
@@ -273,7 +287,9 @@ void update_qos(struct ovsdb_idl_index * sbrec_port_binding_by_name,
                 const struct ovsrec_open_vswitch_table *ovs_table,
                 const struct ovsrec_bridge_table *bridge_table);
 
-bool lport_maybe_postpone(const char *port_name, long long int now,
+bool lport_maybe_postpone(const struct sbrec_port_binding *pb,
+                          const struct sbrec_chassis *chassis_rec,
+                          long long int now,
                           struct sset *postponed_ports);
 
 void claimed_lport_set_up(const struct sbrec_port_binding *pb,
@@ -281,4 +297,7 @@ void claimed_lport_set_up(const struct sbrec_port_binding *pb,
 bool port_binding_is_up(const struct sbrec_chassis *chassis_rec,
                         const struct sbrec_port_binding_table *,
                         const struct uuid *pb_uuid);
+bool is_iface_in_int_bridge(const struct ovsrec_interface *iface,
+                            const struct ovsrec_bridge *br_int);
+
 #endif /* controller/binding.h */

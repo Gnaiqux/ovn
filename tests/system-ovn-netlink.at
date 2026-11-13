@@ -1,0 +1,951 @@
+AT_BANNER([system-ovn-netlink])
+
+AT_SETUP([sync netlink neighbors - learn VXLAN VTEP neighbors])
+AT_KEYWORDS([netlink-neighbors])
+
+check ip link add br-test type bridge
+on_exit 'ip link del br-test'
+check ip link set br-test address 00:00:00:00:00:01
+check ip link set dev br-test up
+
+check ip link add vxlan-test type vxlan id 42 \
+    dstport 4789 local 42.42.42.2 nolearning
+on_exit 'ip link del vxlan-test'
+check ip link set vxlan-test master br-test
+check ip link set vxlan-test address 00:00:00:00:00:02
+check ip link set dev vxlan-test up
+
+dnl Inject permanent (vxlan) entries.
+check bridge fdb append 00:00:00:00:00:00 dev vxlan-test \
+    dst 42.42.42.3 port 4789 self permanent
+check bridge fdb append 00:00:00:00:00:00 dev vxlan-test \
+    dst 42.42.42.4 port 4790 self permanent
+
+if_index=$(netlink_if_index vxlan-test)
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink neighbor-sync \
+    bridge $if_index 0 | sort], [0], [dnl
+Neighbor ifindex=$if_index vlan=0 eth=00:00:00:00:00:00 dst=42.42.42.3 port=0 nh_id=0
+Neighbor ifindex=$if_index vlan=0 eth=00:00:00:00:00:00 dst=42.42.42.4 port=4790 nh_id=0
+Neighbor ifindex=$if_index vlan=0 eth=00:00:00:00:00:02 dst=:: port=0 nh_id=0
+])
+AT_CLEANUP
+
+AT_SETUP([sync netlink neighbors - learn VXLAN remote mac entries])
+AT_KEYWORDS([netlink-neighbors])
+
+check ip link add br-test type bridge
+on_exit 'ip link del br-test'
+check ip link set br-test address 00:00:00:00:00:01
+check ip link set dev br-test up
+
+check ip link add vxlan-test type vxlan id 42 \
+    dstport 4789 local 42.42.42.2 nolearning
+on_exit 'ip link del vxlan-test'
+check ip link set vxlan-test master br-test
+check ip link set vxlan-test address 00:00:00:00:00:02
+check ip link set dev vxlan-test up
+
+dnl Inject externally learnt (vxlan) mac entries.
+check bridge fdb add 00:00:00:00:00:03 dev vxlan-test \
+    dst 42.42.42.3 static extern_learn
+
+if_index=$(netlink_if_index vxlan-test)
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink neighbor-sync \
+    bridge $if_index 0 | sort], [0], [dnl
+Neighbor ifindex=$if_index vlan=0 eth=00:00:00:00:00:02 dst=:: port=0 nh_id=0
+Neighbor ifindex=$if_index vlan=0 eth=00:00:00:00:00:03 dst=42.42.42.3 port=0 nh_id=0
+])
+
+dnl Test FDB entries with nexthop group ID (NDA_NH_ID).
+dnl Use a separate namespace to avoid nexthop ID conflicts.
+ADD_NAMESPACES(nhid)
+
+dnl Bridge setup.
+NS_EXEC([nhid], [ip link add br-nhid type bridge])
+NS_EXEC([nhid], [ip link set br-nhid address 00:00:00:00:00:01])
+NS_EXEC([nhid], [ip link set dev br-nhid up])
+
+dnl VXLAN setup.
+NS_EXEC([nhid], [ip link add vxlan-nhid type vxlan id 42 \
+    dstport 4789 local 42.42.42.2 nolearning])
+NS_EXEC([nhid], [ip link set vxlan-nhid master br-nhid])
+NS_EXEC([nhid], [ip link set vxlan-nhid address 00:00:00:00:00:02])
+NS_EXEC([nhid], [ip link set dev vxlan-nhid up])
+
+dnl Nexthop setup.
+NS_EXEC([nhid], [ip nexthop add id 1 via 192.168.1.1 fdb])
+NS_EXEC([nhid], [ip nexthop add id 10 group 1 fdb])
+
+dnl FDB entries.
+NS_EXEC([nhid], [bridge fdb add 00:00:00:00:00:03 dev vxlan-nhid \
+    dst 42.42.42.3 static extern_learn])
+NS_EXEC([nhid], [bridge fdb add 00:00:00:00:00:04 dev vxlan-nhid nhid 10])
+
+nhid_if_index=$(netlink_if_index vxlan-nhid nhid)
+
+dnl Verify that nh_id is parsed and reported.
+OVS_WAIT_FOR_OUTPUT_UNQUOTED(
+    [ip netns exec nhid ovstest test-ovn-netlink neighbor-sync \
+        bridge $nhid_if_index 0 | sort], [0], [dnl
+Neighbor ifindex=$nhid_if_index vlan=0 eth=00:00:00:00:00:02 dst=:: port=0 nh_id=0
+Neighbor ifindex=$nhid_if_index vlan=0 eth=00:00:00:00:00:03 dst=42.42.42.3 port=0 nh_id=0
+Neighbor ifindex=$nhid_if_index vlan=0 eth=00:00:00:00:00:04 dst=:: port=0 nh_id=10
+])
+AT_CLEANUP
+
+AT_SETUP([sync netlink neighbors - inject OVN static mac entries])
+AT_KEYWORDS([netlink-neighbors])
+
+check ip link add br-test type bridge
+on_exit 'ip link del br-test'
+check ip link set br-test address 00:00:00:00:00:01
+check ip link set dev br-test up
+
+check ip link add lo-test type dummy
+on_exit 'ip link del lo-test'
+check ip link set lo-test master br-test
+check ip link set lo-test address 00:00:00:00:00:02
+check ip link set dev lo-test up
+
+dnl Let ovn inject some neighbor (mac) entries, we detect the lo-test mac and
+dnl the L2 multicast ones.
+if_index=$(netlink_if_index lo-test)
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink neighbor-sync \
+    bridge $if_index 2 00:00:00:00:01:00 00:00:00:00:02:00 | sort], [0], [dnl
+Neighbor ifindex=$if_index vlan=0 eth=00:00:00:00:00:02 dst=:: port=0 nh_id=0
+Neighbor ifindex=$if_index vlan=0 eth=01:00:5e:00:00:01 dst=:: port=0 nh_id=0
+Neighbor ifindex=$if_index vlan=0 eth=33:33:00:00:00:01 dst=:: port=0 nh_id=0
+])
+
+dnl Check that OVN installed its entries (these are always installed
+dnl as "static").
+OVS_WAIT_FOR_OUTPUT([bridge fdb show dev lo-test | grep static | sort], [0],
+[dnl
+00:00:00:00:01:00 master br-test static
+00:00:00:00:01:00 vlan 1 master br-test static
+00:00:00:00:02:00 master br-test static
+00:00:00:00:02:00 vlan 1 master br-test static
+])
+
+dnl Remove the static entries, rerun the OVN test binary, they should be
+dnl readded.
+check bridge fdb del 00:00:00:00:01:00 dev lo-test master static
+check bridge fdb del 00:00:00:00:02:00 dev lo-test master static
+
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink neighbor-sync \
+    bridge $if_index 2 00:00:00:00:01:00 00:00:00:00:02:00 | sort], [0], [dnl
+Neighbor ifindex=$if_index vlan=0 eth=00:00:00:00:00:02 dst=:: port=0 nh_id=0
+Neighbor ifindex=$if_index vlan=0 eth=01:00:5e:00:00:01 dst=:: port=0 nh_id=0
+Neighbor ifindex=$if_index vlan=0 eth=33:33:00:00:00:01 dst=:: port=0 nh_id=0
+])
+
+OVS_WAIT_FOR_OUTPUT([bridge fdb show dev lo-test | grep static | sort], [0],
+[dnl
+00:00:00:00:01:00 master br-test static
+00:00:00:00:01:00 vlan 1 master br-test static
+00:00:00:00:02:00 master br-test static
+00:00:00:00:02:00 vlan 1 master br-test static
+])
+
+dnl Inject some ovn-like entries, rerun the OVN test binary, they should
+dnl be removed.
+check bridge fdb add 00:00:00:00:03:00 dev lo-test master static
+check bridge fdb add 00:00:00:00:04:00 dev lo-test master static
+
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink neighbor-sync \
+    bridge $if_index 2 00:00:00:00:01:00 00:00:00:00:02:00 | sort], [0], [dnl
+Neighbor ifindex=$if_index vlan=0 eth=00:00:00:00:00:02 dst=:: port=0 nh_id=0
+Neighbor ifindex=$if_index vlan=0 eth=01:00:5e:00:00:01 dst=:: port=0 nh_id=0
+Neighbor ifindex=$if_index vlan=0 eth=33:33:00:00:00:01 dst=:: port=0 nh_id=0
+])
+
+OVS_WAIT_FOR_OUTPUT([bridge fdb show dev lo-test | grep static | sort], [0],
+[dnl
+00:00:00:00:01:00 master br-test static
+00:00:00:00:01:00 vlan 1 master br-test static
+00:00:00:00:02:00 master br-test static
+00:00:00:00:02:00 vlan 1 master br-test static
+])
+
+AT_CLEANUP
+
+AT_SETUP([sync netlink neighbors - learn IP neighbors])
+AT_KEYWORDS([netlink-neighbors])
+CHECK_VRF()
+
+dnl NOTE: To avoid affecting the default routing table configure a test
+dnl interface into a separate vrf.
+check ip link add vrf-ovn type vrf table 42
+on_exit 'ip link del vrf-ovn'
+check ip link add br-test type bridge
+on_exit 'ip link del br-test'
+check ip link set br-test master vrf-ovn
+check ip link set br-test address 00:00:00:00:00:01
+check ip address add dev br-test 20.20.20.1/24
+check ip -6 address add dev br-test 20::1/64
+check ip link set dev br-test up
+
+dnl Inject externally learnt IP neighbor entries.
+check ip neigh add 10.10.10.10 \
+    lladdr 00:00:00:00:10:00 dev br-test extern_learn
+check ip -6 neigh add 10::10 \
+    lladdr 00:00:00:00:10:00 dev br-test extern_learn
+
+dnl Let OVN inject some IPv4 neighbors too and make sure it learnt the
+dnl external ones.
+if_index=$(netlink_if_index br-test)
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink neighbor-sync \
+    inet $if_index 1 00:00:00:00:20:00 20.20.20.20 | sort], [0], [dnl
+Neighbor ifindex=$if_index vlan=0 eth=00:00:00:00:10:00 dst=10.10.10.10 port=0 nh_id=0
+])
+
+dnl Check that OVN installed its entries (these are always installed
+dnl as "noarp").
+OVN_NEIGH_EQUAL([br-test], [nud noarp], [20.20.20], [dnl
+20.20.20.20 lladdr 00:00:00:00:20:00 NOARP])
+
+dnl Let OVN inject some IPv6 neighbors too and make sure it learnt the
+dnl external ones.
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink neighbor-sync \
+    inet6 $if_index 1 00:00:00:00:20:00 20::20 | sort], [0], [dnl
+Neighbor ifindex=$if_index vlan=0 eth=00:00:00:00:10:00 dst=10::10 port=0 nh_id=0
+])
+
+dnl Check that OVN installed its entries (these are always installed
+dnl as "noarp").
+OVN_NEIGH_V6_EQUAL([br-test], [nud noarp], [20::], [dnl
+20::20 lladdr 00:00:00:00:20:00 NOARP])
+
+dnl Remove the "noarp" entries, rerun the OVN test binary, they should be
+dnl readded.
+check ip neigh del dev br-test 20.20.20.20
+check ip -6 neigh del dev br-test 20::20
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink neighbor-sync \
+    inet $if_index 1 00:00:00:00:20:00 20.20.20.20 | sort], [0], [dnl
+Neighbor ifindex=$if_index vlan=0 eth=00:00:00:00:10:00 dst=10.10.10.10 port=0 nh_id=0
+])
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink neighbor-sync \
+    inet6 $if_index 1 00:00:00:00:20:00 20::20 | sort], [0], [dnl
+Neighbor ifindex=$if_index vlan=0 eth=00:00:00:00:10:00 dst=10::10 port=0 nh_id=0
+])
+
+OVN_NEIGH_EQUAL([br-test], [nud noarp], [20.20.20], [dnl
+20.20.20.20 lladdr 00:00:00:00:20:00 NOARP])
+OVN_NEIGH_V6_EQUAL([br-test], [nud noarp], [20::], [dnl
+20::20 lladdr 00:00:00:00:20:00 NOARP])
+
+dnl Inject some ovn-like entries, rerun the OVN test binary, they should
+dnl be removed.
+check ip neigh add 20.20.20.40 \
+    lladdr 00:00:00:00:40:00 dev br-test nud noarp
+check ip -6 neigh add 20::40 \
+    lladdr 00:00:00:00:40:00 dev br-test nud noarp
+
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink neighbor-sync \
+    inet $if_index 1 00:00:00:00:20:00 20.20.20.20 | sort], [0], [dnl
+Neighbor ifindex=$if_index vlan=0 eth=00:00:00:00:10:00 dst=10.10.10.10 port=0 nh_id=0
+])
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink neighbor-sync \
+    inet6 $if_index 1 00:00:00:00:20:00 20::20 | sort], [0], [dnl
+Neighbor ifindex=$if_index vlan=0 eth=00:00:00:00:10:00 dst=10::10 port=0 nh_id=0
+])
+
+OVN_NEIGH_EQUAL([br-test], [nud noarp], [20.20.20], [dnl
+20.20.20.20 lladdr 00:00:00:00:20:00 NOARP])
+OVN_NEIGH_V6_EQUAL([br-test], [nud noarp], [20::], [dnl
+20::20 lladdr 00:00:00:00:20:00 NOARP])
+
+AT_CLEANUP
+
+AT_SETUP([sync netlink neighbors - table notify])
+AT_KEYWORDS([netlink-neighbors])
+
+check ip link add br-test type bridge
+on_exit 'ip link del br-test'
+check ip link set br-test address 00:00:00:00:00:01
+check ip address add dev br-test 10.10.10.1/24
+check ip link set dev br-test up
+br_if_index=$(netlink_if_index br-test)
+
+check ip link add lo-test type dummy
+on_exit 'ip link del lo-test'
+check ip link set lo-test master br-test
+check ip link set lo-test address 00:00:00:00:00:02
+check ip link set dev lo-test up
+lo_if_index=$(netlink_if_index lo-test)
+
+dnl Should notify if an entry is added to a bridge port monitored by OVN.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink neighbor-table-notify \
+    'bridge fdb add 00:00:00:00:00:05 dev lo-test'], [0], [dnl
+Add neighbor ifindex=$lo_if_index vlan=0 eth=00:00:00:00:00:05 dst=:: port=0 nh_id=0
+])
+
+dnl Should notify if an entry is removed from a bridge port monitored by OVN.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink neighbor-table-notify \
+    'bridge fdb del 00:00:00:00:00:05 dev lo-test'], [0], [dnl
+Delete neighbor ifindex=$lo_if_index vlan=0 eth=00:00:00:00:00:05 dst=:: port=0 nh_id=0
+])
+
+dnl Should NOT notify if a static entry is added to a bridge port
+dnl monitored by OVN.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink neighbor-table-notify \
+    'bridge fdb add 00:00:00:00:00:06 dev lo-test master static'], [0], [dnl
+])
+
+dnl Should notify if an entry is added to a bridge that's monitored by
+dnl OVN.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink neighbor-table-notify \
+    'ip neigh add 10.10.10.10 lladdr 00:00:00:00:10:00 \
+        dev br-test extern_learn'], [0], [dnl
+Add neighbor ifindex=$br_if_index vlan=0 eth=00:00:00:00:10:00 dst=10.10.10.10 port=0 nh_id=0
+])
+
+dnl Should notify if an entry is removed from a bridge that's monitored by
+dnl OVN.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink neighbor-table-notify \
+    'ip neigh del 10.10.10.10 lladdr 00:00:00:00:10:00 \
+        dev br-test' | sort], [0], [dnl
+Add neighbor ifindex=$br_if_index vlan=0 eth=00:00:00:00:00:00 dst=10.10.10.10 port=0 nh_id=0
+Delete neighbor ifindex=$br_if_index vlan=0 eth=00:00:00:00:00:00 dst=10.10.10.10 port=0 nh_id=0
+])
+
+dnl Should NOT notify if a noarp entry is added to a bridge port
+dnl monitored by OVN.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink neighbor-table-notify \
+    'ip neigh add 20.20.20.20 lladdr 00:00:00:00:20:00 \
+        dev br-test nud noarp'], [0], [dnl
+])
+
+dnl Test NDA_NH_ID in notifications.
+dnl Use a separate namespace to avoid nexthop ID conflicts.
+ADD_NAMESPACES(nhid)
+
+dnl Bridge setup.
+NS_EXEC([nhid], [ip link add br-nhid type bridge])
+NS_EXEC([nhid], [ip link set br-nhid address 00:00:00:00:00:01])
+NS_EXEC([nhid], [ip link set dev br-nhid up])
+
+dnl VXLAN setup.
+NS_EXEC([nhid], [ip link add vxlan-nhid type vxlan id 42 \
+    dstport 4789 local 42.42.42.2 nolearning])
+NS_EXEC([nhid], [ip link set vxlan-nhid master br-nhid])
+NS_EXEC([nhid], [ip link set dev vxlan-nhid up])
+
+dnl Nexthop setup.
+NS_EXEC([nhid], [ip nexthop add id 1 via 192.168.1.1 fdb])
+NS_EXEC([nhid], [ip nexthop add id 10 group 1 fdb])
+
+nhid_if_index=$(netlink_if_index vxlan-nhid nhid)
+
+dnl Should notify with nh_id when FDB entry with nhid is added.
+AT_CHECK_UNQUOTED(
+    [ip netns exec nhid ovstest test-ovn-netlink neighbor-table-notify \
+        'bridge fdb add 00:00:00:00:00:07 dev vxlan-nhid nhid 10' \
+        | grep -v 'nh_id=0'], [0], [dnl
+Add neighbor ifindex=$nhid_if_index vlan=0 eth=00:00:00:00:00:07 dst=:: port=0 nh_id=10
+])
+
+dnl Should notify with nh_id when FDB entry with nhid is deleted.
+AT_CHECK_UNQUOTED(
+    [ip netns exec nhid ovstest test-ovn-netlink neighbor-table-notify \
+        'bridge fdb del 00:00:00:00:00:07 dev vxlan-nhid nhid 10' \
+        | grep -v 'nh_id=0'], [0], [dnl
+Delete neighbor ifindex=$nhid_if_index vlan=0 eth=00:00:00:00:00:07 dst=:: port=0 nh_id=10
+])
+AT_CLEANUP
+
+AT_SETUP([netlink - host-if-monitor])
+AT_KEYWORDS([netlink])
+
+dnl Should notify if an interface whose name is monitored by OVN is added.
+on_exit 'ip link del lo-test'
+if_index=$(ovstest test-ovn-netlink host-if-monitor lo-test \
+    'ip link add lo-test type dummy && ip link set dev lo-test up' \
+    true)
+check test $? -eq 0
+AT_CHECK_UNQUOTED([netlink_if_index lo-test], [0], [dnl
+$if_index
+])
+
+dnl Should NOT notify if an interface whose name is not monitored by OVN
+dnl is added.
+check ip link del lo-test
+on_exit 'ip link del lo-test-unused'
+AT_CHECK([ovstest test-ovn-netlink host-if-monitor lo-test \
+    'ip link add lo-test-unused type dummy && ip link set dev lo-test-unused up' \
+    false], [0], [dnl
+0
+])
+AT_CLEANUP
+
+AT_SETUP([sync netlink routes - Blackhole])
+AT_KEYWORDS([netlink-routes])
+
+table_id=100
+
+check ip link add vrf-$table_id type vrf table $table_id
+on_exit 'ip link del vrf-$table_id'
+check ip link set dev vrf-$table_id up
+
+check ip link add lo-test type dummy
+on_exit 'ip link del lo-test'
+check ip link set lo-test master vrf-$table_id
+check ip link set lo-test address 00:00:00:00:00:10
+check ip addr add 20.0.0.10/24 dev lo-test
+check ip addr add fd20::10/64 dev lo-test
+check ip link set up lo-test
+
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink route-sync \
+    $table_id | sort], [0], [dnl
+])
+
+check ip route add 10.10.10.1 via 20.0.0.1 vrf vrf-$table_id proto zebra
+check ip route add fd20:100::10 via fd20::1 vrf vrf-$table_id proto zebra
+check ip route add 10.10.20.0/24 via 20.0.0.1 vrf vrf-$table_id
+
+AS_BOX([No advertisement])
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink route-sync \
+    $table_id | sort], [0], [dnl
+Route table_id=$table_id dst=10.10.10.1 plen=32 nexthop=20.0.0.1
+Route table_id=$table_id dst=fd20:100::10 plen=128 nexthop=fd20::1
+])
+
+OVN_ROUTE_EQUAL([vrf-$table_id], [dnl
+10.10.10.1 via 20.0.0.1 dev lo-test proto zebra
+10.10.20.0/24 via 20.0.0.1 dev lo-test
+20.0.0.0/24 dev lo-test proto kernel scope link src 20.0.0.10])
+
+OVN_ROUTE_V6_EQUAL([vrf-$table_id], [dnl
+fd20::/64 dev lo-test proto kernel metric 256 pref medium
+fd20:100::10 via fd20::1 dev lo-test proto zebra metric 1024 pref medium
+fe80::/64 dev lo-test proto kernel metric 256 pref medium])
+
+AS_BOX([Advertise just IPv4])
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink route-sync \
+    $table_id 192.168.100.0/24 | sort], [0], [dnl
+Route table_id=$table_id dst=10.10.10.1 plen=32 nexthop=20.0.0.1
+Route table_id=$table_id dst=fd20:100::10 plen=128 nexthop=fd20::1
+])
+
+OVN_ROUTE_EQUAL([vrf-$table_id], [dnl
+10.10.10.1 via 20.0.0.1 dev lo-test proto zebra
+10.10.20.0/24 via 20.0.0.1 dev lo-test
+20.0.0.0/24 dev lo-test proto kernel scope link src 20.0.0.10
+blackhole 192.168.100.0/24 proto ovn])
+
+OVN_ROUTE_V6_EQUAL([vrf-$table_id], [dnl
+fd20::/64 dev lo-test proto kernel metric 256 pref medium
+fd20:100::10 via fd20::1 dev lo-test proto zebra metric 1024 pref medium
+fe80::/64 dev lo-test proto kernel metric 256 pref medium])
+
+AS_BOX([Advertise both IPv4 and IPv6])
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink route-sync \
+    $table_id 192.168.100.0/24 fd20:100::/64 | sort], [0], [dnl
+Route table_id=$table_id dst=10.10.10.1 plen=32 nexthop=20.0.0.1
+Route table_id=$table_id dst=fd20:100::10 plen=128 nexthop=fd20::1
+])
+
+OVN_ROUTE_EQUAL([vrf-$table_id], [dnl
+10.10.10.1 via 20.0.0.1 dev lo-test proto zebra
+10.10.20.0/24 via 20.0.0.1 dev lo-test
+20.0.0.0/24 dev lo-test proto kernel scope link src 20.0.0.10
+blackhole 192.168.100.0/24 proto ovn])
+
+OVN_ROUTE_V6_EQUAL([vrf-$table_id], [dnl
+fd20::/64 dev lo-test proto kernel metric 256 pref medium
+fd20:100::10 via fd20::1 dev lo-test proto zebra metric 1024 pref medium
+blackhole fd20:100::/64 dev lo proto ovn metric 1024 pref medium
+fe80::/64 dev lo-test proto kernel metric 256 pref medium])
+
+AS_BOX([Advertise just IPv4, should remove the IPv6])
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink route-sync \
+    $table_id 192.168.100.0/24 | sort], [0], [dnl
+Route table_id=$table_id dst=10.10.10.1 plen=32 nexthop=20.0.0.1
+Route table_id=$table_id dst=fd20:100::10 plen=128 nexthop=fd20::1
+])
+
+OVN_ROUTE_EQUAL([vrf-$table_id], [dnl
+10.10.10.1 via 20.0.0.1 dev lo-test proto zebra
+10.10.20.0/24 via 20.0.0.1 dev lo-test
+20.0.0.0/24 dev lo-test proto kernel scope link src 20.0.0.10
+blackhole 192.168.100.0/24 proto ovn])
+
+OVN_ROUTE_V6_EQUAL([vrf-$table_id], [dnl
+fd20::/64 dev lo-test proto kernel metric 256 pref medium
+fd20:100::10 via fd20::1 dev lo-test proto zebra metric 1024 pref medium
+fe80::/64 dev lo-test proto kernel metric 256 pref medium])
+
+AS_BOX([No advertisement should remove IPv4])
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink route-sync \
+    $table_id | sort], [0], [dnl
+Route table_id=$table_id dst=10.10.10.1 plen=32 nexthop=20.0.0.1
+Route table_id=$table_id dst=fd20:100::10 plen=128 nexthop=fd20::1
+])
+
+OVN_ROUTE_EQUAL([vrf-$table_id], [dnl
+10.10.10.1 via 20.0.0.1 dev lo-test proto zebra
+10.10.20.0/24 via 20.0.0.1 dev lo-test
+20.0.0.0/24 dev lo-test proto kernel scope link src 20.0.0.10])
+
+OVN_ROUTE_V6_EQUAL([vrf-$table_id], [dnl
+fd20::/64 dev lo-test proto kernel metric 256 pref medium
+fd20:100::10 via fd20::1 dev lo-test proto zebra metric 1024 pref medium
+fe80::/64 dev lo-test proto kernel metric 256 pref medium])
+
+AT_CLEANUP
+
+AT_SETUP([sync netlink routes - Nexthop])
+AT_KEYWORDS([netlink-routes])
+
+table_id=100
+
+check ip link add vrf-$table_id type vrf table $table_id
+on_exit 'ip link del vrf-$table_id'
+check ip link set dev vrf-$table_id up
+
+check ip link add lo-test type dummy
+on_exit 'ip link del lo-test'
+check ip link set lo-test master vrf-$table_id
+check ip link set lo-test address 00:00:00:00:00:10
+check ip addr add 20.0.0.10/24 dev lo-test
+check ip addr add fd20::10/64 dev lo-test
+check ip link set up lo-test
+
+check ovstest test-ovn-netlink route-sync $table_id
+
+AS_BOX([Advertise IPv4 via IPv4])
+check ovstest test-ovn-netlink route-sync $table_id \
+    192.168.100.0/24 via 20.0.0.1
+
+OVN_ROUTE_EQUAL([vrf-$table_id], [dnl
+20.0.0.0/24 dev lo-test proto kernel scope link src 20.0.0.10
+192.168.100.0/24 via 20.0.0.1 dev lo-test proto ovn])
+
+OVN_ROUTE_V6_EQUAL([vrf-$table_id], [dnl
+fd20::/64 dev lo-test proto kernel metric 256 pref medium
+fe80::/64 dev lo-test proto kernel metric 256 pref medium])
+
+AS_BOX([Advertise IPv4 via IPv4 and IPv6 via IPv6])
+check ovstest test-ovn-netlink route-sync $table_id \
+    192.168.100.0/24 via 20.0.0.1 \
+    fd20:100::/64 via fd20::1
+
+OVN_ROUTE_EQUAL([vrf-$table_id], [dnl
+20.0.0.0/24 dev lo-test proto kernel scope link src 20.0.0.10
+192.168.100.0/24 via 20.0.0.1 dev lo-test proto ovn])
+
+OVN_ROUTE_V6_EQUAL([vrf-$table_id], [dnl
+fd20::/64 dev lo-test proto kernel metric 256 pref medium
+fd20:100::/64 via fd20::1 dev lo-test proto ovn metric 1024 pref medium
+fe80::/64 dev lo-test proto kernel metric 256 pref medium])
+
+AS_BOX([Advertise IPv4 via IPv6 and IPv6 via IPv6])
+check ovstest test-ovn-netlink route-sync $table_id \
+    192.168.100.0/24 via fd20::1 \
+    fd20:100::/64 via fd20::1
+
+OVN_ROUTE_EQUAL([vrf-$table_id], [dnl
+20.0.0.0/24 dev lo-test proto kernel scope link src 20.0.0.10
+192.168.100.0/24 via inet6 fd20::1 dev lo-test proto ovn])
+
+OVN_ROUTE_V6_EQUAL([vrf-$table_id], [dnl
+fd20::/64 dev lo-test proto kernel metric 256 pref medium
+fd20:100::/64 via fd20::1 dev lo-test proto ovn metric 1024 pref medium
+fe80::/64 dev lo-test proto kernel metric 256 pref medium])
+
+AS_BOX([Replace both with blackhole])
+check ovstest test-ovn-netlink route-sync $table_id \
+    192.168.100.0/24 \
+    fd20:100::/64
+
+OVN_ROUTE_EQUAL([vrf-$table_id], [dnl
+20.0.0.0/24 dev lo-test proto kernel scope link src 20.0.0.10
+blackhole 192.168.100.0/24 proto ovn])
+
+OVN_ROUTE_V6_EQUAL([vrf-$table_id], [dnl
+fd20::/64 dev lo-test proto kernel metric 256 pref medium
+blackhole fd20:100::/64 dev lo proto ovn metric 1024 pref medium
+fe80::/64 dev lo-test proto kernel metric 256 pref medium])
+
+AT_CLEANUP
+
+AT_SETUP([sync netlink routes - learn routes via nexthop id])
+AT_KEYWORDS([netlink-routes])
+CHECK_VRF()
+
+dnl Skip if the running kernel or iproute2 has no nexthop object support.
+AT_SKIP_IF([! ip nexthop show >/dev/null 2>&1])
+
+dnl Make the kernel describe these routes through the nexthop id alone.  In
+dnl compatibility mode, which is the default, it reports the resolved next
+dnl hop inline as well and OVN would not have to resolve anything.
+compat_mode=$(sysctl -n net.ipv4.nexthop_compat_mode)
+on_exit "sysctl -wq net.ipv4.nexthop_compat_mode=$compat_mode"
+check sysctl -wq net.ipv4.nexthop_compat_mode=0
+
+table_id=100
+
+check ip link add vrf-$table_id type vrf table $table_id
+on_exit 'ip link del vrf-$table_id'
+dnl Routes can outlive the VRF they were added to, so make sure the ones this
+dnl test adds do not leak into the following tests.
+on_exit 'ip -6 route flush vrf vrf-$table_id'
+on_exit 'ip route flush vrf vrf-$table_id'
+check ip link set dev vrf-$table_id up
+
+check ip link add lo-test type dummy
+on_exit 'ip link del lo-test'
+check ip link set lo-test master vrf-$table_id
+check ip link set lo-test address 00:00:00:00:00:10
+check ip addr add 20.0.0.10/24 dev lo-test
+check ip addr add fd20::10/64 dev lo-test
+check ip link set up lo-test
+
+dnl Drop the routes a previous test may have left behind in this table.
+check ovstest test-ovn-netlink route-sync $table_id
+
+dnl Create standalone nexthop objects and a nexthop group referencing them.
+dnl These are the "nhid" next hops that OVN has to resolve against the kernel
+dnl nexthop table.
+nh_v4=$(nexthop_alloc)
+check ip nexthop add id $nh_v4 via 20.0.0.1 dev lo-test
+on_exit "ip nexthop del id $nh_v4"
+nh_v4_b=$(nexthop_alloc)
+check ip nexthop add id $nh_v4_b via 20.0.0.2 dev lo-test
+on_exit "ip nexthop del id $nh_v4_b"
+nh_v6=$(nexthop_alloc)
+check ip nexthop add id $nh_v6 via fd20::1 dev lo-test
+on_exit "ip nexthop del id $nh_v6"
+nh_grp=$(nexthop_alloc)
+check ip nexthop add id $nh_grp group $nh_v4/$nh_v4_b
+on_exit "ip nexthop del id $nh_grp"
+
+dnl Add routes that reference their next hop(s) indirectly through a nexthop
+dnl id instead of carrying the next hop inline.  Use a dynamic routing
+dnl protocol so that OVN actually learns them.
+check ip route add 10.10.10.0/24 nhid $nh_v4 vrf vrf-$table_id proto bgp
+check ip route add 10.10.30.0/24 nhid $nh_grp vrf vrf-$table_id proto bgp
+check ip -6 route add fd20:100::/64 nhid $nh_v6 vrf vrf-$table_id proto bgp
+
+dnl OVN should learn all of them, expanding the nexthop group into one
+dnl learned route per member.
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink route-sync \
+    $table_id | sort], [0], [dnl
+Route table_id=$table_id dst=10.10.10.0 plen=24 nexthop=20.0.0.1
+Route table_id=$table_id dst=10.10.30.0 plen=24 nexthop=20.0.0.1
+Route table_id=$table_id dst=10.10.30.0 plen=24 nexthop=20.0.0.2
+Route table_id=$table_id dst=fd20:100:: plen=64 nexthop=fd20::1
+])
+
+dnl The learned routes depend on the nexthop objects they name and, for a
+dnl group, on its members as well: replacing a member moves the routes without
+dnl the group itself being reported as changed.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink route-sync-nhids $table_id | sort],
+    [0], [$(printf 'Referenced nexthop id=%s\n' \
+            $nh_v4 $nh_v4_b $nh_v6 $nh_grp | sort)
+])
+
+dnl Replacing a nexthop object changes where the routes referencing it point,
+dnl without the kernel touching the routes themselves.
+check ip nexthop replace id $nh_v4 via 20.0.0.9 dev lo-test
+
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink route-sync \
+    $table_id | sort], [0], [dnl
+Route table_id=$table_id dst=10.10.10.0 plen=24 nexthop=20.0.0.9
+Route table_id=$table_id dst=10.10.30.0 plen=24 nexthop=20.0.0.2
+Route table_id=$table_id dst=10.10.30.0 plen=24 nexthop=20.0.0.9
+Route table_id=$table_id dst=fd20:100:: plen=64 nexthop=fd20::1
+])
+
+dnl A blackhole nexthop has no usable next hop, so nothing is learned for the
+dnl routes pointing at it.
+check ip -6 nexthop replace id $nh_v6 blackhole
+
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink route-sync \
+    $table_id | sort], [0], [dnl
+Route table_id=$table_id dst=10.10.10.0 plen=24 nexthop=20.0.0.9
+Route table_id=$table_id dst=10.10.30.0 plen=24 nexthop=20.0.0.2
+Route table_id=$table_id dst=10.10.30.0 plen=24 nexthop=20.0.0.9
+])
+
+dnl Leaving the kernel in its default compatibility mode, where the resolved
+dnl next hop is reported inline as well, must not change what is learned.
+check sysctl -wq net.ipv4.nexthop_compat_mode=1
+
+OVS_WAIT_FOR_OUTPUT_UNQUOTED([ovstest test-ovn-netlink route-sync \
+    $table_id | sort], [0], [dnl
+Route table_id=$table_id dst=10.10.10.0 plen=24 nexthop=20.0.0.9
+Route table_id=$table_id dst=10.10.30.0 plen=24 nexthop=20.0.0.2
+Route table_id=$table_id dst=10.10.30.0 plen=24 nexthop=20.0.0.9
+])
+
+AT_CLEANUP
+
+AT_SETUP([sync netlink routes - table notify])
+AT_KEYWORDS([netlink-routes])
+CHECK_VRF()
+
+table_id=100
+
+check ip link add vrf-$table_id type vrf table $table_id
+on_exit 'ip link del vrf-$table_id'
+check ip link set dev vrf-$table_id up
+
+check ip link add lo-test type dummy
+on_exit 'ip link del lo-test'
+check ip link set lo-test master vrf-$table_id
+check ip link set lo-test address 00:00:00:00:00:10
+check ip addr add 20.0.0.10/24 dev lo-test
+check ip addr add fd20::10/64 dev lo-test
+check ip link set up lo-test
+
+dnl Should notify if an IPv4 route is added to a table monitored by OVN.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink route-table-notify \
+    "ip route add 10.10.10.0/24 via 20.0.0.1 vrf vrf-$table_id"], [0], [dnl
+Notification v4 add route table_id=$table_id dst=10.10.10.0 plen=24 proto=3 priority=0 nexthop=20.0.0.1,dev=lo-test
+])
+
+dnl Should notify if an IPv6 route is added to a table monitored by OVN.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink route-table-notify \
+    "ip -6 route add fd10::/64 via fd20::1 vrf vrf-$table_id"], [0], [dnl
+Notification v6 add route table_id=$table_id dst=fd10:: plen=64 proto=3 priority=1024 nexthop=fd20::1,dev=lo-test
+])
+
+dnl Should report which route was removed, not just that something changed.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink route-table-notify \
+    "ip route del 10.10.10.0/24 via 20.0.0.1 vrf vrf-$table_id"], [0], [dnl
+Notification v4 delete route table_id=$table_id dst=10.10.10.0 plen=24 proto=3 priority=0 nexthop=20.0.0.1,dev=lo-test
+])
+
+dnl Should NOT notify if a route with proto ovn is added.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink route-table-notify \
+    "ip route add 10.10.20.0/24 via 20.0.0.1 vrf vrf-$table_id proto RTPROT_OVN"], [0], [dnl
+])
+
+dnl Should NOT notify if an IPv6 route with proto ovn is added.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink route-table-notify \
+    "ip -6 route add fd20:200::/64 via fd20::1 vrf vrf-$table_id proto RTPROT_OVN"], [0], [dnl
+])
+
+AT_CLEANUP
+
+AT_SETUP([sync netlink routes - table update])
+AT_KEYWORDS([netlink-routes])
+CHECK_VRF()
+
+table_id=100
+
+check ip link add vrf-$table_id type vrf table $table_id
+on_exit 'ip link del vrf-$table_id'
+check ip link set dev vrf-$table_id up
+
+check ip link add lo-test type dummy
+on_exit 'ip link del lo-test'
+check ip link set lo-test master vrf-$table_id
+check ip addr add 20.0.0.10/24 dev lo-test
+check ip link set up lo-test
+
+dnl A route installed by a dynamic routing protocol is there from the start.
+check ip route add 10.10.10.0/24 via 20.0.0.1 vrf vrf-$table_id proto zebra
+
+dnl A route added to the table joins the ones we know of.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink route-table-update $table_id \
+    "ip route add 10.10.11.0/24 via 20.0.0.2 vrf vrf-$table_id proto zebra" \
+    | sort], [0], [dnl
+Applied route add
+Route table_id=$table_id dst=10.10.10.0 plen=24 proto=11 priority=0 nexthop=20.0.0.1,dev=lo-test
+Route table_id=$table_id dst=10.10.11.0 plen=24 proto=11 priority=0 nexthop=20.0.0.2,dev=lo-test
+])
+
+dnl A route removed from the table leaves them.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink route-table-update $table_id \
+    "ip route del 10.10.11.0/24 vrf vrf-$table_id" | sort], [0], [dnl
+Applied route delete
+Route table_id=$table_id dst=10.10.10.0 plen=24 proto=11 priority=0 nexthop=20.0.0.1,dev=lo-test
+])
+
+dnl Sending a route somewhere else replaces the one we know of.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink route-table-update $table_id \
+    "ip route replace 10.10.10.0/24 via 20.0.0.3 vrf vrf-$table_id proto zebra" \
+    | sort], [0], [dnl
+Applied route add
+Route table_id=$table_id dst=10.10.10.0 plen=24 proto=11 priority=0 nexthop=20.0.0.3,dev=lo-test
+])
+
+dnl A route OVN does not learn, here one configured by a user, is left out.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink route-table-update $table_id \
+    "ip route add 10.10.12.0/24 via 20.0.0.4 vrf vrf-$table_id proto static" \
+    | sort], [0], [dnl
+Ignored route add
+Route table_id=$table_id dst=10.10.10.0 plen=24 proto=11 priority=0 nexthop=20.0.0.3,dev=lo-test
+])
+
+dnl The kernel keeps several routes to one prefix that differ only by their
+dnl metric, so the metric is part of what tells them apart.
+check ip route add 10.10.13.0/24 via 20.0.0.5 metric 100 vrf vrf-$table_id \
+    proto zebra
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink route-table-update $table_id \
+    "ip route add 10.10.13.0/24 via 20.0.0.6 metric 200 vrf vrf-$table_id proto zebra" \
+    | sort], [0], [dnl
+Applied route add
+Route table_id=$table_id dst=10.10.10.0 plen=24 proto=11 priority=0 nexthop=20.0.0.3,dev=lo-test
+Route table_id=$table_id dst=10.10.13.0 plen=24 proto=11 priority=100 nexthop=20.0.0.5,dev=lo-test
+Route table_id=$table_id dst=10.10.13.0 plen=24 proto=11 priority=200 nexthop=20.0.0.6,dev=lo-test
+])
+
+dnl Removing one of them keeps the other.
+AT_CHECK_UNQUOTED([ovstest test-ovn-netlink route-table-update $table_id \
+    "ip route del 10.10.13.0/24 metric 100 vrf vrf-$table_id" | sort], [0], [dnl
+Applied route delete
+Route table_id=$table_id dst=10.10.10.0 plen=24 proto=11 priority=0 nexthop=20.0.0.3,dev=lo-test
+Route table_id=$table_id dst=10.10.13.0 plen=24 proto=11 priority=200 nexthop=20.0.0.6,dev=lo-test
+])
+
+AT_CLEANUP
+
+AT_SETUP([sync netlink nexthops - learn nexthops])
+AT_KEYWORDS([netlink-nexthops])
+
+ADD_NAMESPACES(nh)
+NS_EXEC([nh], [ip link set up lo])
+
+NS_CHECK_EXEC([nh], [ip nexthop add id 1 via 192.168.1.1 fdb], [0])
+NS_CHECK_EXEC([nh], [ip nexthop add id 2 via 192.168.1.2 fdb], [0])
+NS_CHECK_EXEC([nh], [ip nexthop add id 5 via 192.168.1.5 fdb], [0])
+NS_CHECK_EXEC([nh], [ip nexthop add id 10 group 1/2 fdb], [0])
+NS_CHECK_EXEC([nh], [ip nexthop add id 3 group 5 fdb], [0])
+NS_CHECK_EXEC([nh], [ip nexthop add id 11 group 1 fdb], [0])
+NS_CHECK_EXEC([nh], [ip nexthop add id 12 group 1,100/2,200 fdb], [0])
+
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-sync | sort], [0], [dnl
+Nexthop id=1, address=192.168.1.1
+Nexthop id=10, group=[[1;192.168.1.1;1, 2;192.168.1.2;1]]
+Nexthop id=11, group=[[1;192.168.1.1;1]]
+Nexthop id=12, group=[[1;192.168.1.1;100, 2;192.168.1.2;200]]
+Nexthop id=2, address=192.168.1.2
+Nexthop id=3, group=[[5;192.168.1.5;1]]
+Nexthop id=5, address=192.168.1.5
+])
+
+AT_CLEANUP
+
+AT_SETUP([sync netlink nexthops - table notify])
+AT_KEYWORDS([netlink-nexthops])
+
+ADD_NAMESPACES(nh)
+NS_EXEC([nh], [ip link set up lo])
+
+dnl Should notify if an IPv4 nexthop is added.
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-table-notify \
+    "ip nexthop add id 1 via 10.0.0.1 fdb"], [0], [dnl
+Add nexthop id=1, address=10.0.0.1
+])
+
+dnl Should notify if an IPv6 nexthop is added.
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-table-notify \
+    "ip nexthop add id 2 via fd20::2 fdb"], [0], [dnl
+Add nexthop id=2, address=fd20::2
+])
+
+dnl Should notify if IPv4 nexthop group is added.
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-table-notify \
+    "ip nexthop add id 10 group 1 fdb"], [0], [dnl
+Add nexthop id=10, group=[[1;1]]
+])
+
+dnl Should notify if IPv6 nexthop group is added.
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-table-notify \
+    "ip nexthop add id 11 group 2 fdb"], [0], [dnl
+Add nexthop id=11, group=[[2;1]]
+])
+
+dnl Should notify if IPv4 nexthop group is removed.
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-table-notify \
+    "ip nexthop del id 10"], [0], [dnl
+Delete nexthop id=10, group=[[1;1]]
+])
+
+dnl Should notify if IPv6 nexthop group is removed.
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-table-notify \
+    "ip nexthop del id 11"], [0], [dnl
+Delete nexthop id=11, group=[[2;1]]
+])
+
+NS_EXEC([nh], [ip nexthop add id 3 via 10.0.0.3 fdb])
+NS_EXEC([nh], [ip nexthop add id 10 group 1/3 fdb])
+NS_EXEC([nh], [ip nexthop add id 4 via fd20::4 fdb])
+NS_EXEC([nh], [ip nexthop add id 11 group 2/4 fdb])
+
+dnl Should notify if an IPv4 nexthop group is removed and group modified.
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-table-notify \
+    "ip nexthop del id 3" | sort], [0], [dnl
+Add nexthop id=10, group=[[1;1]]
+Delete nexthop id=3, address=10.0.0.3
+])
+
+dnl Should notify if an IPv6 nexthop group is removed and group modified.
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-table-notify \
+    "ip nexthop del id 4" | sort], [0], [dnl
+Add nexthop id=11, group=[[2;1]]
+Delete nexthop id=4, address=fd20::4
+])
+
+dnl Should notify if an IPv4 nexthop group is removed and group modified.
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-table-notify \
+    "ip nexthop del id 1" | sort], [0], [dnl
+Delete nexthop id=1, address=10.0.0.1
+Delete nexthop id=10, group=[[1;1]]
+])
+
+dnl Should notify if an IPv6 nexthop group is removed and group modified.
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-table-notify \
+    "ip nexthop del id 2" | sort], [0], [dnl
+Delete nexthop id=11, group=[[2;1]]
+Delete nexthop id=2, address=fd20::2
+])
+
+dnl Routes reference nexthop objects that are not FDB ones, so those have to
+dnl be reported as well.
+dnl Should notify if a blackhole nexthop is added.
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-table-notify \
+    "ip nexthop add id 1 blackhole"], [0], [dnl
+Add nexthop id=1, blackhole
+])
+
+dnl Should notify if non-FDB nexthop is added.
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-table-notify \
+    "ip nexthop add id 2 via 127.0.0.2 dev lo"], [0], [dnl
+Add nexthop id=2, address=127.0.0.2, dev=lo
+])
+
+AT_CLEANUP
+
+AT_SETUP([sync netlink nexthops - group member update])
+AT_KEYWORDS([netlink-nexthops])
+
+ADD_NAMESPACES(nh)
+NS_EXEC([nh], [ip link set up lo])
+
+NS_CHECK_EXEC([nh], [ip nexthop add id 1 via 192.168.1.1 fdb], [0])
+NS_CHECK_EXEC([nh], [ip nexthop add id 2 via 192.168.1.2 fdb], [0])
+NS_CHECK_EXEC([nh], [ip nexthop add id 10 group 1/2 fdb], [0])
+
+dnl Replacing a member leaves the membership of the group untouched, so the
+dnl kernel reports the member alone.  The group must still end up pointing at
+dnl the new address of that member.
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-table-update \
+    "ip nexthop replace id 1 via 192.168.1.9 fdb" | sort], [0], [dnl
+Nexthop id=1, address=192.168.1.9
+Nexthop id=10, group=[[1;192.168.1.9;1, 2;192.168.1.2;1]]
+Nexthop id=2, address=192.168.1.2
+])
+
+dnl Deleting a member does change the membership, so here the kernel reports
+dnl the group as well.
+NS_CHECK_EXEC([nh], [ovstest test-ovn-netlink nexthop-table-update \
+    "ip nexthop del id 2" | sort], [0], [dnl
+Nexthop id=1, address=192.168.1.9
+Nexthop id=10, group=[[1;192.168.1.9;1]]
+])
+
+AT_CLEANUP

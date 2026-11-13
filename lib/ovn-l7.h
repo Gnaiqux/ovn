@@ -52,6 +52,7 @@ BUILD_ASSERT_DECL(BFD_PACKET_LEN == sizeof(struct bfd_msg));
 
 #define DNS_CLASS_IN            0x01
 #define DNS_DEFAULT_RR_TTL      3600
+#define DNS_MAX_RR_TTL          2147483647U /* 2^31-1, per RFC 2181. */
 
 /* Generic options map which is used to store dhcpv4 opts and dhcpv6 opts. */
 struct gen_opts_map {
@@ -312,6 +313,16 @@ extern const struct in6_addr in6addr_all_dhcp_agents;
                                            0x00,0x00,0x00,0x00,0x00,0x00,     \
                                            0x00,0x01,0x00,0x02 } } }
 
+#define DHCPV6_HEADER_LEN 4
+OVS_PACKED(
+struct dhcpv6_header {
+    uint8_t msg_type;
+    uint8_t transaction_id[3];
+});
+BUILD_ASSERT_DECL(DHCPV6_HEADER_LEN == sizeof(struct dhcpv6_header));
+
+#define DHCPV6_PAYLOAD(hdr) \
+    (const void *)((uint8_t *) (hdr) + sizeof(struct dhcpv6_header))
 
 #define DHCP6_OPT_HEADER_LEN 4
 OVS_PACKED(

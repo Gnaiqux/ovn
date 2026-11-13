@@ -42,8 +42,8 @@ Generating Certificates and Keys
 
 OVN chassis uses CA-signed certificate to authenticate peer chassis for
 building IPsec tunnel. If you have enabled Role-Based Access Control (RBAC) in
-OVN, you can use the RBAC SSL certificates and keys to set up OVN IPsec. Or you
-can generate separate certificates and keys with ``ovs-pki`` (refer to
+OVN, you can use the RBAC SSL/TLS certificates and keys to set up OVN IPsec. Or
+you can generate separate certificates and keys with ``ovs-pki`` (refer to
 :ref:`gen-certs-keys`).
 
 .. note::
@@ -113,7 +113,7 @@ For strongswan backends::
 
 .. note::
 
-   Support for this feature is only availably when OVN is used together with
+   Support for this feature is only available when OVN is used together with
    OVS releases that accept IPsec custom tunnel options.
 
 Troubleshooting
@@ -165,6 +165,13 @@ refresh the ``ovs-monitor-ipsec`` daemon::
 You can also check the logs of the ``ovs-monitor-ipsec`` daemon and the IKE
 daemon to locate issues.  ``ovs-monitor-ipsec`` outputs log messages to
 ``/var/log/openvswitch/ovs-monitor-ipsec.log``.
+
+The ipsec_encapsulation and ipsec_forceencaps options are boolean
+and only accept true or yes. Additional "ipsec_*" options such as
+the one below can be set to pass configuration directly to the underlying
+IPsec backend.
+
+    $ ovn-nbctl set nb_global . options:ipsec_replay-window=128
 
 Bug Reporting
 -------------

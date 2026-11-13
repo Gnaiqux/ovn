@@ -61,6 +61,7 @@
 #include "unixctl.h"
 #include "util.h"
 #include "svec.h"
+#include "vec.h"
 
 VLOG_DEFINE_THIS_MODULE(sbctl);
 
@@ -97,8 +98,8 @@ Chassis commands:\n\
   chassis-add CHASSIS ENCAP-TYPE ENCAP-IP  create a new chassis named\n\
                                            CHASSIS with ENCAP-TYPE tunnels\n\
                                            and ENCAP-IP\n\
-  chassis-del CHASSIS         delete CHASSIS and all of its encaps\n\
-                              and gateway_ports\n\
+  chassis-del CHASSIS         delete CHASSIS, its encaps, and the associated\n\
+                              Chassis_Private record.\n\
 \n\
 Port binding commands:\n\
   lsp-bind PORT CHASSIS       bind logical port PORT to CHASSIS\n\
@@ -109,17 +110,22 @@ Logical flow commands:\n\
   dump-flows  [DATAPATH] [LFLOW...] alias for lflow-list\n\
   count-flows [DATAPATH]            count logical flows for DATAPATH\n\
 \n\
+IP multicast commands:\n\
+  ip-multicast-flush [SWITCH]     flush learned multicast groups\n\
+\n\
 Connection commands:\n\
   get-connection             print the connections\n\
   del-connection             delete the connections\n\
   [--inactivity-probe=MSECS]\n\
   set-connection TARGET...   set the list of connections to TARGET...\n\
+                               (TARGET may be preceded by read-only,\n\
+                               read-write, or role=NAME)\n\
 \n\
-SSL commands:\n\
-  get-ssl                     print the SSL configuration\n\
-  del-ssl                     delete the SSL configuration\n\
-  set-ssl PRIV-KEY CERT CA-CERT [SSL-PROTOS [SSL-CIPHERS]] \
-set the SSL configuration\n\
+SSL/TLS commands:\n\
+  get-ssl                     print the SSL/TLS configuration\n\
+  del-ssl                     delete the SSL/TLS configuration\n\
+  set-ssl PRIV-KEY CERT CA-CERT [SSL-PROTOS [SSL-CIPHERS [SSL-CIPHERSUITES]]] \
+set the SSL/TLS configuration\n\
 \n\
 %s\
 %s\
@@ -381,6 +387,7 @@ pre_get_info(struct ctl_context *ctx)
     ovsdb_idl_add_column(ctx->idl, &sbrec_logical_dp_group_col_datapaths);
 
     ovsdb_idl_add_column(ctx->idl, &sbrec_datapath_binding_col_external_ids);
+    ovsdb_idl_add_column(ctx->idl, &sbrec_datapath_binding_col_nb_uuid);
 
     ovsdb_idl_add_column(ctx->idl, &sbrec_ip_multicast_col_datapath);
     ovsdb_idl_add_column(ctx->idl, &sbrec_ip_multicast_col_seq_no);
@@ -623,12 +630,6 @@ sbctl_lflow_cmp(const void *a_, const void *b_)
 }
 
 static bool
-is_uuid_with_prefix(const char *uuid)
-{
-     return uuid[0] == '0' && (uuid[1] == 'x' || uuid[1] == 'X');
-}
-
-static bool
 parse_partial_uuid(char *s)
 {
     /* Accept a full or partial UUID. */
@@ -644,30 +645,6 @@ parse_partial_uuid(char *s)
 
     /* Not a (partial) UUID. */
     return false;
-}
-
-static const char *
-strip_leading_zero(const char *s)
-{
-    return s + strspn(s, "0");
-}
-
-static bool
-is_partial_uuid_match(const struct uuid *uuid, const char *match)
-{
-    char uuid_s[UUID_LEN + 1];
-    snprintf(uuid_s, sizeof uuid_s, UUID_FMT, UUID_ARGS(uuid));
-
-    /* We strip leading zeros because we want to accept cookie values derived
-     * from UUIDs, and cookie values are printed without leading zeros because
-     * they're just numbers. */
-    const char *s1 = strip_leading_zero(uuid_s);
-    const char *s2 = match;
-    if (is_uuid_with_prefix(s2)) {
-        s2 = s2 + 2;
-    }
-    s2 = strip_leading_zero(s2);
-    return !strncmp(s1, s2, strlen(s2));
 }
 
 static char *
@@ -991,17 +968,15 @@ cmd_lflow_list_load_balancers(struct ctl_context *ctx, struct vconn *vconn,
 }
 
 static void
-sbctl_lflow_add(struct sbctl_lflow **lflows,
-                size_t *n_flows, size_t *n_capacity,
+sbctl_lflow_add(struct vector *lflows,
                 const struct sbrec_logical_flow *lflow,
                 const struct sbrec_datapath_binding *dp)
 {
-    if (*n_flows == *n_capacity) {
-        *lflows = x2nrealloc(*lflows, n_capacity, sizeof **lflows);
-    }
-    (*lflows)[*n_flows].lflow = lflow;
-    (*lflows)[*n_flows].dp = dp;
-    (*n_flows)++;
+    struct sbctl_lflow sbctl_lflow = (struct sbctl_lflow) {
+        .lflow = lflow,
+        .dp = dp,
+    };
+    vector_push(lflows, &sbctl_lflow);
 }
 
 static void
@@ -1032,14 +1007,13 @@ print_lflows_count(int64_t table_id, const char *name,
 }
 
 static void
-print_lflow_counters(size_t n_flows, struct sbctl_lflow *lflows, struct ds *s)
+print_lflow_counters(struct vector *lflows, struct ds *s)
 {
     const struct sbctl_lflow *curr, *prev = NULL;
     long table_lflows = 0;
     long dp_lflows = 0;
-    for (size_t i = 0; i < n_flows; i++) {
+    VECTOR_FOR_EACH_PTR (lflows, curr) {
        bool new_datapath = false;
-       curr = &lflows[i];
        if (!prev
             || prev->dp != curr->dp
             || strcmp(prev->lflow->pipeline, curr->lflow->pipeline)) {
@@ -1070,7 +1044,7 @@ print_lflow_counters(size_t n_flows, struct sbctl_lflow *lflows, struct ds *s)
         }
         prev = curr;
     }
-    if (n_flows > 0) {
+    if (!vector_is_empty(lflows)) {
         print_lflows_count(prev->lflow->table_id,
                            smap_get_def(&prev->lflow->external_ids,
                                         "stage-name", ""),
@@ -1079,7 +1053,8 @@ print_lflow_counters(size_t n_flows, struct sbctl_lflow *lflows, struct ds *s)
                            prev->lflow->pipeline, dp_lflows, s);
 
     }
-    ds_put_format(s, "Total number of logical flows = %"PRIuSIZE"\n", n_flows);
+    ds_put_format(s, "Total number of logical flows = %"PRIuSIZE"\n",
+                  vector_len(lflows));
 }
 
 static void
@@ -1087,6 +1062,8 @@ cmd_lflow_list(struct ctl_context *ctx)
 {
     const char *cmd = ctx->argv[0];
     const struct sbrec_datapath_binding *datapath = NULL;
+    struct vector lflows = VECTOR_EMPTY_INITIALIZER(struct sbctl_lflow);
+
     if (ctx->argc > 1) {
         const struct ovsdb_idl_row *row;
         char *error = ctl_get_row(ctx, &sbrec_table_datapath_binding,
@@ -1097,13 +1074,13 @@ cmd_lflow_list(struct ctl_context *ctx)
             return;
         }
 
-        datapath = (const struct sbrec_datapath_binding *)row;
+        datapath = (const struct sbrec_datapath_binding *) row;
         if (datapath) {
             ctx->argc--;
             ctx->argv++;
         } else if (!strcmp(cmd, "count-flows")) {
             /* datapath is defined, but isn't found */
-            print_lflow_counters(0, NULL, &ctx->output);
+            print_lflow_counters(&lflows, &ctx->output);
             return;
        }
 
@@ -1120,9 +1097,6 @@ cmd_lflow_list(struct ctl_context *ctx)
     struct vconn *vconn = sbctl_open_vconn(&ctx->options);
     bool stats = shash_find(&ctx->options, "--stats") != NULL;
 
-    struct sbctl_lflow *lflows = NULL;
-    size_t n_flows = 0;
-    size_t n_capacity = 0;
     const struct sbrec_logical_flow *lflow;
     const struct sbrec_logical_dp_group *dp_group;
     SBREC_LOGICAL_FLOW_FOR_EACH (lflow, ctx->idl) {
@@ -1133,35 +1107,29 @@ cmd_lflow_list(struct ctl_context *ctx)
             continue;
         }
         if (datapath) {
-            sbctl_lflow_add(&lflows, &n_flows, &n_capacity, lflow, datapath);
+            sbctl_lflow_add(&lflows, lflow, datapath);
             continue;
         }
         if (lflow->logical_datapath) {
-            sbctl_lflow_add(&lflows, &n_flows, &n_capacity,
-                            lflow, lflow->logical_datapath);
+            sbctl_lflow_add(&lflows, lflow, lflow->logical_datapath);
         }
         dp_group = lflow->logical_dp_group;
         for (size_t i = 0; dp_group && i < dp_group->n_datapaths; i++) {
-            sbctl_lflow_add(&lflows, &n_flows, &n_capacity,
-                            lflow, dp_group->datapaths[i]);
+            sbctl_lflow_add(&lflows, lflow, dp_group->datapaths[i]);
         }
     }
 
-    if (n_flows) {
-        qsort(lflows, n_flows, sizeof *lflows, sbctl_lflow_cmp);
-    }
+    vector_qsort(&lflows, sbctl_lflow_cmp);
 
     if (!strcmp(cmd, "count-flows")) {
-        print_lflow_counters(n_flows, lflows, &ctx->output);
+        print_lflow_counters(&lflows, &ctx->output);
         goto cleanup;
     }
 
     bool print_uuid = shash_find(&ctx->options, "--uuid") != NULL;
 
     const struct sbctl_lflow *curr, *prev = NULL;
-    for (size_t i = 0; i < n_flows; i++) {
-        curr = &lflows[i];
-
+    VECTOR_FOR_EACH_PTR (&lflows, curr) {
         /* Figure out whether to print this particular flow.  By default, we
          * print all flows, but if any UUIDs were listed on the command line
          * then we only print the matching ones. */
@@ -1220,7 +1188,7 @@ cmd_lflow_list(struct ctl_context *ctx)
 
 cleanup:
     vconn_close(vconn);
-    free(lflows);
+    vector_destroy(&lflows);
 }
 
 static void
@@ -1478,11 +1446,14 @@ cmd_set_ssl(struct ctl_context *ctx)
 
     sbrec_ssl_set_bootstrap_ca_cert(ssl, bootstrap);
 
-    if (ctx->argc == 5) {
+    if (ctx->argc >= 5) {
         sbrec_ssl_set_ssl_protocols(ssl, ctx->argv[4]);
-    } else if (ctx->argc == 6) {
-        sbrec_ssl_set_ssl_protocols(ssl, ctx->argv[4]);
-        sbrec_ssl_set_ssl_ciphers(ssl, ctx->argv[5]);
+        if (ctx->argc >= 6) {
+            sbrec_ssl_set_ssl_ciphers(ssl, ctx->argv[5]);
+            if (ctx->argc == 7) {
+                sbrec_ssl_set_ssl_ciphersuites(ssl, ctx->argv[6]);
+            }
+        }
     }
 
     sbrec_sb_global_set_ssl(sb_global, ssl);
@@ -1498,8 +1469,8 @@ static const struct ctl_table_class tables[SBREC_N_TABLES] = {
     [SBREC_TABLE_DATAPATH_BINDING].row_ids
      = {{&sbrec_datapath_binding_col_external_ids, "name", NULL},
         {&sbrec_datapath_binding_col_external_ids, "name2", NULL},
-        {&sbrec_datapath_binding_col_external_ids, "logical-switch", NULL},
-        {&sbrec_datapath_binding_col_external_ids, "logical-router", NULL}},
+        {&sbrec_datapath_binding_col_nb_uuid, NULL, NULL}},
+
 
     [SBREC_TABLE_PORT_BINDING].row_ids
      = {{&sbrec_port_binding_col_logical_port, NULL, NULL},
@@ -1587,11 +1558,12 @@ static const struct ctl_command_syntax sbctl_commands[] = {
     {"set-connection", 1, INT_MAX, "TARGET...", pre_connection, cmd_set_connection,
      NULL, "--inactivity-probe=", RW},
 
-    /* SSL commands. */
+    /* SSL/TLS commands. */
     {"get-ssl", 0, 0, "", pre_cmd_get_ssl, cmd_get_ssl, NULL, "", RO},
     {"del-ssl", 0, 0, "", pre_cmd_del_ssl, cmd_del_ssl, NULL, "", RW},
-    {"set-ssl", 3, 5,
-        "PRIVATE-KEY CERTIFICATE CA-CERT [SSL-PROTOS [SSL-CIPHERS]]",
+    {"set-ssl", 3, 6,
+        "PRIVATE-KEY CERTIFICATE CA-CERT"
+        " [SSL-PROTOS [SSL-CIPHERS [SSL-CIPHERSUITES]]]",
         pre_cmd_set_ssl, cmd_set_ssl, NULL, "--bootstrap", RW},
 
     {NULL, 0, 0, NULL, NULL, NULL, NULL, NULL, RO},

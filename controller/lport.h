@@ -34,10 +34,6 @@ struct sset;
  * instead we define our own indexes.
  */
 
-const struct sbrec_port_binding *lport_lookup_by_name(
-    struct ovsdb_idl_index *sbrec_port_binding_by_name,
-    const char *name);
-
 const struct sbrec_port_binding *lport_lookup_by_key(
     struct ovsdb_idl_index *sbrec_datapath_binding_by_key,
     struct ovsdb_idl_index *sbrec_port_binding_by_key,
@@ -66,14 +62,28 @@ const struct sbrec_multicast_group *mcgroup_lookup_by_dp_name(
 bool
 lport_is_chassis_resident(struct ovsdb_idl_index *sbrec_port_binding_by_name,
                           const struct sbrec_chassis *chassis,
-                          const struct sset *active_tunnels,
                           const char *port_name);
+bool lport_pb_is_chassis_resident(const struct sbrec_chassis *chassis,
+                                  const struct sbrec_port_binding *pb);
+
+bool lport_is_local(struct ovsdb_idl_index *sbrec_port_binding_by_name,
+                    const struct sbrec_chassis *chassis,
+                    const char *port_name);
+bool lport_pb_is_local(struct ovsdb_idl_index *sbrec_port_binding_by_name,
+                       const struct sbrec_chassis *chassis,
+                       const struct sbrec_port_binding *pb);
 const struct sbrec_port_binding *lport_get_peer(
+    const struct sbrec_port_binding *,
+    struct ovsdb_idl_index *sbrec_port_binding_by_name);
+const struct sbrec_port_binding *lport_get_patch_peer(
     const struct sbrec_port_binding *,
     struct ovsdb_idl_index *sbrec_port_binding_by_name);
 const struct sbrec_port_binding *lport_get_l3gw_peer(
     const struct sbrec_port_binding *,
     struct ovsdb_idl_index *sbrec_port_binding_by_name);
+const struct sbrec_port_binding *lport_get_cr_port(
+    struct ovsdb_idl_index *sbrec_port_binding_by_name,
+    const struct sbrec_port_binding *, const char *crp_name);
 bool
 lport_is_activated_by_activation_strategy(const struct sbrec_port_binding *pb,
                                           const struct sbrec_chassis *chassis);

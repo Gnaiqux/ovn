@@ -48,7 +48,7 @@ static bool oneline;
 /* --dry-run: Do not commit any changes. */
 static bool dry_run;
 
-/* SSL options */
+/* SSL/TLS options. */
 static const char *ssl_private_key_file;
 static const char *ssl_certificate_file;
 static const char *ssl_ca_cert_file;
@@ -106,7 +106,7 @@ static char * OVS_WARN_UNUSED_RESULT main_loop(
     struct ctl_command *commands, size_t n_commands,
     struct ovsdb_idl *idl, const struct timer *);
 static void server_loop(const struct ovn_dbctl_options *dbctl_options,
-                        struct ovsdb_idl *idl, int argc, char *argv[]);
+                        struct ovsdb_idl *idl);
 static void ovn_dbctl_exit(int status);
 
 static void
@@ -209,7 +209,7 @@ ovn_dbctl_main(int argc, char *argv[],
     set_idl_probe_interval(idl, db, DEFAULT_UTILS_PROBE_INTERVAL_MSEC);
 
     if (daemon_mode) {
-        server_loop(dbctl_options, idl, argc, argv_);
+        server_loop(dbctl_options, idl);
     } else {
         struct ctl_command *commands;
         size_t n_commands;
@@ -618,6 +618,14 @@ apply_options_direct(const struct ovn_dbctl_options *dbctl_options,
             stream_ssl_set_ciphers(optarg);
             break;
 
+        case OPT_SSL_CIPHERSUITES:
+            stream_ssl_set_ciphersuites(optarg);
+            break;
+
+        case OPT_SSL_SERVER_NAME:
+            stream_ssl_set_server_name(optarg);
+            break;
+
         case OPT_BOOTSTRAP_CA_CERT:
             stream_ssl_set_ca_cert_file(po->arg, true);
             break;
@@ -646,13 +654,19 @@ run_prerequisites(const struct ovn_dbctl_options *dbctl_options,
 {
     dbctl_options->add_base_prerequisites(idl, wait_type);
 
+    /* Make sure all commands are properly initialized before checking
+     * prerequisites. */
+    for (size_t i = 0; i < n_commands; i++) {
+        struct ctl_command *c = &commands[i];
+
+        ds_init(&c->output);
+        c->table = NULL;
+    }
+
     for (size_t i = 0; i < n_commands; i++) {
         struct ctl_command *c = &commands[i];
         if (c->syntax->prerequisites) {
             struct ctl_context ctx;
-
-            ds_init(&c->output);
-            c->table = NULL;
 
             ctl_context_init(&ctx, c, idl, NULL, NULL, NULL);
             (c->syntax->prerequisites)(&ctx);
@@ -727,11 +741,7 @@ do_dbctl(const struct ovn_dbctl_options *dbctl_options,
     dbctl_options->pre_execute(idl, txn, wait_type);
 
     symtab = ovsdb_symbol_table_create();
-    for (size_t i = 0; i < n_commands; i++) {
-        struct ctl_command *c = &commands[i];
-        ds_init(&c->output);
-        c->table = NULL;
-    }
+
     struct ctl_context *ctx = dbctl_options->ctx_create();
     ctl_context_init(ctx, NULL, idl, txn, symtab, NULL);
     for (size_t i = 0; i < n_commands; i++) {
@@ -1114,12 +1124,11 @@ update_inactivity_probe(struct server_cmd_run_ctx *ctx)
 
 static void
 server_loop(const struct ovn_dbctl_options *dbctl_options,
-            struct ovsdb_idl *idl, int argc, char *argv[])
+            struct ovsdb_idl *idl)
 {
     struct unixctl_server *server = NULL;
     bool exiting = false;
 
-    service_start(&argc, &argv);
     daemonize_start(false, false);
 
     char *abs_unixctl_path = get_abs_unix_ctl_path(unixctl_path);
@@ -1181,6 +1190,28 @@ server_loop(const struct ovn_dbctl_options *dbctl_options,
     unixctl_server_destroy(server);
 }
 
+static char *
+reply_to_string(struct json *reply)
+{
+    ovs_assert(reply);
+
+    if (reply->type != JSON_STRING) {
+        ovs_error(0, "Unexpected reply type in JSON rpc reply: %s",
+                  json_type_to_string(reply->type));
+        exit(EXIT_FAILURE);
+    }
+
+    struct ds ds = DS_EMPTY_INITIALIZER;
+
+    ds_put_cstr(&ds, json_string(reply));
+
+    if (ds_last(&ds) != EOF && ds_last(&ds) != '\n') {
+        ds_put_char(&ds, '\n');
+    }
+
+    return ds_steal_cstr(&ds);
+}
+
 static void
 dbctl_client(const struct ovn_dbctl_options *dbctl_options,
              const char *socket_name,
@@ -1264,11 +1295,11 @@ dbctl_client(const struct ovn_dbctl_options *dbctl_options,
 
     ctl_timeout_setup(timeout);
 
-    char *cmd_result = NULL;
-    char *cmd_error = NULL;
+    struct json *cmd_result = NULL;
+    struct json *cmd_error = NULL;
     struct jsonrpc *client;
     int exit_status;
-    char *error_str;
+    char *error_str, *str;
 
     int error = unixctl_client_create(socket_name, &client);
     if (error) {
@@ -1289,12 +1320,16 @@ dbctl_client(const struct ovn_dbctl_options *dbctl_options,
     }
 
     if (cmd_error) {
-        fprintf(stderr, "%s: %s", program_name, cmd_error);
+        str = reply_to_string(cmd_error);
+        fprintf(stderr, "%s: %s", program_name, str);
+        free(str);
         goto error;
     }
 
     exit_status = EXIT_SUCCESS;
-    fputs(cmd_result, stdout);
+    str = reply_to_string(cmd_result);
+    fputs(str, stdout);
+    free(str);
     goto cleanup;
 
 log_error:
@@ -1306,8 +1341,8 @@ error:
     exit_status = EXIT_FAILURE;
 
 cleanup:
-    free(cmd_result);
-    free(cmd_error);
+    json_destroy(cmd_result);
+    json_destroy(cmd_error);
     jsonrpc_close(client);
     svec_destroy(&args);
     destroy_argv(argc, argv);

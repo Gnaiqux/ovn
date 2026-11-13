@@ -21,7 +21,9 @@
 
 #include "daemon.h"
 #include "include/ovn/actions.h"
+#include "lib/random.h"
 #include "openvswitch/ofp-parse.h"
+#include "openvswitch/rconn.h"
 #include "openvswitch/vlog.h"
 #include "lib/vswitch-idl.h"
 #include "ovn-dirs.h"
@@ -32,10 +34,17 @@
 #include "stream.h"
 #include "svec.h"
 #include "unixctl.h"
+#include "dummy.h"
 
 VLOG_DEFINE_THIS_MODULE(ovn_util);
 
 #define DEFAULT_PROBE_INTERVAL_MSEC 5000
+
+bool
+lrouter_is_enabled(const struct nbrec_logical_router *lrouter)
+{
+    return !lrouter->enabled || *lrouter->enabled;
+}
 
 void ovn_conn_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
                    const char *argv[] OVS_UNUSED, void *idl_)
@@ -63,6 +72,39 @@ void set_idl_probe_interval(struct ovsdb_idl *idl, const char *remote,
     }
 
     ovsdb_idl_set_probe_interval(idl, interval);
+}
+
+struct ovsdb_idl_txn *
+run_idl_loop(struct ovsdb_idl_loop *idl_loop, const char *name,
+             uint64_t *idl_duration)
+{
+    unsigned long long duration, start = time_msec();
+    unsigned int seqno = UINT_MAX;
+    struct ovsdb_idl_txn *txn;
+    int n = 0;
+
+    /* Accumulate database changes as long as there are some,
+     * but no longer than "IDL_LOOP_MAX_DURATION_MS". */
+    while (seqno != ovsdb_idl_get_seqno(idl_loop->idl)
+           && time_msec() - start < IDL_LOOP_MAX_DURATION_MS) {
+        seqno = ovsdb_idl_get_seqno(idl_loop->idl);
+        ovsdb_idl_run(idl_loop->idl);
+        n++;
+    }
+
+    txn = ovsdb_idl_loop_run(idl_loop);
+
+    duration = time_msec() - start;
+    *idl_duration = duration;
+    /* ovsdb_idl_run() is called at least 2 times.  Once directly and
+     * once in the ovsdb_idl_loop_run().  n > 2 means that we received
+     * data on at least 2 subsequent calls. */
+    if (n > 2 || duration > 100) {
+        VLOG(duration > IDL_LOOP_MAX_DURATION_MS ? VLL_INFO : VLL_DBG,
+             "%s IDL run: %d iterations in %lld ms", name, n + 1, duration);
+    }
+
+    return txn;
 }
 
 static void
@@ -352,6 +394,26 @@ extract_lrp_networks(const struct nbrec_logical_router_port *lrp,
     return true;
 }
 
+void
+lrp_network_to_string(const struct lport_addresses *addresses, struct ds *s,
+                      bool include_generated_v6)
+{
+    ds_put_cstr(s, addresses->ea_s);
+    for (size_t i = 0; i < addresses->n_ipv4_addrs; i++) {
+        struct ipv4_netaddr *addr = &addresses->ipv4_addrs[i];
+        ds_put_format(s, " %s/%d", addr->addr_s, addr->plen);
+    }
+    for (size_t i = 0; i < addresses->n_ipv6_addrs; i++) {
+        /* The generated v6 address is always at the end
+         * (see extract_lrp_networks). */
+        if (!include_generated_v6 && i == addresses->n_ipv6_addrs -1) {
+            break;
+        }
+        struct ipv6_netaddr *addr = &addresses->ipv6_addrs[i];
+        ds_put_format(s, " %s/%d", addr->addr_s, addr->plen);
+    }
+}
+
 bool
 extract_sbrec_binding_first_mac(const struct sbrec_port_binding *binding,
                                 struct eth_addr *ea)
@@ -459,6 +521,60 @@ find_lport_address(const struct lport_addresses *laddrs, const char *ip_s)
     return NULL;
 }
 
+static bool
+contains_ipv4_address(const struct lport_addresses *lsp_addrs,
+                      size_t n_lsp_addrs, ovs_be32 ip4)
+{
+    for (unsigned int i = 0; i < n_lsp_addrs; i++) {
+        const struct lport_addresses *laddrs = &lsp_addrs[i];
+        size_t n = laddrs->n_ipv4_addrs;
+
+        for (size_t j = 0; j < n; j++) {
+            if (laddrs->ipv4_addrs[j].addr == ip4) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool
+contains_ipv6_address(const struct lport_addresses *lsp_addrs,
+                      size_t n_lsp_addrs, const struct in6_addr *ip6)
+{
+    for (unsigned int i = 0; i < n_lsp_addrs; i++) {
+        const struct lport_addresses *laddrs = &lsp_addrs[i];
+        size_t n = laddrs->n_ipv6_addrs;
+
+        for (size_t j = 0; j < n; j++) {
+            if (IN6_ARE_ADDR_EQUAL(&laddrs->ipv6_addrs[j].addr, ip6)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool
+lport_addresses_contains_ip(const struct lport_addresses *lsp_addrs,
+                            size_t n_lsp_addrs, const char *ip_s)
+{
+    struct in6_addr ip6;
+    ovs_be32 ip4;
+
+    if (ip_parse(ip_s, &ip4)) {
+        return contains_ipv4_address(lsp_addrs, n_lsp_addrs, ip4);
+    }
+
+    if (ipv6_parse(ip_s, &ip6)) {
+        return contains_ipv6_address(lsp_addrs, n_lsp_addrs, &ip6);
+    }
+
+    return false;
+}
+
 /* Go through 'addresses' and add found IPv4 addresses to 'ipv4_addrs' and
  * IPv6 addresses to 'ipv6_addrs'. */
 void
@@ -538,19 +654,25 @@ default_ic_sb_db(void)
     return def;
 }
 
+const char *
+default_br_db(void)
+{
+    static char *def;
+    if (!def) {
+        def = getenv("OVN_BR_DB");
+        if (!def) {
+            def = xasprintf("unix:%s/ovnbr_db.sock", ovn_rundir());
+        }
+    }
+    return def;
+}
+
 char *
 get_abs_unix_ctl_path(const char *path)
 {
-#ifdef _WIN32
-    enum { WINDOWS = 1 };
-#else
-    enum { WINDOWS = 0 };
-#endif
-
     long int pid = getpid();
     char *abs_path
         = (path ? abs_file_name(ovn_rundir(), path)
-           : WINDOWS ? xasprintf("%s/%s.ctl", ovn_rundir(), program_name)
            : xasprintf("%s/%s.%ld.ctl", ovn_rundir(), program_name, pid));
     return abs_path;
 }
@@ -560,20 +682,8 @@ ovn_set_pidfile(const char *name)
 {
     char *pidfile_name = NULL;
 
-#ifndef _WIN32
     pidfile_name = name ? abs_file_name(ovn_rundir(), name)
                         : xasprintf("%s/%s.pid", ovn_rundir(), program_name);
-#else
-    if (name) {
-        if (strchr(name, ':')) {
-            pidfile_name = xstrdup(name);
-        } else {
-            pidfile_name = xasprintf("%s/%s", ovn_rundir(), name);
-        }
-    } else {
-        pidfile_name = xasprintf("%s/%s.pid", ovn_rundir(), program_name);
-    }
-#endif
 
     /* Call openvswitch lib function. */
     set_pidfile(pidfile_name);
@@ -589,6 +699,7 @@ static const char *OVN_NB_LSP_TYPES[] = {
     "localnet",
     "localport",
     "router",
+    "switch",
     "vtep",
     "external",
     "virtual",
@@ -622,19 +733,23 @@ ovn_pipeline_from_name(const char *pipeline)
 uint32_t
 sbrec_logical_flow_hash(const struct sbrec_logical_flow *lf)
 {
+    bool acl_ct_translation = smap_get_bool(&lf->tags,
+                                            "acl_ct_translation", false);
     return ovn_logical_flow_hash(lf->table_id,
                                  ovn_pipeline_from_name(lf->pipeline),
                                  lf->priority, lf->match,
-                                 lf->actions);
+                                 lf->actions, acl_ct_translation);
 }
 
 uint32_t
 ovn_logical_flow_hash(uint8_t table_id, enum ovn_pipeline pipeline,
                       uint16_t priority,
-                      const char *match, const char *actions)
+                      const char *match, const char *actions,
+                      bool acl_ct_translation)
 {
     size_t hash = hash_2words((table_id << 16) | priority, pipeline);
     hash = hash_string(match, hash);
+    hash = hash_boolean(acl_ct_translation, hash);
     return hash_string(actions, hash);
 }
 
@@ -802,6 +917,16 @@ normalize_v46_prefix(const struct in6_addr *prefix, unsigned int plen)
 }
 
 char *
+normalize_v46(const struct in6_addr *prefix)
+{
+    if (IN6_IS_ADDR_V4MAPPED(prefix)) {
+        return normalize_ipv4_prefix(in6_addr_get_mapped_ipv4(prefix), 32);
+    } else {
+        return normalize_ipv6_prefix(prefix, 128);
+    }
+}
+
+char *
 str_tolower(const char *orig)
 {
     char *copy = xmalloc(strlen(orig) + 1);
@@ -813,6 +938,37 @@ str_tolower(const char *orig)
     *p = '\0';
 
     return copy;
+}
+
+/* This is a wrapper function which get the value associated with 'key' in
+ * 'smap' and converts it to a long long. If 'key' is not in 'smap' or a
+ * valid unsigned integer can't be parsed from its value, returns 'def'.
+ */
+long long
+ovn_smap_get_llong(const struct smap *smap, const char *key, long long def)
+{
+    const char *value = smap_get(smap, key);
+    long long ll_value;
+
+    if (!value || !str_to_llong(value, 10, &ll_value)) {
+        return def;
+    }
+
+    return ll_value;
+}
+
+bool
+ovn_str_to_ushort(const char *s, int base, unsigned short *u)
+{
+    long long ll;
+    bool ok = str_to_llong(s, base, &ll);
+    if (!ok || ll < 0 || ll > USHRT_MAX) {
+        *u = 0;
+        return false;
+    } else {
+        *u = ll;
+        return true;
+    }
 }
 
 /* For a 'key' of the form "IP:port" or just "IP", sets 'port',
@@ -847,8 +1003,12 @@ ip_address_and_port_from_lb_key(const char *key, char **ip_address,
  * modified or a stage is added to a logical pipeline.
  *
  * This value is also used to handle some backward compatibility during
- * upgrading. It should never decrease or rewind. */
-#define OVN_INTERNAL_MINOR_VER 6
+ * upgrading. It should never decrease or rewind.
+ *
+ * NOTE: If OVN_NORTHD_PIPELINE_CSUM is updated make sure to double check
+ * whether an update of OVN_INTERNAL_MINOR_VER is required. */
+#define OVN_NORTHD_PIPELINE_CSUM "3980195012 11262"
+#define OVN_INTERNAL_MINOR_VER 16
 
 /* Returns the OVN version. The caller must free the returned value. */
 char *
@@ -859,18 +1019,16 @@ ovn_get_internal_version(void)
                      N_OVNACTS, OVN_INTERNAL_MINOR_VER);
 }
 
-uint32_t
+enum chassis_tunnel_type
 get_tunnel_type(const char *name)
 {
     if (!strcmp(name, "geneve")) {
         return GENEVE;
-    } else if (!strcmp(name, "stt")) {
-        return STT;
     } else if (!strcmp(name, "vxlan")) {
         return VXLAN;
     }
 
-    return 0;
+    return TUNNEL_TYPE_INVALID;
 }
 
 const struct ovsrec_bridge *
@@ -885,13 +1043,24 @@ get_bridge(const struct ovsrec_bridge_table *bridge_table, const char *br_name)
     return NULL;
 }
 
+/* This counts the amount of iterations of monitoring condition updates and
+ * their respective update towards us.
+ * This only needs to handle the case of non monitor_all since that will use
+ * the ignore feature below.
+ * In this case we need at least 2 iterations:
+ * 1. the initial iteration where we pull the sb content based on the few
+ *    conditions we now have.
+ * 2. after the first engine run we have enough information to update the
+ *    monitoring conditions to their final values.
+ * However based on the structure of the datapaths we might need more. The
+ * value below is just a hard limit of iterations. We detect if we are done
+ * earlier and then skip further iterations. */
 #define DAEMON_STARTUP_DELAY_SEED 20
-#define DAEMON_STARTUP_DELAY_MS   10000
 
 static int64_t startup_ts;
 static int startup_delay = DAEMON_STARTUP_DELAY_SEED;
 
-/* Used by debug command only, for tests. */
+/* Used if we do not need the startup delay (e.g. when using monitor_all). */
 static bool ignore_startup_delay = false;
 
 OVS_CONSTRUCTOR(startup_ts_initializer) {
@@ -932,9 +1101,7 @@ daemon_started_recently(void)
     if (startup_delay) {
         return true;
     }
-
-    /* Ensure that at least an amount of time has passed. */
-    return time_wall_msec() - startup_ts <= DAEMON_STARTUP_DELAY_MS;
+    return false;
 }
 
 /* Builds a unique address set compatible name ([a-zA-Z_.][a-zA-Z_.0-9]*)
@@ -1158,6 +1325,8 @@ get_lport_type(const struct sbrec_port_binding *pb)
         return LP_REMOTE;
     } else if (!strcmp(pb->type, "vtep")) {
         return LP_VTEP;
+    } else if (!strcmp(pb->type, "mirror")) {
+        return LP_MIRROR;
     }
 
     return LP_UNKNOWN;
@@ -1171,6 +1340,8 @@ get_lport_type_str(enum en_lport_type lport_type)
         return "VIF";
     case LP_CONTAINER:
         return "CONTAINER";
+    case LP_MIRROR:
+        return "MIRROR";
     case LP_VIRTUAL:
         return "VIRTUAL";
     case LP_PATCH:
@@ -1196,33 +1367,6 @@ get_lport_type_str(enum en_lport_type lport_type)
     }
 
     OVS_NOT_REACHED();
-}
-
-bool
-is_pb_router_type(const struct sbrec_port_binding *pb)
-{
-    enum en_lport_type lport_type = get_lport_type(pb);
-
-    switch (lport_type) {
-    case LP_PATCH:
-    case LP_CHASSISREDIRECT:
-    case LP_L3GATEWAY:
-    case LP_L2GATEWAY:
-        return true;
-
-    case LP_VIF:
-    case LP_CONTAINER:
-    case LP_VIRTUAL:
-    case LP_LOCALNET:
-    case LP_LOCALPORT:
-    case LP_REMOTE:
-    case LP_VTEP:
-    case LP_EXTERNAL:
-    case LP_UNKNOWN:
-        return false;
-    }
-
-    return false;
 }
 
 void
@@ -1287,4 +1431,550 @@ ovn_exit_args_finish(struct ovn_exit_args *exit_args)
         unixctl_command_reply(exit_args->conns[i], NULL);
     }
     free(exit_args->conns);
+}
+
+bool
+ovn_update_swconn_at(struct rconn *swconn, const char *target,
+                     int probe_interval, const char *where)
+{
+    if (!target) {
+        rconn_disconnect(swconn);
+        return true;
+    }
+
+    bool notify = false;
+
+    if (strcmp(target, rconn_get_target(swconn))) {
+        VLOG_INFO("%s: connecting to switch: \"%s\"", where, target);
+        rconn_connect(swconn, target, target);
+        notify = true;
+    }
+
+    if (probe_interval != rconn_get_probe_interval(swconn)) {
+        rconn_set_probe_interval(swconn, probe_interval);
+        notify = true;
+    }
+
+    return notify;
+}
+
+bool
+prefix_is_link_local(const struct in6_addr *prefix, unsigned int plen)
+{
+    if (IN6_IS_ADDR_V4MAPPED(prefix)) {
+        /* Link local range is "169.254.0.0/16". */
+        if (plen < 16) {
+            return false;
+        }
+        ovs_be32 lla;
+        inet_pton(AF_INET, "169.254.0.0", &lla);
+        return ((in6_addr_get_mapped_ipv4(prefix) & htonl(0xffff0000)) == lla);
+    }
+
+    /* ipv6, link local range is "fe80::/10". */
+    if (plen < 10) {
+        return false;
+    }
+    return (((prefix->s6_addr[0] & 0xff) == 0xfe) &&
+            ((prefix->s6_addr[1] & 0xc0) == 0x80));
+}
+
+bool
+find_prefix_in_set(const struct in6_addr *prefix, unsigned int plen,
+                   const struct sset *prefix_set, const char *filter_name)
+{
+    struct in6_addr lt_prefix;
+    const char *cur_prefix;
+    unsigned int lt_plen;
+
+    SSET_FOR_EACH (cur_prefix, prefix_set) {
+        if (!ip46_parse_cidr(cur_prefix, &lt_prefix, &lt_plen)) {
+            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
+            VLOG_WARN_RL(&rl, "Bad prefix (%s) format: %s. CIDR expected.",
+                         filter_name, cur_prefix);
+            continue;
+        }
+
+        if (IN6_IS_ADDR_V4MAPPED(&lt_prefix) != IN6_IS_ADDR_V4MAPPED(prefix)) {
+            continue;
+        }
+
+        /* 192.168.0.0/16 does not belong to 192.168.0.0/17 */
+        if (plen < lt_plen) {
+            continue;
+        }
+
+        if (IN6_IS_ADDR_V4MAPPED(prefix)) {
+            ovs_be32 bl_prefix_v4 = in6_addr_get_mapped_ipv4(&lt_prefix);
+            ovs_be32 prefix_v4 = in6_addr_get_mapped_ipv4(prefix);
+            ovs_be32 mask = be32_prefix_mask(lt_plen);
+
+            if ((prefix_v4 & mask) == (bl_prefix_v4 & mask)) {
+                return true;
+            }
+        } else {
+            struct in6_addr bl_mask = ipv6_create_mask(lt_plen);
+            struct in6_addr m_prefix = ipv6_addr_bitand(prefix, &bl_mask);
+            struct in6_addr m_bl_prefix = ipv6_addr_bitand(&lt_prefix,
+                                                           &bl_mask);
+            if (ipv6_addr_equals(&m_prefix, &m_bl_prefix)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+const struct sbrec_port_binding *
+lport_lookup_by_name(struct ovsdb_idl_index *sbrec_port_binding_by_name,
+                     const char *name)
+{
+    struct sbrec_port_binding *pb = sbrec_port_binding_index_init_row(
+        sbrec_port_binding_by_name);
+    sbrec_port_binding_index_set_logical_port(pb, name);
+
+    const struct sbrec_port_binding *retval = sbrec_port_binding_index_find(
+        sbrec_port_binding_by_name, pb);
+
+    sbrec_port_binding_index_destroy_row(pb);
+
+    return retval;
+}
+
+static void
+ovn_enable_timewarp(struct unixctl_conn *conn, int argc OVS_UNUSED,
+                    const char *argv[] OVS_UNUSED, void *arg OVS_UNUSED)
+{
+    timeval_dummy_register();
+    unixctl_command_reply(conn, NULL);
+}
+
+void
+ovn_debug_commands_register(void)
+{
+    unixctl_command_register("debug/enable-timewarp", "", 0, 0,
+                             ovn_enable_timewarp, NULL);
+}
+
+char *
+ovn_mirror_port_name(const char *datapath_name,
+                     const char *port_name)
+{
+    return xasprintf("mp-%s-%s", datapath_name, port_name);
+}
+
+void
+put_load_bytes(const void *value, size_t len, enum mf_field_id dst,
+               size_t ofs, size_t n_bits, struct ofpbuf *ofpacts)
+{
+    struct ofpact_set_field *sf = ofpact_put_set_field(ofpacts,
+                                                       mf_from_id(dst), NULL,
+                                                       NULL);
+    bitwise_copy(value, len, 0, sf->value, sf->field->n_bytes, ofs, n_bits);
+    bitwise_one(ofpact_set_field_mask(sf), sf->field->n_bytes, ofs, n_bits);
+}
+
+void
+put_load(uint64_t value, enum mf_field_id dst, size_t ofs, size_t n_bits,
+         struct ofpbuf *ofpacts)
+{
+    ovs_be64 n_value = htonll(value);
+    put_load_bytes(&n_value, 8, dst, ofs, n_bits, ofpacts);
+}
+
+bool
+datapath_get_nb_uuid_and_type(const struct sbrec_datapath_binding *sb,
+                              struct uuid *nb_uuid, const char **type)
+{
+    if (sb->nb_uuid && sb->type && *sb->type) {
+        /* New style. The UUID and the type are direct columns,
+         * so use those. */
+        *nb_uuid = *sb->nb_uuid;
+        *type = sb->type;
+        return true;
+    }
+
+    /* Old style. The UUID is stored in external_ids, and the key
+     * corresponds to the datapath type. This only works with
+     * logical switches and logical routers.
+     */
+    *type = "logical-switch";
+    if (smap_get_uuid(&sb->external_ids, *type, nb_uuid)) {
+        return true;
+    }
+    *type = "logical-router";
+    if (smap_get_uuid(&sb->external_ids, *type, nb_uuid)) {
+        return true;
+    }
+    *type = "";
+    *nb_uuid = UUID_ZERO;
+    return false;
+}
+
+bool
+datapath_get_nb_uuid(const struct sbrec_datapath_binding *sb,
+                     struct uuid *nb_uuid)
+{
+    const char *type;
+    return datapath_get_nb_uuid_and_type(sb, nb_uuid, &type);
+}
+
+const char *
+datapath_get_nb_type(const struct sbrec_datapath_binding *sb)
+{
+    const char *type;
+    struct uuid nb_uuid;
+    datapath_get_nb_uuid_and_type(sb, &nb_uuid, &type);
+    return type;
+}
+
+bool
+ovn_is_valid_vni(int64_t vni)
+{
+    return vni >= 0 && (vni <= (1 << 24) - 1);
+}
+
+/* Adds 'field' to the ECMP 'selection_fields'.  If 'field' is tp_src or
+ * tp_dst, also adds ip_proto: the protocol specific port fields are only
+ * valid with a match on the protocol. */
+void
+ovn_ecmp_selection_fields_add(const char *field,
+                              struct sset *selection_fields)
+{
+    if (!strcmp(field, "tp_src") || !strcmp(field, "tp_dst")) {
+        sset_add(selection_fields, "ip_proto");
+    }
+    sset_add(selection_fields, field);
+}
+
+/* Parses 'fields_s', a comma separated list of the fields that the
+ * Logical_Router_Static_Route selection_fields column accepts, into
+ * 'selection_fields'.  Returns false, and leaves 'selection_fields'
+ * empty, if 'fields_s' contains a field that is not supported. */
+bool
+ovn_ecmp_selection_fields_parse(const char *fields_s,
+                                struct sset *selection_fields)
+{
+    static const char *const supported[] = {
+        "eth_src", "eth_dst", "ip_proto", "ip_src", "ip_dst",
+        "ipv6_src", "ipv6_dst", "tp_src", "tp_dst",
+    };
+
+    char *tokstr = xstrdup(fields_s);
+    char *save_ptr = NULL;
+    bool ok = true;
+    for (char *field = strtok_r(tokstr, ",", &save_ptr); field;
+         field = strtok_r(NULL, ",", &save_ptr)) {
+        size_t i;
+        for (i = 0; i < ARRAY_SIZE(supported); i++) {
+            if (!strcmp(field, supported[i])) {
+                break;
+            }
+        }
+        if (i == ARRAY_SIZE(supported)) {
+            ok = false;
+            break;
+        }
+        ovn_ecmp_selection_fields_add(field, selection_fields);
+    }
+    free(tokstr);
+
+    if (!ok) {
+        sset_clear(selection_fields);
+    }
+    return ok;
+}
+
+/* Returns the fields of an OpenFlow select group with selection_method=hash
+ * for the ECMP 'selection_fields', or NULL if 'selection_fields' is empty.
+ * One group serves every protocol, so tp_src and tp_dst become the ports of
+ * TCP, UDP and SCTP; ovs-vswitchd hashes only the fields that are present
+ * in a packet.  The caller must free the returned string. */
+char *
+ovn_ecmp_selection_fields_to_hash_fields(const struct sset *selection_fields)
+{
+    if (sset_is_empty(selection_fields)) {
+        return NULL;
+    }
+
+    struct sset of_fields = SSET_INITIALIZER(&of_fields);
+    const char *field;
+    SSET_FOR_EACH (field, selection_fields) {
+        if (!strcmp(field, "tp_src") || !strcmp(field, "tp_dst")) {
+            const char *dir = field + strlen("tp_");
+            sset_add_and_free(&of_fields, xasprintf("tcp_%s", dir));
+            sset_add_and_free(&of_fields, xasprintf("udp_%s", dir));
+            sset_add_and_free(&of_fields, xasprintf("sctp_%s", dir));
+        } else {
+            sset_add(&of_fields, field);
+        }
+    }
+
+    char *hash_fields = sset_join(&of_fields, ",", "");
+    sset_destroy(&of_fields);
+    return hash_fields;
+}
+
+struct sset *
+lrp_network_sset(const char **networks, int n_networks)
+{
+    struct sset *network_set = xzalloc(sizeof *network_set);
+    sset_init(network_set);
+    for (int i = 0; i < n_networks; i++) {
+        char *norm = normalize_prefix_str(networks[i]);
+        if (!norm) {
+            sset_destroy(network_set);
+            free(network_set);
+            return NULL;
+        }
+
+        sset_add_and_free(network_set, norm);
+    }
+
+    return network_set;
+}
+
+char *
+normalize_ipv4_prefix_str(const char *orig_prefix)
+{
+    unsigned int plen;
+    ovs_be32 ipv4;
+    char *error;
+
+    error = ip_parse_cidr(orig_prefix, &ipv4, &plen);
+    if (error) {
+        free(error);
+        return NULL;
+    }
+
+    return normalize_ipv4_prefix(ipv4, plen);
+}
+
+char *
+normalize_ipv6_prefix_str(const char *orig_prefix)
+{
+    unsigned int plen;
+    struct in6_addr ipv6;
+    char *error;
+
+    error = ipv6_parse_cidr(orig_prefix, &ipv6, &plen);
+    if (error) {
+        free(error);
+        return NULL;
+    }
+
+    return normalize_ipv6_prefix(&ipv6, plen);
+}
+
+char *
+normalize_prefix_str(const char *orig_prefix)
+{
+    char *ret;
+
+    ret = normalize_ipv4_prefix_str(orig_prefix);
+    if (!ret) {
+        ret = normalize_ipv6_prefix_str(orig_prefix);
+    }
+
+    return ret;
+}
+
+char *
+normalize_ipv4_addr_str(const char *orig_addr)
+{
+    ovs_be32 ipv4;
+
+    if (!ip_parse(orig_addr, &ipv4)) {
+        return NULL;
+    }
+
+    return normalize_ipv4_prefix(ipv4, 32);
+}
+
+char *
+normalize_ipv6_addr_str(const char *orig_addr)
+{
+    struct in6_addr ipv6;
+
+    if (!ipv6_parse(orig_addr, &ipv6)) {
+        return NULL;
+    }
+
+    return normalize_ipv6_prefix(&ipv6, 128);
+}
+
+char *
+normalize_addr_str(const char *orig_addr)
+{
+    char *ret;
+
+    ret = normalize_ipv4_addr_str(orig_addr);
+    if (!ret) {
+        ret = normalize_ipv6_addr_str(orig_addr);
+    }
+
+    return ret;
+}
+
+enum neigh_redistribute_mode
+parse_neigh_dynamic_redistribute(const struct smap *options)
+{
+    const char *redistribute = smap_get(options,
+                                        "dynamic-routing-redistribute");
+    if (!redistribute) {
+        return NRM_NONE;
+    }
+
+    enum neigh_redistribute_mode mode = NRM_NONE;
+    char *save_ptr = NULL, *tokstr = xstrdup(redistribute);
+    for (char *token = strtok_r(tokstr, ",", &save_ptr);
+         token; token = strtok_r(NULL, ",", &save_ptr)) {
+        if (!strcmp(token, "fdb")) {
+            mode |= NRM_FDB;
+        }
+        if (!strcmp(token, "ip")) {
+            mode |= NRM_IP;
+        }
+        if (!strcmp(token, "nat")) {
+            mode |= NRM_NAT;
+        }
+    }
+    free(tokstr);
+
+    return mode;
+}
+
+bool
+is_partial_uuid_match(const struct uuid *uuid, const char *match)
+{
+    char uuid_s[UUID_LEN + 1];
+    snprintf(uuid_s, sizeof uuid_s, UUID_FMT, UUID_ARGS(uuid));
+
+    /* We strip leading zeros because we want to accept cookie values derived
+     * from UUIDs, and cookie values are printed without leading zeros because
+     * they're just numbers. */
+    const char *s1 = strip_leading_zero(uuid_s);
+    const char *s2 = match;
+    if (is_uuid_with_prefix(s2)) {
+        s2 = s2 + 2;
+    }
+    s2 = strip_leading_zero(s2);
+    return !strncmp(s1, s2, strlen(s2));
+}
+
+/* Return an array of shuffled indices [0, n-1] using Fisher-Yates algorithm.
+ * Caller must free the returned array. Returns NULL if n == 0. */
+size_t *
+shuffled_range(size_t n)
+{
+    if (!n) {
+        return NULL;
+    }
+
+    size_t *indices = xmalloc(n * sizeof *indices);
+    for (size_t i = 0; i < n; i++) {
+        indices[i] = i;
+    }
+
+    for (size_t i = n - 1; i > 0; i--) {
+        size_t j = random_range(i + 1);
+        size_t tmp = indices[i];
+        indices[i] = indices[j];
+        indices[j] = tmp;
+    }
+
+    return indices;
+}
+
+/* Parses string 's', which must be a MAC address with an optional mask or
+ * mask prefix length.  Stores the MAC address into '*ea' and the mask prefix
+ * length into '*plen' (if 's' does not contain a mask, all-one-bits
+ * is assumed).
+ *
+ * Returns true if successful, otherwise false and the '*ea' is zeroed out in
+ * case. */
+bool
+eth_addr_parse_masked(const char *s, struct eth_addr *ea, unsigned int *plen)
+{
+    int n = 0;
+
+    if (!ovs_scan_len(s, &n, ETH_ADDR_SCAN_FMT, ETH_ADDR_SCAN_ARGS(*ea))) {
+        *ea = eth_addr_zero;
+        return false;
+    }
+
+    /* There isn't any mask provided. */
+    if (s[n] != '/') {
+        *plen = 48;
+        return true;
+    }
+
+    struct eth_addr mask;
+    if (ovs_scan_len(s, &n, "/"ETH_ADDR_SCAN_FMT, ETH_ADDR_SCAN_ARGS(mask))) {
+        int prefix = eth_addr_get_prefix_len(mask);
+        if (!eth_addr_equals(mask, eth_addr_create_mask(prefix))) {
+            *ea = eth_addr_zero;
+            return false;
+        }
+
+        *plen = prefix;
+        return true;
+    }
+
+    int prefix;
+    if (ovs_scan_len(s, &n, "/%d", &prefix)) {
+        if (prefix < 0 || prefix > 48) {
+            *ea = eth_addr_zero;
+            return false;
+        }
+        *plen = prefix;
+        return true;
+    }
+
+    *ea = eth_addr_zero;
+    return false;
+}
+
+bool
+port_contains_duplicate_ip(struct lport_addresses *laddrs1,
+                          struct lport_addresses *laddrs2,
+                          const char *port_name,
+                          char **error_str)
+{
+    for (size_t i = 0; i < laddrs1->n_ipv4_addrs; i++) {
+        for (size_t j = 0; j < laddrs2->n_ipv4_addrs; j++) {
+            if (laddrs1->ipv4_addrs[i].addr == laddrs2->ipv4_addrs[j].addr) {
+                if (error_str) {
+                    *error_str = xasprintf("duplicate IPv4 address '%s' "
+                                           "found on logical switch "
+                                           "port '%s'",
+                                           laddrs1->ipv4_addrs[i].addr_s,
+                                           port_name);
+                }
+                return true;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < laddrs1->n_ipv6_addrs; i++) {
+        for (size_t j = 0; j < laddrs2->n_ipv6_addrs; j++) {
+            if (IN6_ARE_ADDR_EQUAL(&laddrs1->ipv6_addrs[i].addr,
+                                   &laddrs2->ipv6_addrs[j].addr)) {
+                if (error_str) {
+                    *error_str = xasprintf("duplicate IPv6 address "
+                                           "'%s' found on logical "
+                                           "switch port '%s'",
+                                           laddrs1->ipv6_addrs[i].addr_s,
+                                           port_name);
+                }
+                return true;
+            }
+        }
+    }
+
+    if (error_str) {
+        *error_str = NULL;
+    }
+
+    return false;
 }

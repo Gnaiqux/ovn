@@ -28,7 +28,7 @@
     </p>
 
     <p>
-      <code>ovn-ctl</code> is exactly similar to Open vSwitch
+      <code>ovn-appctl</code> is the equivalent of the Open vSwitch
       <code>ovs-appctl</code> utility.
     </p>
 
@@ -80,7 +80,7 @@
     <dl>
       <dt><code>emer</code></dt>
       <dd>
-        A major failure forced a process to abort.
+        A major failure forced a process to hard stop.
       </dd>
 
       <dt><code>err</code></dt>
@@ -141,13 +141,6 @@
               <code>syslog</code>, <code>console</code>, or <code>file</code>,
               to limit the log level change to only to the system log, to the
               console, or to a file, respectively.
-            </p>
-
-            <p>
-              On Windows platform, <code>syslog</code> is accepted as a word
-              and is only useful if the target was started with the
-              <code>--syslog-target</code> option (the word has no effect
-              otherwise).
             </p>
           </li>
 

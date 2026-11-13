@@ -16,13 +16,18 @@
 #include <config.h>
 #include <stdbool.h>
 
+#include "lflow.h"
+#include "lib/mac-binding-index.h"
+#include "lib/vec.h"
 #include "local_data.h"
 #include "lport.h"
 #include "mac-cache.h"
 #include "openvswitch/hmap.h"
 #include "openvswitch/vlog.h"
 #include "ovn/logical-fields.h"
+#include "uuidset.h"
 #include "ovn-sb-idl.h"
+#include "pinctrl.h"
 
 VLOG_DEFINE_THIS_MODULE(mac_cache);
 
@@ -30,12 +35,19 @@ VLOG_DEFINE_THIS_MODULE(mac_cache);
 #define BUFFER_QUEUE_DEPTH          4
 #define BUFFERED_PACKETS_TIMEOUT_MS 10000
 #define BUFFERED_PACKETS_LOOKUP_MS  100
+#define PROBE_MULICAST_THRESHOLD     2
 
 static uint32_t
 mac_binding_data_hash(const struct mac_binding_data *mb_data);
 static inline bool
 mac_binding_data_equals(const struct mac_binding_data *a,
                         const struct mac_binding_data *b);
+static void mac_binding_update_log(const char *action,
+                                   const struct mac_binding_data *,
+                                   bool print_times,
+                                   const struct mac_cache_threshold *,
+                                   int64_t idle_age_ms,
+                                   uint64_t since_updated_ms);
 static uint32_t
 fdb_data_hash(const struct fdb_data *fdb_data);
 static inline bool
@@ -49,12 +61,11 @@ static void
 mac_cache_update_req_delay(struct hmap *thresholds, uint64_t *req_delay);
 
 static struct buffered_packets *
-buffered_packets_find(struct buffered_packets_ctx *ctx,
+buffered_packets_find(struct cmap *bp_map,
                       const struct mac_binding_data *mb_data);
 
 static void
-buffered_packets_remove(struct buffered_packets_ctx *ctx,
-                        struct buffered_packets *bp);
+buffered_packets_free(struct buffered_packets *bp);
 
 static void
 buffered_packets_db_lookup(struct buffered_packets *bp,
@@ -83,7 +94,21 @@ mac_cache_threshold_add(struct mac_cache_data *data,
     threshold = xmalloc(sizeof *threshold);
     threshold->dp_key = dp->tunnel_key;
     threshold->value = value;
-    threshold->dump_period = (3 * value) / 4;
+    threshold->dump_period = (3 * value) / 16;
+    threshold->cooldown_period = (3 * value) / 16;
+
+    /* (cooldown_period + dump_period) is the maximum time the timestamp may
+     * be not updated for an entry with IP + MAC combination from which we see
+     * incoming traffic.  For the entry that is used only in Tx direction
+     * (e.g., an entry for a default gateway of the chassis) this time is
+     * doubled, because an ARP/ND probe will need to be sent first and the
+     * (cooldown_period + dump_period) will be the maximum time between such
+     * probes.  Hence, 2 * (cooldown_period + dump_period) should be less than
+     * a threshold, otherwise we may fail to update an active MAC binding in
+     * time and risk it being removed.  Giving it an extra 1/10 of the time
+     * for all the processing that needs to happen. */
+    ovs_assert(2 * (threshold->cooldown_period + threshold->dump_period)
+               < (9 * value) / 10);
 
     hmap_insert(&data->thresholds, &threshold->hmap_node, dp->tunnel_key);
 }
@@ -142,25 +167,27 @@ mac_cache_thresholds_clear(struct mac_cache_data *data)
 }
 
 /* MAC binding. */
-struct mac_binding *
+void
 mac_binding_add(struct hmap *map, struct mac_binding_data mb_data,
-                long long timestamp) {
-
+                const struct sbrec_mac_binding *smb, long long timestamp)
+{
     struct mac_binding *mb = mac_binding_find(map, &mb_data);
     if (!mb) {
         mb = xmalloc(sizeof *mb);
-        mb->sbrec_mb = NULL;
         hmap_insert(map, &mb->hmap_node, mac_binding_data_hash(&mb_data));
     }
 
     mb->data = mb_data;
+    mb->sbrec = smb;
     mb->timestamp = timestamp;
-
-    return mb;
+    mb->arp_attempts = 0;
+    mac_binding_update_log("Added", &mb_data, false, NULL, 0, 0);
 }
 
 void
-mac_binding_remove(struct hmap *map, struct mac_binding *mb) {
+mac_binding_remove(struct hmap *map, struct mac_binding *mb)
+{
+    mac_binding_update_log("Removed", &mb->data, false, NULL, 0, 0);
     hmap_remove(map, &mb->hmap_node);
     free(mb);
 }
@@ -181,24 +208,37 @@ mac_binding_find(const struct hmap *map,
 }
 
 bool
-mac_binding_data_from_sbrec(struct mac_binding_data *data,
-                            const struct sbrec_mac_binding *mb,
-                            struct ovsdb_idl_index *sbrec_pb_by_name)
+mac_binding_data_parse(struct mac_binding_data *data,
+                       uint32_t dp_key, uint32_t port_key,
+                       const char *ip_str, const char *mac_str)
 {
-    const struct sbrec_port_binding *pb =
-            lport_lookup_by_name(sbrec_pb_by_name, mb->logical_port);
+    struct eth_addr mac;
+    struct in6_addr ip;
 
-    if (!pb || !pb->datapath || !ip46_parse(mb->ip, &data->ip) ||
-        !eth_addr_from_string(mb->mac, &data->mac)) {
+    if (!ip46_parse(ip_str, &ip) || !eth_addr_from_string(mac_str, &mac)) {
         static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-        VLOG_WARN_RL(&rl, "Couldn't parse MAC binding: ip=%s, mac=%s, "
-                     "logical_port=%s", mb->ip, mb->mac, mb->logical_port);
+        VLOG_WARN_RL(&rl, "Couldn't parse MAC binding: ip=%s, mac=%s",
+                     ip_str, mac_str);
         return false;
     }
 
-    data->dp_key = mb->datapath->tunnel_key;
-    data->port_key = pb->tunnel_key;
+    mac_binding_data_init(data, dp_key, port_key, ip, mac);
+    return true;
+}
 
+bool
+mac_binding_data_from_sbrec(struct mac_binding_data *data,
+                            const struct sbrec_mac_binding *mb)
+{
+    /* This explicitly sets the port_key to 0 as port_binding tunnel_keys
+     * can change.  Instead use add the SB.MAC_Binding UUID as key; this
+     * makes the mac_binding_data key unique. */
+    if (!mac_binding_data_parse(data, mb->datapath->tunnel_key, 0,
+                                mb->ip, mb->mac)) {
+        return false;
+    }
+
+    data->cookie = mb->header_.uuid.parts[0];
     return true;
 }
 
@@ -211,41 +251,37 @@ mac_bindings_clear(struct hmap *map)
     }
 }
 
-bool
-sb_mac_binding_updated(const struct sbrec_mac_binding *mb)
+static void
+mac_binding_data_to_string(const struct mac_binding_data *data,
+                           struct ds *out_data)
 {
-    bool updated = false;
-    for (size_t i = 0; i < SBREC_MAC_BINDING_N_COLUMNS; i++) {
-        /* Ignore timestamp update as this does not affect the existing nodes
-         * at all. */
-        if (i == SBREC_MAC_BINDING_COL_TIMESTAMP) {
-            continue;
-        }
-        updated |= sbrec_mac_binding_is_updated(mb, i);
-    }
+    char ip[INET6_ADDRSTRLEN];
 
-    return updated || sbrec_mac_binding_is_deleted(mb);
+    if (!ipv6_string_mapped(ip, &data->ip)) {
+        return;
+    }
+    ds_put_format(out_data, "cookie: 0x%08"PRIx64", "
+                            "datapath-key: %"PRIu32", "
+                            "port-key: %"PRIu32", "
+                            "ip: %s, mac: " ETH_ADDR_FMT,
+                  data->cookie, data->dp_key, data->port_key,
+                  ip, ETH_ADDR_ARGS(data->mac));
 }
 
-const struct sbrec_mac_binding *
-mac_binding_lookup(struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
-                   const char *logical_port, const char *ip) {
-    struct sbrec_mac_binding *mb =
-            sbrec_mac_binding_index_init_row(sbrec_mac_binding_by_lport_ip);
-    sbrec_mac_binding_index_set_logical_port(mb, logical_port);
-    sbrec_mac_binding_index_set_ip(mb, ip);
-
-    const struct sbrec_mac_binding *retval =
-            sbrec_mac_binding_index_find(sbrec_mac_binding_by_lport_ip, mb);
-
-    sbrec_mac_binding_index_destroy_row(mb);
-
-    return retval;
+void
+mac_bindings_to_string(const struct hmap *map, struct ds *out_data)
+{
+    struct mac_binding *mb;
+    HMAP_FOR_EACH (mb, hmap_node, map) {
+        mac_binding_data_to_string(&mb->data, out_data);
+        ds_put_char(out_data, '\n');
+    }
 }
 
 /* FDB. */
 struct fdb *
-fdb_add(struct hmap *map, struct fdb_data fdb_data) {
+fdb_add(struct hmap *map, struct fdb_data fdb_data, long long timestamp)
+{
     struct fdb *fdb = fdb_find(map, &fdb_data);
 
     if (!fdb) {
@@ -255,6 +291,8 @@ fdb_add(struct hmap *map, struct fdb_data fdb_data) {
     }
 
     fdb->data = fdb_data;
+    fdb->timestamp = timestamp;
+    fdb->cfg = -1;
 
     return fdb;
 }
@@ -296,22 +334,6 @@ fdb_find(const struct hmap *map, const struct fdb_data *fdb_data)
     return NULL;
 }
 
-bool
-sb_fdb_updated(const struct sbrec_fdb *fdb)
-{
-    bool updated = false;
-    for (size_t i = 0; i < SBREC_FDB_N_COLUMNS; i++) {
-        /* Ignore timestamp update as this does not affect the existing nodes
-         * at all. */
-        if (i == SBREC_FDB_COL_TIMESTAMP) {
-            continue;
-        }
-        updated |= sbrec_fdb_is_updated(fdb, i);
-    }
-
-    return updated || sbrec_fdb_is_deleted(fdb);
-}
-
 void
 fdbs_clear(struct hmap *map)
 {
@@ -321,134 +343,331 @@ fdbs_clear(struct hmap *map)
     }
 }
 
-struct mac_cache_stats {
-    struct ovs_list list_node;
-
-    int64_t idle_age_ms;
-
-    union {
-        /* Common data to identify MAC binding. */
-        struct mac_binding_data mb;
-        /* Common data to identify FDB. */
-        struct fdb_data fdb;
-    } data;
-};
-
 /* MAC binding stat processing. */
 void
-mac_binding_stats_process_flow_stats(struct ovs_list *stats_list,
+mac_binding_stats_process_flow_stats(struct vector *stats_vec,
                                      struct ofputil_flow_stats *ofp_stats)
 {
-    struct mac_cache_stats *stats = xmalloc(sizeof *stats);
-
-    stats->idle_age_ms = ofp_stats->idle_age * 1000;
-    stats->data.mb = (struct mac_binding_data) {
-        .port_key = ofp_stats->match.flow.regs[MFF_LOG_INPORT - MFF_REG0],
-        .dp_key = ntohll(ofp_stats->match.flow.metadata),
-        .mac = ofp_stats->match.flow.dl_src
-    };
-
-    if (ofp_stats->match.flow.dl_type == htons(ETH_TYPE_IP)) {
-        stats->data.mb.ip = in6_addr_mapped_ipv4(ofp_stats->match.flow.nw_src);
-    } else {
-        stats->data.mb.ip = ofp_stats->match.flow.ipv6_src;
+    if (!ofp_stats->packet_count) {
+        return;
     }
 
-    ovs_list_push_back(stats_list, &stats->list_node);
+    struct mac_cache_stats stats = (struct mac_cache_stats) {
+        .idle_age_ms = ofp_stats->idle_age >= 0
+                       ? ofp_stats->idle_age * 1000
+                       : 0,
+        .data.mb = (struct mac_binding_data) {
+            .cookie = ntohll(ofp_stats->cookie),
+            /* The port_key must be zero to match
+             * mac_binding_data_from_sbrec. */
+            .port_key = 0,
+            .dp_key = ntohll(ofp_stats->match.flow.metadata),
+            .mac = ofp_stats->match.flow.dl_src
+        },
+    };
+
+    if (ofp_stats->match.flow.dl_type == htons(ETH_TYPE_IP) ||
+        ofp_stats->match.flow.dl_type == htons(ETH_TYPE_ARP)) {
+        stats.data.mb.ip = in6_addr_mapped_ipv4(ofp_stats->match.flow.nw_src);
+    } else {
+        stats.data.mb.ip = ofp_stats->match.flow.ipv6_src;
+    }
+    vector_push(stats_vec, &stats);
+}
+
+static void
+mac_binding_update_log(const char *action,
+                       const struct mac_binding_data *data,
+                       bool print_times,
+                       const struct mac_cache_threshold *threshold,
+                       int64_t idle_age_ms, uint64_t since_updated_ms)
+{
+    if (!VLOG_IS_DBG_ENABLED()) {
+        return;
+    }
+
+    struct ds s = DS_EMPTY_INITIALIZER;
+
+    ds_put_cstr(&s, action);
+    ds_put_cstr(&s, " MAC binding (");
+    mac_binding_data_to_string(data, &s);
+    if (print_times) {
+        ds_put_format(&s, "), last update: %"PRIu64"ms ago,"
+                          " idle age: %"PRIi64"ms, threshold: %"PRIu64"ms",
+                      since_updated_ms, idle_age_ms, threshold->value);
+    } else {
+        ds_put_char(&s, ')');
+    }
+    VLOG_DBG("%s.", ds_cstr_ro(&s));
+    ds_destroy(&s);
 }
 
 void
-mac_binding_stats_run(struct ovs_list *stats_list, uint64_t *req_delay,
-                      void *data)
+mac_binding_stats_run(struct vector *stats_vec, uint64_t *req_delay,
+                      void *data, struct uuidset *pending,
+                      long long timewall_now)
 {
     struct mac_cache_data *cache_data = data;
-    long long timewall_now = time_wall_msec();
 
     struct mac_cache_stats *stats;
-    LIST_FOR_EACH_POP (stats, list_node, stats_list) {
+    VECTOR_FOR_EACH_PTR (stats_vec, stats) {
         struct mac_binding *mb = mac_binding_find(&cache_data->mac_bindings,
                                                   &stats->data.mb);
         if (!mb) {
-            free(stats);
+            mac_binding_update_log("Not found in the cache:", &stats->data.mb,
+                                   false, NULL, 0, 0);
             continue;
         }
 
         struct mac_cache_threshold *threshold =
-                mac_cache_threshold_find(cache_data, mb->data.dp_key);
-
-        /* If "idle_age" is under threshold it means that the mac binding is
-         * used on this chassis. Also make sure that we don't update the
-         * timestamp more than once during the dump period. */
-        if (stats->idle_age_ms < threshold->value &&
-                (timewall_now - mb->sbrec_mb->timestamp) >=
-            threshold->dump_period) {
-            sbrec_mac_binding_set_timestamp(mb->sbrec_mb, timewall_now);
+            mac_cache_threshold_find(cache_data, mb->data.dp_key);
+        if (timewall_now < mb->sbrec->timestamp) {
+            mac_binding_update_log("Not updating with future timestamp",
+                                   &mb->data, true, threshold,
+                                   stats->idle_age_ms, 0);
+            continue;
         }
 
-        free(stats);
+        uint64_t since_updated_ms = timewall_now - mb->sbrec->timestamp;
+
+        /* If "idle_age" is under threshold it means that the mac binding is
+         * used on this chassis. */
+        if (stats->idle_age_ms < threshold->value) {
+            if (since_updated_ms >= threshold->cooldown_period) {
+                mac_binding_update_log("Queuing timestamp update for active",
+                                       &mb->data, true, threshold,
+                                       stats->idle_age_ms, since_updated_ms);
+                uuidset_insert(pending, &mb->sbrec->header_.uuid);
+            } else {
+                /* Postponing the update to avoid sending database transactions
+                 * too frequently. */
+                mac_binding_update_log("Not updating active", &mb->data, true,
+                                       threshold, stats->idle_age_ms,
+                                       since_updated_ms);
+            }
+        } else {
+            mac_binding_update_log("Not updating non-active", &mb->data, true,
+                                   threshold, stats->idle_age_ms,
+                                   since_updated_ms);
+        }
     }
 
     mac_cache_update_req_delay(&cache_data->thresholds, req_delay);
+    if (*req_delay) {
+        VLOG_DBG("MAC binding statistics delay: %"PRIu64, *req_delay);
+    }
+}
+
+void
+mac_binding_stats_drain(struct ovsdb_idl_txn *txn, struct uuidset *pending,
+                        size_t batch_size, long long timewall_now)
+{
+    struct ovsdb_idl *idl = ovsdb_idl_txn_get_idl(txn);
+    size_t drained = 0;
+
+    struct uuidset_node *node;
+    UUIDSET_FOR_EACH_SAFE (node, pending) {
+        if (drained == batch_size) {
+            break;
+        }
+
+        const struct sbrec_mac_binding *mb =
+            sbrec_mac_binding_get_for_uuid(idl, &node->uuid);
+        if (mb) {
+            sbrec_mac_binding_set_timestamp(mb, timewall_now);
+
+            if (VLOG_IS_DBG_ENABLED()) {
+                struct mac_binding_data data;
+                if (mac_binding_data_from_sbrec(&data, mb)) {
+                    mac_binding_update_log("Updating active", &data, false,
+                                           NULL, 0, 0);
+                }
+            }
+        }
+        uuidset_delete(pending, node);
+        drained++;
+    }
 }
 
 /* FDB stat processing. */
 void
-fdb_stats_process_flow_stats(struct ovs_list *stats_list,
+fdb_stats_process_flow_stats(struct vector *stats_vec,
                              struct ofputil_flow_stats *ofp_stats)
 {
-    struct mac_cache_stats *stats = xmalloc(sizeof *stats);
+    if (!ofp_stats->packet_count) {
+        return;
+    }
 
-    stats->idle_age_ms = ofp_stats->idle_age * 1000;
-    stats->data.fdb = (struct fdb_data) {
+    struct mac_cache_stats stats = (struct mac_cache_stats) {
+        .idle_age_ms = ofp_stats->idle_age >= 0
+                       ? ofp_stats->idle_age * 1000
+                       : 0,
+        .data.fdb = (struct fdb_data) {
             .port_key = ofp_stats->match.flow.regs[MFF_LOG_INPORT - MFF_REG0],
             .dp_key = ntohll(ofp_stats->match.flow.metadata),
             .mac = ofp_stats->match.flow.dl_src
+        },
     };
+    vector_push(stats_vec, &stats);
+}
 
-    ovs_list_push_back(stats_list, &stats->list_node);
+static void
+fdb_update_log(const char *action,
+               const struct fdb_data *data,
+               bool print_times,
+               const struct mac_cache_threshold *threshold,
+               int64_t idle_age_ms, uint64_t since_updated_ms)
+{
+    if (!VLOG_IS_DBG_ENABLED()) {
+        return;
+    }
+
+    struct ds s = DS_EMPTY_INITIALIZER;
+
+    ds_put_cstr(&s, action);
+    ds_put_format(&s, " FDB entry (datapath-key: %"PRIu32", "
+                      "port-key: %"PRIu32", mac: " ETH_ADDR_FMT,
+                  data->dp_key, data->port_key, ETH_ADDR_ARGS(data->mac));
+    if (print_times) {
+        ds_put_format(&s, "), last update: %"PRIu64"ms ago,"
+                          " idle age: %"PRIi64"ms, threshold: %"PRIu64"ms",
+                      since_updated_ms, idle_age_ms, threshold->value);
+    } else {
+        ds_put_char(&s, ')');
+    }
+    VLOG_DBG("%s.", ds_cstr_ro(&s));
+    ds_destroy(&s);
 }
 
 void
-fdb_stats_run(struct ovs_list *stats_list, uint64_t *req_delay,
-              void *data)
+fdb_stats_run(struct vector *stats_vec, uint64_t *req_delay, void *data,
+              struct uuidset *pending, long long timewall_now)
 {
     struct mac_cache_data *cache_data = data;
-    long long timewall_now = time_wall_msec();
 
     struct mac_cache_stats *stats;
-    LIST_FOR_EACH_POP (stats, list_node, stats_list) {
+    VECTOR_FOR_EACH_PTR (stats_vec, stats) {
         struct fdb *fdb = fdb_find(&cache_data->fdbs, &stats->data.fdb);
 
         if (!fdb) {
-            free(stats);
+            fdb_update_log("Not found in the cache:", &stats->data.fdb,
+                           false, NULL, 0, 0);
             continue;
         }
 
         struct mac_cache_threshold *threshold =
-                mac_cache_threshold_find(cache_data, fdb->data.dp_key);
-
-        /* If "idle_age" is under threshold it means that the mac binding is
-         * used on this chassis. Also make sure that we don't update the
-         * timestamp more than once during the dump period. */
-        if (stats->idle_age_ms < threshold->value &&
-                (timewall_now - fdb->sbrec_fdb->timestamp) >=
-            threshold->dump_period) {
-            sbrec_fdb_set_timestamp(fdb->sbrec_fdb, timewall_now);
+            mac_cache_threshold_find(cache_data, fdb->data.dp_key);
+        if (timewall_now < fdb->sbrec_fdb->timestamp) {
+            fdb_update_log("Not updating with future timestamp", &fdb->data,
+                           true, threshold, stats->idle_age_ms, 0);
+            continue;
         }
 
-        free(stats);
+        uint64_t since_updated_ms = timewall_now - fdb->sbrec_fdb->timestamp;
+
+        /* If "idle_age" is under threshold it means that the fdb entry is
+         * used on this chassis. */
+        if (stats->idle_age_ms < threshold->value) {
+            if (since_updated_ms >= threshold->cooldown_period) {
+                fdb_update_log("Queuing timestamp update for active",
+                               &fdb->data, true, threshold,
+                               stats->idle_age_ms, since_updated_ms);
+                uuidset_insert(pending, &fdb->sbrec_fdb->header_.uuid);
+            } else {
+                /* Postponing the update to avoid sending database transactions
+                 * too frequently. */
+                fdb_update_log("Not updating active", &fdb->data, true,
+                               threshold, stats->idle_age_ms,
+                               since_updated_ms);
+            }
+        } else {
+            fdb_update_log("Not updating non-active", &fdb->data, true,
+                           threshold, stats->idle_age_ms, since_updated_ms);
+        }
     }
 
     mac_cache_update_req_delay(&cache_data->thresholds, req_delay);
+    if (*req_delay) {
+        VLOG_DBG("FDB entry statistics delay: %"PRIu64, *req_delay);
+    }
+}
+
+void
+fdb_stats_drain(struct ovsdb_idl_txn *txn, struct uuidset *pending,
+                size_t batch_size, long long timewall_now)
+{
+    struct ovsdb_idl *idl = ovsdb_idl_txn_get_idl(txn);
+    size_t drained = 0;
+
+    struct uuidset_node *node;
+    UUIDSET_FOR_EACH_SAFE (node, pending) {
+        if (drained == batch_size) {
+            break;
+        }
+
+        const struct sbrec_fdb *fdb = sbrec_fdb_get_for_uuid(idl, &node->uuid);
+        if (fdb) {
+            sbrec_fdb_set_timestamp(fdb, timewall_now);
+
+            if (VLOG_IS_DBG_ENABLED()) {
+                struct fdb_data data;
+                if (fdb_data_from_sbrec(&data, fdb)) {
+                    fdb_update_log("Updating active", &data, false,
+                                   NULL, 0, 0);
+                }
+            }
+        }
+        uuidset_delete(pending, node);
+        drained++;
+    }
 }
 
 /* Packet buffering. */
-struct bp_packet_data *
-bp_packet_data_create(const struct ofputil_packet_in *pin,
-                      const struct ofpbuf *continuation) {
-    struct bp_packet_data *pd = xmalloc(sizeof *pd);
+void
+bp_packet_data_destroy(struct bp_packet_data *pd) {
+    free(pd->pin.packet);
+    ofpbuf_delete(pd->continuation);
+}
 
-    pd->pin = (struct ofputil_packet_in) {
+struct buffered_packets *
+buffered_packets_add(struct cmap *bp_map, struct mac_binding_data mb_data) {
+    uint32_t hash = mac_binding_data_hash(&mb_data);
+
+    struct buffered_packets *bp = buffered_packets_find(bp_map, &mb_data);
+    if (!bp) {
+        if (cmap_count(bp_map) >= MAX_BUFFERED_PACKETS) {
+            return NULL;
+        }
+
+        bp = xmalloc(sizeof *bp);
+        bp->mb_data = mb_data;
+        atomic_init(&bp->resolved_mac, 0);
+        /* Schedule the freshly added buffered packet to do lookup
+         * immediately. */
+        bp->lookup_at_ms = 0;
+        bp->queue = VECTOR_CAPACITY_INITIALIZER(struct bp_packet_data,
+                                                BUFFER_QUEUE_DEPTH);
+        cmap_insert(bp_map, &bp->cmap_node, hash);
+    }
+
+    bp->expire_at_ms = time_msec() + BUFFERED_PACKETS_TIMEOUT_MS;
+
+    return bp;
+}
+
+void
+buffered_packets_packet_data_enqueue(struct buffered_packets *bp,
+                                     const struct ofputil_packet_in *pin,
+                                     const struct ofpbuf *continuation)
+{
+    if (vector_len(&bp->queue) == BUFFER_QUEUE_DEPTH) {
+        struct bp_packet_data pd;
+        vector_remove(&bp->queue, 0, &pd);
+        bp_packet_data_destroy(&pd);
+    }
+
+    struct bp_packet_data pd = (struct bp_packet_data) {
+        .pin = (struct ofputil_packet_in) {
             .packet = xmemdup(pin->packet, pin->packet_len),
             .packet_len = pin->packet_len,
             .flow_metadata = pin->flow_metadata,
@@ -459,75 +678,34 @@ bp_packet_data_create(const struct ofputil_packet_in *pin,
              * it is not needed for the continuation. */
             .userdata = NULL,
             .userdata_len = 0,
+        },
+        .continuation = ofpbuf_clone(continuation),
     };
-    pd->continuation = ofpbuf_clone(continuation);
 
-    return pd;
+    vector_push(&bp->queue, &pd);
 }
 
-
-void
-bp_packet_data_destroy(struct bp_packet_data *pd) {
-    free(pd->pin.packet);
-    ofpbuf_delete(pd->continuation);
-    free(pd);
-}
-
-struct buffered_packets *
-buffered_packets_add(struct buffered_packets_ctx *ctx,
-                     struct mac_binding_data mb_data) {
-    uint32_t hash = mac_binding_data_hash(&mb_data);
-
-    struct buffered_packets *bp = buffered_packets_find(ctx, &mb_data);
-    if (!bp) {
-        if (hmap_count(&ctx->buffered_packets) >= MAX_BUFFERED_PACKETS) {
-            return NULL;
-        }
-
-        bp = xmalloc(sizeof *bp);
-        hmap_insert(&ctx->buffered_packets, &bp->hmap_node, hash);
-        bp->mb_data = mb_data;
-        /* Schedule the freshly added buffered packet to do lookup
-         * immediately. */
-        bp->lookup_at_ms = 0;
-        ovs_list_init(&bp->queue);
-    }
-
-    bp->expire_at_ms = time_msec() + BUFFERED_PACKETS_TIMEOUT_MS;
-
-    return bp;
-}
-
-void
-buffered_packets_packet_data_enqueue(struct buffered_packets *bp,
-                                     struct bp_packet_data *pd) {
-    if (ovs_list_size(&bp->queue) == BUFFER_QUEUE_DEPTH) {
-        struct bp_packet_data *p = CONTAINER_OF(ovs_list_pop_front(&bp->queue),
-                                                struct bp_packet_data, node);
-
-        bp_packet_data_destroy(p);
-    }
-    ovs_list_push_back(&bp->queue, &pd->node);
-}
-
-void
-buffered_packets_ctx_run(struct buffered_packets_ctx *ctx,
-                         const struct hmap *recent_mbs,
-                         struct ovsdb_idl_index *sbrec_pb_by_key,
-                         struct ovsdb_idl_index *sbrec_dp_by_key,
-                         struct ovsdb_idl_index *sbrec_pb_by_name,
-                         struct ovsdb_idl_index *sbrec_mb_by_lport_ip) {
+bool
+buffered_packets_lookup_run(struct cmap *bp_map, const struct hmap *recent_mbs,
+                            struct ovsdb_idl_index *sbrec_pb_by_key,
+                            struct ovsdb_idl_index *sbrec_dp_by_key,
+                            struct ovsdb_idl_index *sbrec_pb_by_name,
+                            struct ovsdb_idl_index *sbrec_mb_by_lport_ip) {
     struct ds ip = DS_EMPTY_INITIALIZER;
     long long now = time_msec();
+    bool updated = false;
 
     struct buffered_packets *bp;
-    HMAP_FOR_EACH_SAFE (bp, hmap_node, &ctx->buffered_packets) {
-        struct eth_addr mac = eth_addr_zero;
-        /* Remove expired buffered packets. */
-        if (now > bp->expire_at_ms) {
-            buffered_packets_remove(ctx, bp);
+    CMAP_FOR_EACH (bp, cmap_node, bp_map) {
+        uint64_t mac64;
+        atomic_read(&bp->resolved_mac, &mac64);
+        /* MAC for given entry was already resolved,
+         * no need to resolve it again. */
+        if (mac64) {
             continue;
         }
+
+        struct eth_addr mac = eth_addr_zero;
 
         struct mac_binding *mb = mac_binding_find(recent_mbs, &bp->mb_data);
         if (mb) {
@@ -539,74 +717,80 @@ buffered_packets_ctx_run(struct buffered_packets_ctx *ctx,
                                        sbrec_mb_by_lport_ip);
             /* Schedule next lookup even if we found the MAC address,
              * if the address was found this struct will be deleted anyway. */
+
             bp->lookup_at_ms = now + BUFFERED_PACKETS_LOOKUP_MS;
         }
 
-        if (eth_addr_is_zero(mac)) {
+        if (!eth_addr_is_zero(mac)) {
+            atomic_store(&bp->resolved_mac, eth_addr_to_uint64(mac));
+            updated = true;
+        }
+    }
+
+    ds_destroy(&ip);
+
+    return updated;
+}
+
+void
+buffered_packets_run(struct cmap *bp_map, struct vector *rpd)
+{
+    long long now = time_msec();
+
+    struct buffered_packets *bp;
+    CMAP_FOR_EACH (bp, cmap_node, bp_map) {
+        uint32_t hash = mac_binding_data_hash(&bp->mb_data);
+
+        /* Remove expired buffered packets. */
+        if (now > bp->expire_at_ms) {
+            cmap_remove(bp_map, &bp->cmap_node, hash);
+            ovsrcu_postpone(buffered_packets_free, bp);
             continue;
         }
 
+        uint64_t mac64;
+        atomic_read(&bp->resolved_mac, &mac64);
+        if (!mac64) {
+            continue;
+        }
+
+        struct eth_addr mac;
+        eth_addr_from_uint64(mac64, &mac);
+
         struct bp_packet_data *pd;
-        LIST_FOR_EACH_POP (pd, node, &bp->queue) {
+        VECTOR_FOR_EACH_PTR (&bp->queue, pd) {
             struct dp_packet packet;
             dp_packet_use_const(&packet, pd->pin.packet, pd->pin.packet_len);
 
             struct eth_header *eth = dp_packet_data(&packet);
             eth->eth_dst = mac;
-
-            ovs_list_push_back(&ctx->ready_packets_data, &pd->node);
         }
 
-        buffered_packets_remove(ctx, bp);
+        vector_push_array(rpd, vector_get_array(&bp->queue),
+                          vector_len(&bp->queue));
+        vector_clear(&bp->queue);
+
+        cmap_remove(bp_map, &bp->cmap_node, hash);
+        ovsrcu_postpone(buffered_packets_free, bp);
     }
-
-    ds_destroy(&ip);
-}
-
-bool
-buffered_packets_ctx_is_ready_to_send(struct buffered_packets_ctx *ctx) {
-    return !ovs_list_is_empty(&ctx->ready_packets_data);
-}
-
-bool
-buffered_packets_ctx_has_packets(struct buffered_packets_ctx *ctx) {
-    return !hmap_is_empty(&ctx->buffered_packets);
 }
 
 void
-buffered_packets_ctx_init(struct buffered_packets_ctx *ctx) {
-    hmap_init(&ctx->buffered_packets);
-    ovs_list_init(&ctx->ready_packets_data);
-}
-
-void
-buffered_packets_ctx_destroy(struct buffered_packets_ctx *ctx) {
-    struct bp_packet_data *pd;
-    LIST_FOR_EACH_POP (pd, node, &ctx->ready_packets_data) {
-        bp_packet_data_destroy(pd);
-    }
-
+buffered_packets_map_destroy(struct cmap *bp_map) {
     struct buffered_packets *bp;
-    HMAP_FOR_EACH_SAFE (bp, hmap_node, &ctx->buffered_packets) {
-        buffered_packets_remove(ctx, bp);
+    CMAP_FOR_EACH (bp, cmap_node, bp_map) {
+        cmap_remove(bp_map, &bp->cmap_node,
+                    mac_binding_data_hash(&bp->mb_data));
+        ovsrcu_postpone(buffered_packets_free, bp);
     }
-    hmap_destroy(&ctx->buffered_packets);
-}
 
-
-void
-mac_cache_stats_destroy(struct ovs_list *stats_list)
-{
-    struct mac_cache_stats *stats;
-    LIST_FOR_EACH_POP (stats, list_node, stats_list) {
-        free(stats);
-    }
+    cmap_destroy(bp_map);
 }
 
 static uint32_t
 mac_binding_data_hash(const struct mac_binding_data *mb_data)
 {
-    uint32_t hash = 0;
+    uint32_t hash = hash_uint64(mb_data->cookie);
 
     hash = hash_add(hash, mb_data->port_key);
     hash = hash_add(hash, mb_data->dp_key);
@@ -619,9 +803,10 @@ static inline bool
 mac_binding_data_equals(const struct mac_binding_data *a,
                         const struct mac_binding_data *b)
 {
-    return a->port_key == b->port_key &&
+    return a->cookie == b->cookie &&
+           a->port_key == b->port_key &&
            a->dp_key == b->dp_key &&
-            ipv6_addr_equals(&a->ip, &b->ip);
+           ipv6_addr_equals(&a->ip, &b->ip);
 }
 
 static uint32_t
@@ -682,12 +867,12 @@ mac_cache_update_req_delay(struct hmap *thresholds, uint64_t *req_delay)
 }
 
 static struct buffered_packets *
-buffered_packets_find(struct buffered_packets_ctx *ctx,
+buffered_packets_find(struct cmap *bp_map,
                       const struct mac_binding_data *mb_data) {
     uint32_t hash = mac_binding_data_hash(mb_data);
 
     struct buffered_packets *bp;
-    HMAP_FOR_EACH_WITH_HASH (bp, hmap_node, hash, &ctx->buffered_packets) {
+    CMAP_FOR_EACH_WITH_HASH (bp, cmap_node, hash, bp_map) {
         if (mac_binding_data_equals(&bp->mb_data, mb_data)) {
             return bp;
         }
@@ -697,14 +882,13 @@ buffered_packets_find(struct buffered_packets_ctx *ctx,
 }
 
 static void
-buffered_packets_remove(struct buffered_packets_ctx *ctx,
-                        struct buffered_packets *bp) {
+buffered_packets_free(struct buffered_packets *bp) {
     struct bp_packet_data *pd;
-    LIST_FOR_EACH_POP (pd, node, &bp->queue) {
+    VECTOR_FOR_EACH_PTR (&bp->queue, pd) {
         bp_packet_data_destroy(pd);
     }
 
-    hmap_remove(&ctx->buffered_packets, &bp->hmap_node);
+    vector_destroy(&bp->queue);
     free(bp);
 }
 
@@ -742,4 +926,165 @@ buffered_packets_db_lookup(struct buffered_packets *bp, struct ds *ip,
     }
 
     eth_addr_from_string(smb->mac, mac);
+}
+
+void
+mac_binding_probe_stats_process_flow_stats(
+        struct vector *stats_vec,
+        struct ofputil_flow_stats *ofp_stats)
+{
+    if (!ofp_stats->packet_count) {
+        return;
+    }
+
+    struct mac_cache_stats stats = (struct mac_cache_stats) {
+        .idle_age_ms = ofp_stats->idle_age >= 0
+               ? ofp_stats->idle_age * 1000
+               : 0,
+        .data.mb = (struct mac_binding_data) {
+            .cookie = ntohll(ofp_stats->cookie),
+            /* The port_key must be zero to match
+             * mac_binding_data_from_sbrec. */
+            .port_key = 0,
+            .dp_key = ntohll(ofp_stats->match.flow.metadata),
+            .mac = ofp_stats->match.flow.dl_src
+        },
+    };
+
+    if (ofp_stats->match.flow.regs[0]) {
+        stats.data.mb.ip =
+            in6_addr_mapped_ipv4(htonl(ofp_stats->match.flow.regs[0]));
+    } else {
+        ovs_be128 ip6 = hton128(flow_get_xxreg(&ofp_stats->match.flow, 1));
+        memcpy(&stats.data.mb.ip, &ip6, sizeof stats.data.mb.ip);
+    }
+
+    vector_push(stats_vec, &stats);
+}
+
+void
+mac_binding_probe_stats_run(struct vector *stats_vec, uint64_t *req_delay,
+                            void *data, struct uuidset *pending OVS_UNUSED,
+                            long long timewall_now)
+{
+    struct mac_binding_probe_data *probe_data = data;
+    struct mac_cache_data *cache_data = probe_data->cache_data;
+
+    struct mac_cache_stats *stats;
+    VECTOR_FOR_EACH_PTR (stats_vec, stats) {
+        struct mac_binding *mb = mac_binding_find(&cache_data->mac_bindings,
+                                                  &stats->data.mb);
+        if (!mb) {
+            mac_binding_update_log("Probe: not found in the cache:",
+                                   &stats->data.mb, false, NULL, 0, 0);
+            continue;
+        }
+
+        struct mac_cache_threshold *threshold =
+            mac_cache_threshold_find(cache_data, mb->data.dp_key);
+        if (timewall_now < mb->sbrec->timestamp) {
+            mac_binding_update_log("Not sending ARP/ND request with future "
+                                   "timestamp", &mb->data, true, threshold,
+                                   stats->idle_age_ms, 0);
+            mb->arp_attempts = 0;
+            continue;
+        }
+
+        uint64_t since_updated_ms = timewall_now - mb->sbrec->timestamp;
+        const struct sbrec_mac_binding *sbrec = mb->sbrec;
+
+        if (stats->idle_age_ms > threshold->value) {
+            mac_binding_update_log("Not sending ARP/ND request for non-active",
+                                   &mb->data, true, threshold,
+                                   stats->idle_age_ms, since_updated_ms);
+            continue;
+        }
+
+        if (since_updated_ms < threshold->cooldown_period ||
+            uuidset_contains(probe_data->mac_binding_pending,
+                             &sbrec->header_.uuid)) {
+            mac_binding_update_log(
+                    "Not sending ARP/ND request for recently/to be updated",
+                    &mb->data, true, threshold, stats->idle_age_ms,
+                    since_updated_ms);
+            mb->arp_attempts = 0;
+            continue;
+        }
+
+        const struct sbrec_port_binding *pb =
+            lport_lookup_by_name(probe_data->sbrec_port_binding_by_name,
+                                 sbrec->logical_port);
+        if (!pb) {
+            continue;
+        }
+
+        if (!lport_pb_is_local(probe_data->sbrec_port_binding_by_name,
+                               probe_data->chassis, pb)) {
+            mac_binding_update_log("Not sending ARP/ND request for non-local",
+                                   &mb->data, true, threshold,
+                                   stats->idle_age_ms, since_updated_ms);
+            continue;
+        }
+
+        struct lport_addresses laddr;
+        if (!extract_lsp_addresses(pb->mac[0], &laddr)) {
+            continue;
+        }
+
+        struct in6_addr local = in6addr_any;
+        if (IN6_IS_ADDR_V4MAPPED(&mb->data.ip)) {
+            if (laddr.n_ipv4_addrs) {
+                local = in6_addr_mapped_ipv4(laddr.ipv4_addrs[0].addr);
+            }
+
+            ovs_be32 ip4 = in6_addr_get_mapped_ipv4(&mb->data.ip);
+            for (size_t i = 0; i < laddr.n_ipv4_addrs; i++) {
+                struct ipv4_netaddr address = laddr.ipv4_addrs[i];
+                if (address.network == (ip4 & address.mask)) {
+                    local = in6_addr_mapped_ipv4(address.addr);
+                    break;
+                }
+            }
+        } else {
+            if (laddr.n_ipv6_addrs) {
+                local = laddr.ipv6_addrs[0].addr;
+            }
+
+            for (size_t i = 0; i < laddr.n_ipv6_addrs; i++) {
+                struct ipv6_netaddr address = laddr.ipv6_addrs[i];
+                struct in6_addr neigh_prefix =
+                    ipv6_addr_bitand(&mb->data.ip, &address.mask);
+                if (ipv6_addr_equals(&address.network, &neigh_prefix)) {
+                    local = address.addr;
+                    break;
+                }
+            }
+        }
+
+        if (!ipv6_addr_equals(&local, &in6addr_any)) {
+            struct eth_addr eth_dst =
+                mb->arp_attempts < PROBE_MULICAST_THRESHOLD
+                ? mb->data.mac
+                : eth_addr_zero;
+
+            mac_binding_update_log("Sending ARP/ND request for active",
+                                   &mb->data, true, threshold,
+                                   stats->idle_age_ms, since_updated_ms);
+
+            send_self_originated_neigh_packet(probe_data->swconn,
+                                              sbrec->datapath->tunnel_key,
+                                              pb->tunnel_key, laddr.ea,
+                                              eth_dst, &local,
+                                              &mb->data.ip,
+                                              OFTABLE_LOCAL_OUTPUT);
+            mb->arp_attempts++;
+        }
+
+        destroy_lport_addresses(&laddr);
+    }
+
+    mac_cache_update_req_delay(&cache_data->thresholds, req_delay);
+    if (*req_delay) {
+        VLOG_DBG("MAC probe binding statistics delay: %"PRIu64, *req_delay);
+    }
 }

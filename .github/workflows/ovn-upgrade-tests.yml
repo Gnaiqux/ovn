@@ -1,0 +1,106 @@
+name: OVN Upgrade Tests
+
+on:
+  schedule:
+    # Run Tuesday at midnight
+    - cron: '0 0 * * 2'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  upgrade-tests:
+    name: upgrade-test ${{ matrix.cfg.base_version }} ${{ matrix.cfg.test_range }} -> ${{ matrix.cfg.target_version || github.ref_name }}
+    if: (github.repository_owner == 'ovn-org' && github.event_name == 'schedule' && github.ref_name == 'main') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        cfg:
+        # Upgrade against latest LTS.
+        - { base_version: "origin/branch-24.03", target_version: "branch-26.03", test_range: "-100" }
+        - { base_version: "origin/branch-24.03", target_version: "branch-26.03", test_range: "101-", unstable: unstable }
+        - { base_version: "origin/branch-25.03", target_version: "branch-26.03", test_range: "-100" }
+        - { base_version: "origin/branch-25.03", target_version: "branch-26.03", test_range: "101-200" }
+        - { base_version: "origin/branch-25.03", target_version: "branch-26.03", test_range: "201-", unstable: unstable }
+        - { base_version: "origin/branch-25.09", target_version: "branch-26.03", test_range: "-100"}
+        - { base_version: "origin/branch-25.09", target_version: "branch-26.03", test_range: "101-200"}
+        - { base_version: "origin/branch-25.09", target_version: "branch-26.03", test_range: "201-", unstable: unstable}
+        # Upgrade from LTS to between LTS and main.
+        - { base_version: "origin/branch-26.03", target_version: "branch-26.09", test_range: "-100" }
+        - { base_version: "origin/branch-26.03", target_version: "branch-26.09", test_range: "101-200" }
+        - { base_version: "origin/branch-26.03", target_version: "branch-26.09", test_range: "201-", unstable: unstable }
+        # Upgrade against latest branch ref.
+        - { base_version: "origin/branch-26.03", test_range: "-100" }
+        - { base_version: "origin/branch-26.03", test_range: "101-200" }
+        - { base_version: "origin/branch-26.03", test_range: "201-", unstable: unstable }
+        - { base_version: "origin/branch-26.09", test_range: "-100" }
+        - { base_version: "origin/branch-26.09", test_range: "101-200" }
+        - { base_version: "origin/branch-26.09", test_range: "201-", unstable: unstable }
+
+    env:
+      CC: gcc
+      BASE_VERSION: ${{ matrix.cfg.base_version }}
+      TEST_RANGE: ${{ matrix.cfg.test_range }}
+      UNSTABLE: ${{ matrix.cfg.unstable }}
+      TESTSUITE: "upgrade-test"
+
+    steps:
+    - name: system-level-dependencies
+      run: |
+        sudo apt update
+        sudo apt -y install linux-modules-$(uname -r)
+
+    - name: checkout
+      uses: actions/checkout@v6
+      with:
+        ref: ${{ matrix.cfg.target_version || github.ref }}
+        submodules: recursive
+
+    - name: Fix /etc/hosts file
+      run: |
+        . .ci/linux-util.sh
+        fix_etc_hosts
+
+    - name: Disable apparmor
+      run: |
+        . .ci/linux-util.sh
+        disable_apparmor
+
+    - name: Fixup crun
+      run: |
+        . .ci/linux-util.sh
+        fixup_crun
+
+    - name: Preserve env
+      run: |
+        . .ci/linux-util.sh
+        sudo_preserve_env
+
+    - name: Download container
+      run: sudo podman pull ghcr.io/ovn-org/ovn-tests:ubuntu
+
+    - name: Tag image
+      run: sudo podman tag ghcr.io/ovn-org/ovn-tests:ubuntu ovn-org/ovn-tests
+
+    # Artifact names cannot contain characters such as '/'
+    - name: Artifact name
+      id: artifact
+      run: |
+        RAW_NAME='${{ matrix.cfg.base_version }}'
+        BRANCH_NAME="${RAW_NAME#origin/}"
+        echo "name=logs-upgrade-test-${BRANCH_NAME}-${{ matrix.cfg.test_range }}" >> $GITHUB_OUTPUT
+
+    - name: build
+      run: sudo ./.ci/ci.sh --archive-logs --timeout=2h
+
+    - name: upload logs on failure
+      if: failure() || cancelled()
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ steps.artifact.outputs.name }}
+        path: logs.tgz
